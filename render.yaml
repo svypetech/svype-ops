@@ -1,0 +1,24 @@
+# Render blueprint — provisions the database + web service in one go.
+databases:
+  - name: svype-os-db
+    plan: free
+    databaseName: svypeos
+    user: svypeos
+
+services:
+  - type: web
+    name: svype-os
+    runtime: node
+    plan: free
+    # Build the React client, then install the server
+    buildCommand: cd client && npm install && npm run build && cd ../server && npm install
+    startCommand: cd server && npm start
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: svype-os-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: NODE_VERSION
+        value: 22
