@@ -307,3 +307,12 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, created_at);
+
+-- Whole-app shared state (the existing UI's `data` blob + brand)
+CREATE TABLE IF NOT EXISTS app_state (
+  id         INTEGER PRIMARY KEY DEFAULT 1,
+  doc        JSONB,
+  brand      JSONB,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT app_state_singleton CHECK (id = 1)
+);

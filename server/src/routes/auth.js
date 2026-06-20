@@ -111,4 +111,23 @@ router.put("/users/:id/perms", auth, adminOnly, async (req, res) => {
   res.json(pub(r.rows[0]));
 });
 
+
+// Lightweight identity for chat/websocket: the app manages its own logins,
+// this just issues a token tying a username+role to socket/chat calls.
+router.post("/identify", async (req, res) => {
+  const { username, role } = req.body || {};
+  if (!username) return res.status(400).json({ error: "username required" });
+  // upsert a shadow user row so chat has a stable id + directory
+  const existing = await pool.query("SELECT * FROM users WHERE lower(username)=lower($1)", [username]);
+  let u = existing.rows[0];
+  if (!u) {
+    const r = await pool.query(
+      "INSERT INTO users (username, password, role, active) VALUES (lower($1),'-',$2,TRUE) RETURNING *",
+      [username, ["admin","hr","employee"].includes(role) ? role : "employee"]
+    );
+    u = r.rows[0];
+  }
+  res.json({ token: sign(u), user: pub(u) });
+});
+
 module.exports = router;

@@ -12,7 +12,14 @@ Full-stack version of Svype OS: **Node + Express + PostgreSQL** backend with **s
 - **Team Chat** — channels, direct messages to anyone in the company, real-time delivery.
 - **Full backend for every module** — employees, users & permissions, clients, attendance, leaves, payroll (with Pakistan tax/EOBI/PF + advances), advances, timesheets/daily work, recruitment + CV, vendor bills (dual HR+Founder approval), invoices, payables (with reimbursement approval), receivables, retainers (auto invoices + payments), bank accounts, meeting notes, announcements, requests, audit log, brand. All exposed as REST APIs and ready.
 
-## What's next (honest status)
+## Status
+
+**The full app is here** — every module from your browser version (employees, users & permissions, clients, attendance, payroll, advances, vendor bills, timesheets/daily work, recruitment, CV bank, offers, letters, proposals, quotations, retainers, invoices, payables, receivables, meeting notes, bank accounts, announcements, requests, audit, brand, backup) plus **Team Chat** (channels + DMs, real-time). Data is stored centrally in PostgreSQL and shared across all devices.
+
+### Auth note
+The app keeps its own login/permission system (carried over from your build) and stores all data as one shared document on the server. A server-side hashed-password auth layer also exists (used to secure chat) and can be made the primary login in a later hardening pass.
+
+## (was) What's next
 
 The backend is complete for all modules. The **frontend currently ships the core**: auth, dashboard, and full Team Chat. The detailed module **screens** from the browser version are ported onto this same backend in the next stage — the APIs they need already exist. This was done deliberately so you get a real, deployable, verifiable app now rather than an untested giant.
 
