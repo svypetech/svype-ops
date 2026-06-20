@@ -140,10 +140,12 @@ function ensureRetainerInvoices(db) {
   let changed = false;
   const rets = (db.retainers || []).map((r) => {
     if (r.status !== "Active") return r;
-    if (inv.find((i) => i.retainerId === r.id && i.monthKey === mk)) return r;
+    // Only auto-generate ONCE per retainer per month. The marker (lastGenMonth) means
+    // deleting the generated invoice will NOT cause it to come back — generation already happened.
+    if (r.lastGenMonth === mk) return r;
     const base = +r.amount || 0, carry = +r.carry || 0;
     inv.push({ id: uid(), retainerId: r.id, client: r.client, number: `RET-${mk.replace("-", "")}-${inv.length + 1}`, monthKey: mk, month: ml, base, carry, total: base + carry, currency: r.currency || "PKR", status: "Unpaid", paidAmount: 0, account: "", date: today(), paidDate: "" });
-    changed = true; return { ...r, carry: 0 };
+    changed = true; return { ...r, carry: 0, lastGenMonth: mk };
   });
   return changed ? { ...db, retainerInvoices: inv, retainers: rets } : db;
 }
@@ -253,12 +255,21 @@ export default function App() {
   const role = session?.role || null;
   const meId = session?.empId || null;
   const who = () => role === "employee" ? (data.employees.find(e=>e.id===meId)?.name || session?.username || "Employee") : (ROLES[role] || "System");
-  const withAudit = (base, msg) => msg ? { ...base, audit: [{ id:uid(), who:who(), action:msg, date:new Date().toISOString() }, ...(data.audit||[])].slice(0,500) } : base;
-  const persist = (n) => { setData(n); DB.set("svype_db", n); };
-  const update = (k, rows, audit) => persist(withAudit({ ...data, [k]: rows }, audit));
-  const patch = (obj, audit) => persist(withAudit({ ...data, ...obj }, audit));
+  const auditEntry = (msg) => ({ id:uid(), who:who(), action:msg, date:new Date().toISOString() });
+  // Always merge against the freshest state (functional updater) so two quick saves never clobber each other.
+  const commit = (mutate, msg) => {
+    setData((cur) => {
+      let next = mutate(cur);
+      if (msg) next = { ...next, audit: [auditEntry(msg), ...(cur.audit||[])].slice(0,500) };
+      DB.set("svype_db", next);
+      return next;
+    });
+  };
+  const persist = (n) => commit(() => n);
+  const update = (k, rows, audit) => commit((cur) => ({ ...cur, [k]: rows }), audit);
+  const patch = (obj, audit) => commit((cur) => ({ ...cur, ...obj }), audit);
   const saveBrand = (b) => { setBrand(b); DB.set("svype_brand", b); };
-  const restore = (db, br) => { if (db) persist({ ...SEED, ...db }); if (br) saveBrand(br); };
+  const restore = (db, br) => { if (db) commit(() => ({ ...SEED, ...db })); if (br) saveBrand(br); };
   const wipe = () => { const fresh = JSON.parse(JSON.stringify(SEED)); DB.set("svype_db", fresh); DB.set("svype_brand", SEED_BRAND); setData(fresh); setBrand(SEED_BRAND); setSession(null); setTab("dash"); };
   const reset = () => { setSession(null); setTab("dash"); };
 
@@ -859,7 +870,13 @@ function Employees({ data, update }) {
   const [edit, setEdit] = useState(null); const [open, setOpen] = useState(null); const [q, setQ] = useState("");
   const [lookup, setLookup] = useState("");
   const blank = { name:"",role:"",dept:"",email:"",phone:"",cnic:"",salary:"",pf:0,joined:today(),status:"Active",bankName:"",account:"",docs:[] };
-  const save = (e)=>{ const isNew=!e.id; setRows(e.id?rows.map(r=>r.id===e.id?e:r):[...rows,{...e,id:uid()}]); if(isNew) update("employees",[...rows,{...e,id:uid()}], `Added employee ${e.name}`); setEdit(null); };
+  const save = (e)=>{
+    const isNew = !e.id;
+    const rec = isNew ? { ...e, id: uid() } : e;
+    const next = isNew ? [...rows, rec] : rows.map(r=>r.id===rec.id?rec:r);
+    update("employees", next, isNew ? `Added employee ${rec.name}` : `Updated employee ${rec.name}`);
+    setEdit(null);
+  };
   const filtered = rows.filter(r=>r.name.toLowerCase().includes(q.toLowerCase()));
   const found = lookup ? rows.find(r=>r.name.toLowerCase().includes(lookup.toLowerCase())) : null;
   if (open) { const emp = rows.find(r=>r.id===open); if (emp) return <EmployeeProfile emp={emp} data={data} onBack={()=>setOpen(null)} onEdit={()=>setEdit(emp)} />; }
@@ -1389,7 +1406,17 @@ function Retainers({ data, update, patch, brand, go }) {
     const newRets = c.id?rets.map(r=>r.id===c.id?c:r):[...rets,{...c,id:uid(),carry:+c.carry||0}];
     patch({ retainers:newRets, ...extra }, c.id?`Updated retainer ${c.client}`:`Added retainer client ${c.client}`); setEdit(null);
   };
-  const genDue = () => { const after = ensureRetainerInvoices(data); if (after !== data) patch({ retainerInvoices: after.retainerInvoices, retainers: after.retainers }); };
+  const genDue = () => {
+    const mk = monthKey(), ml = monthLabel();
+    const existing = invs.filter(i=>i.monthKey===mk);
+    const newInvs = [];
+    rets.filter(r=>r.status==="Active").forEach(r=>{
+      if (existing.find(i=>i.retainerId===r.id)) return; // already has one this month
+      const base=+r.amount||0, carry=+r.carry||0;
+      newInvs.push({ id:uid(), retainerId:r.id, client:r.client, number:`RET-${mk.replace("-","")}-${invs.length+newInvs.length+1}`, monthKey:mk, month:ml, base, carry, total:base+carry, currency:r.currency||"PKR", status:"Unpaid", paidAmount:0, account:"", date:today(), paidDate:"" });
+    });
+    if (newInvs.length) patch({ retainerInvoices:[...invs, ...newInvs], retainers: rets.map(r=>r.status==="Active"?{...r,carry:0,lastGenMonth:mk}:r) }, `Generated ${newInvs.length} retainer invoice(s) for ${ml}`);
+  };
   // manual invoice
   const newManual = () => setManual({ client:"", retainerId:"", month: monthLabel(), base:"", carry:0, currency:"PKR", date: today(), due:"", sendOn:"" });
   const onManualClient = (v) => { const r = rets.find(x=>x.client===v); const c = clients.find(x=>x.name===v); setManual(m=>({ ...m, client:v, retainerId:r?.id||"", base: r? r.amount : m.base, currency: (r?.currency||c?.currency||m.currency) })); };
@@ -1417,7 +1444,7 @@ function Retainers({ data, update, patch, brand, go }) {
     ) : (
       <Card><Table cols={["Invoice","Client","Period","Due","Total","Status",""]}>{invs.length===0?<tr><td colSpan={7}><Empty msg="No invoices yet — generate this month or create one"/></td></tr>:[...invs].reverse().map(i=>(
         <Row key={i.id}><Td className="font-medium">{i.number}</Td><Td className="text-slate-500">{i.client}</Td><Td className="text-slate-500">{i.month}</Td><Td className="text-slate-500">{i.due||"—"}{i.sendOn?<div className="text-xs text-slate-400">send {i.sendOn}</div>:null}</Td><Td>{fmt(i.total,i.currency)}{i.status==="Partial"&&<div className="text-xs text-orange-600">received {fmt(i.paidAmount,i.currency)}</div>}{i.status==="Paid"&&i.account&&<div className="text-xs text-slate-400">{i.account}</div>}</Td><Td><Pill s={i.status}/></Td>
-        <Td><RowActions onDelete={()=>update("retainerInvoices",invs.filter(x=>x.id!==i.id))}><button onClick={()=>openInvoicePDF(i, brand)} title="Download PDF invoice" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Download size={14}/></button><button onClick={()=>sendWA(i)} title="Send on WhatsApp" className="p-1.5 rounded text-slate-400 hover:text-green-600 hover:bg-slate-100"><Send size={14}/></button>{i.status!=="Paid" && <button onClick={()=>setPay(i)} title="Mark as paid" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button>}</RowActions></Td></Row>))}</Table></Card>
+        <Td><RowActions onDelete={()=>{ const parent=rets.find(r=>r.id===i.retainerId); patch({ retainerInvoices:invs.filter(x=>x.id!==i.id), retainers: parent?rets.map(r=>r.id===parent.id?{...r,lastGenMonth: i.monthKey||monthKey()}:r):rets }, `Deleted invoice ${i.number}`); }}><button onClick={()=>openInvoicePDF(i, brand)} title="Download PDF invoice" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Download size={14}/></button><button onClick={()=>sendWA(i)} title="Send on WhatsApp" className="p-1.5 rounded text-slate-400 hover:text-green-600 hover:bg-slate-100"><Send size={14}/></button>{i.status!=="Paid" && <button onClick={()=>setPay(i)} title="Mark as paid" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button>}</RowActions></Td></Row>))}</Table></Card>
     )}
     {edit && <Modal title={edit.id?"Edit retainer client":"Add retainer client"} onClose={()=>setEdit(null)}>
       <ClientInput clients={clients} label="Client name" value={edit.client} onChange={e=>onClient(e.target.value)}/>
