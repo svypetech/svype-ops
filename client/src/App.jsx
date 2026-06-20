@@ -76,6 +76,25 @@ function readImage(file, maxW = 700) {
   });
 }
 function download(name, text) { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([text], { type: "application/json" })); a.download = name; a.click(); }
+// Read ANY file (PDF, doc, image) as a base64 data URL so it can be stored and re-opened.
+function readFile(file) {
+  return new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file); });
+}
+// Open a stored data URL (PDF/image/etc.) in a new tab.
+function openDataUrl(dataUrl, name) {
+  if (!dataUrl) return;
+  try {
+    const [meta, b64] = dataUrl.split(",");
+    const mime = (meta.match(/data:(.*?);/) || [])[1] || "application/octet-stream";
+    const bin = atob(b64); const arr = new Uint8Array(bin.length);
+    for (let i=0;i<bin.length;i++) arr[i] = bin.charCodeAt(i);
+    const blob = new Blob([arr], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.target = "_blank"; a.rel = "noopener";
+    if (name) a.download = name;
+    a.click(); setTimeout(()=>URL.revokeObjectURL(url), 10000);
+  } catch { window.open(dataUrl, "_blank"); }
+}
 
 
 async function identifyForChat(u){
@@ -87,11 +106,13 @@ async function identifyForChat(u){
     localStorage.setItem("svype_chat_uid", String(r.user.id));
   }catch(e){ console.error("chat identify failed", e); }
 }
-function chatSocket(onMessage){
-  const proto = location.protocol === "https:" ? "wss" : "ws";
+function chatSocket(onMessage){  const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws?token=${getChatToken()}`);
   ws.onmessage = (e)=>{ try{ onMessage(JSON.parse(e.data)); }catch{} };
   return ws;
+}
+async function aiDraft(kind, fields, template){
+  return apiReq("POST","/ai/draft",{ kind, fields, template });
 }
 
 /* ---------------- seed ---------------- */
@@ -200,7 +221,13 @@ const EMP_NAV = [
 
 export default function App() {
   const [loading, setLoading] = useState(true);
-  const [session, setSession] = useState(null); // the logged-in user record
+  const [session, setSessionRaw] = useState(() => {
+    try { const s = localStorage.getItem("svype_session"); return s ? JSON.parse(s) : null; } catch { return null; }
+  });
+  const setSession = (s) => {
+    setSessionRaw(s);
+    try { s ? localStorage.setItem("svype_session", JSON.stringify(s)) : localStorage.removeItem("svype_session"); } catch {}
+  };
   const [tab, setTab] = useState("dash");
   const [navOpen, setNavOpen] = useState(false);
   const [data, setData] = useState(SEED);
@@ -215,6 +242,11 @@ export default function App() {
     if (!d || after !== merged) DB.set("svype_db", after);
     const b = await DB.get("svype_brand", null);
     if (b) setBrand(b); else { await DB.set("svype_brand", SEED_BRAND); setNeedsSetup(true); }
+    // re-issue a chat token if we restored a session but lost the token
+    try {
+      const s = localStorage.getItem("svype_session");
+      if (s && !getChatToken()) await identifyForChat(JSON.parse(s));
+    } catch {}
     setLoading(false);
   })(); }, []);
 
@@ -279,7 +311,13 @@ export default function App() {
           <NotifBell items={notes} go={setTab}/>
         </div>
         <div className="max-w-6xl mx-auto px-4 sm:px-8 py-6 sm:py-8">
-          {isEmp ? (<>
+          {isEmp ? (
+            (!me && active!=="chat") ? (
+              <div className="max-w-md mx-auto mt-10 bg-white border border-slate-200 rounded-xl p-6 text-center">
+                <div className="font-semibold text-slate-900 mb-1">Your login isn't linked to an employee profile yet</div>
+                <p className="text-sm text-slate-500">Ask HR to open <b>Users &amp; Access</b>, edit your login, and set <b>“Which staff member is this login for?”</b> to your name. Once linked, your profile, payslips, attendance and claims will appear here. You can still use Team Chat in the meantime.</p>
+              </div>
+            ) : (<>
             {active==="dash" && <EmpDashboard {...props}/>}
             {active==="chat" && <TeamChat session={session}/>}
             {active==="profile" && <EmpProfile {...props}/>}
@@ -288,7 +326,7 @@ export default function App() {
             {active==="timesheet" && <EmpTimesheet {...props}/>}
             {active==="meetings" && <EmpMeetings {...props}/>}
             {active==="expenses" && <EmpExpenses {...props}/>}
-          </>) : (<>
+          </>)) : (<>
             {active==="dash" && <Dashboard {...props}/>}
             {active==="chat" && <TeamChat session={session}/>}
             {active==="employees" && <Employees {...props}/>}
@@ -402,7 +440,10 @@ function Login({ data, brand, onLogin }) {
     const user = (data.users||[]).find(x=>x.username.toLowerCase()===u.trim().toLowerCase() && x.password===p);
     if (!user) { setErr("Incorrect username or password."); return; }
     if (!user.active) { setErr("This account has been deactivated. Contact HR."); return; }
-    if (user.role === "employee" && !data.employees.find(e=>e.id===user.empId && e.status==="Active")) { setErr("Your employee profile is inactive. Contact HR."); return; }
+    if (user.role === "employee" && user.empId) {
+      const emp = data.employees.find(e=>e.id===user.empId);
+      if (emp && emp.status !== "Active") { setErr("Your employee profile is inactive. Contact HR."); return; }
+    }
     onLogin(user);
   };
   return (<div className="min-h-screen grid place-items-center bg-slate-900 text-white p-4"><div className="text-center max-w-sm w-full">
@@ -471,12 +512,13 @@ function LeaveBalances({ data, name }) {
 function computePayslip(e, data, month) {
   const basic = +e.salary || 0;
   const allowances = Math.round(basic * 0.1);
-  const reimb = data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===e.name && p.status==="Approved" && !p.settled).reduce((s,p)=>s+ +p.amount,0);
-  const tax = Math.round(annualTax((basic+allowances)*12) / 12);
+  const reimb = data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===e.name && p.status==="Approved" && !p.settled && p.payVia==="salary" && (!p.payMonth || p.payMonth===month)).reduce((s,p)=>s+ +p.amount,0);
+  const tax = 0;   // not auto-calculated — set manually per payslip if needed
+  const eobi = 0;  // not auto-calculated
   const pf = Math.round(basic * (+e.pf||0) / 100);
   const advance = data.advances.filter(a=>a.employee===e.name && a.status==="Active" && a.remaining>0).reduce((s,a)=>s+Math.min(+a.installment, a.remaining),0);
-  const deductions = tax + EOBI + pf + advance;
-  return { id:uid(), employee:e.name, month, basic, allowances, reimbursements:reimb, tax, eobi:EOBI, pf, advance, deductions, paid:false, date:today() };
+  const deductions = tax + eobi + pf + advance;
+  return { id:uid(), employee:e.name, month, basic, allowances, reimbursements:reimb, tax, eobi, pf, advance, deductions, paid:false, date:today() };
 }
 const netPay = (p) => +p.basic + +p.allowances + (+p.reimbursements||0) - (+p.deductions||0);
 
@@ -540,14 +582,21 @@ function EmpDashboard({ data, update, me }) {
 }
 function EmpProfile({ data, update, me }) {
   const [req, setReq] = useState(null);
+  const [cert, setCert] = useState(null);
   const submit = () => { update("requests", [{ id:uid(), employee:me.name, type:"Profile update", note:req, status:"Open", date:today() }, ...data.requests], `${me.name} requested a profile change`); setReq(null); };
+  const submitCert = () => { update("requests", [{ id:uid(), employee:me.name, type:cert.type, note:cert.note, status:"Requested", date:today() }, ...data.requests], `${me.name} requested ${cert.type}`); setCert(null); };
   return (<>
-    <Head title="My Profile" sub="Your records on file" action={<Btn variant="ghost" onClick={()=>setReq("")}><Edit3 size={15}/>Request edit</Btn>}/>
+    <Head title="My Profile" sub="Your records on file" action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>setCert({ type:"Salary Certificate", note:"" })}><FileSignature size={15}/>Request certificate</Btn><Btn variant="ghost" onClick={()=>setReq("")}><Edit3 size={15}/>Request edit</Btn></div>}/>
     <div className="flex items-center gap-4 mb-6"><div className="w-14 h-14 rounded-2xl bg-sky-100 text-sky-700 grid place-items-center font-bold text-xl">{me.name[0]}</div><div><div className="text-lg font-bold text-slate-900">{me.name}</div><div className="text-sm text-slate-500">{me.role} · {me.dept}</div></div></div>
     <div className="grid sm:grid-cols-2 gap-4 mb-6">{[["Email",me.email],["Phone",me.phone],["CNIC",me.cnic],["Salary",fmt(me.salary)],["Joined",me.joined],["Status",me.status]].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-xs text-slate-500">{k}</div><div className="font-medium mt-0.5">{v||"—"}</div></div></Card>))}</div>
     <div className="text-xs uppercase tracking-wider text-slate-500 mb-2 font-medium">My documents</div>
     <Card><div className="p-4">{(!me.docs||me.docs.length===0)?<Empty msg="No documents on file"/>:<div className="grid sm:grid-cols-3 gap-3">{me.docs.map(d=>(<div key={d.id} className="bg-slate-50 border border-slate-200 rounded-lg overflow-hidden">{d.img?<img src={d.img} className="w-full h-32 object-cover"/>:<div className="h-32 grid place-items-center text-slate-400"><FileText/></div>}<div className="p-2 text-xs truncate">{d.name}{d.expiry&&<span className="block text-slate-400">exp {d.expiry}</span>}</div></div>))}</div>}</div></Card>
     {req!==null && <Modal title="Request a profile change" onClose={()=>setReq(null)}><Area label="What needs updating?" value={req} onChange={e=>setReq(e.target.value)} placeholder="e.g. New phone number, updated CNIC scan"/><Btn onClick={submit}><Check size={15}/>Send to HR</Btn></Modal>}
+    {cert && <Modal title="Request a certificate / letter" onClose={()=>setCert(null)}>
+      <Select label="What do you need?" options={["Salary Certificate","Experience Certificate","Employment Verification","Appointment Letter","Other"]} value={cert.type} onChange={e=>setCert({...cert,type:e.target.value})}/>
+      <Area label="Any details for HR (optional)" value={cert.note} onChange={e=>setCert({...cert,note:e.target.value})} placeholder="e.g. addressed to the bank, needed by Friday"/>
+      <Btn onClick={submitCert}><Check size={15}/>Send request to HR</Btn>
+    </Modal>}
   </>);
 }
 function EmpAttendance({ data, update, me }) {
@@ -747,7 +796,7 @@ function UsersAccess({ data, update }) {
       <Field label="Username" value={edit.username} onChange={e=>setEdit({...edit,username:e.target.value})} placeholder="e.g. qasim"/>
       <Field label="Password" value={edit.password} onChange={e=>setEdit({...edit,password:e.target.value})} placeholder="set a password"/>
       <Select label="Role" options={["employee","hr","admin"]} value={edit.role} onChange={e=>setEdit({...edit,role:e.target.value, empId: e.target.value==="employee"?edit.empId:""})}/>
-      {edit.role==="employee" && <label className="block"><span className="text-xs text-slate-500 mb-1 block">Link to employee</span>
+      {edit.role==="employee" && <label className="block"><span className="text-xs text-slate-500 mb-1 block">Which staff member is this login for?</span>
         <select value={edit.empId} onChange={e=>setEdit({...edit,empId:e.target.value})} className={inputCls}>
           <option value="">— select employee —</option>
           {edit.id && data.employees.find(e=>e.id===edit.empId) && !unlinkedEmps.find(e=>e.id===edit.empId) && <option value={edit.empId}>{data.employees.find(e=>e.id===edit.empId).name}</option>}
@@ -867,13 +916,18 @@ function Attendance({ data, update }) {
   const [view, setView] = useState("attendance");
   const mark = (emp,status)=>{ const ex=data.attendance.find(a=>a.employee===emp&&a.date===today()); update("attendance", ex?data.attendance.map(a=>a===ex?{...a,status}:a):[...data.attendance,{id:uid(),employee:emp,date:today(),status}]); };
   const setStatus=(id,s)=>{ const l=data.leaves.find(x=>x.id===id); update("leaves",data.leaves.map(x=>x.id===id?{...x,status:s}:x), `Leave ${s.toLowerCase()} for ${l?.employee}`); };
+  const locLink = (loc) => loc && loc.lat ? `https://www.google.com/maps?q=${loc.lat},${loc.lng}` : null;
+  const history = [...data.attendance].sort((a,b)=> (b.date||"").localeCompare(a.date||"") || (b.checkIn||"").localeCompare(a.checkIn||""));
   return (<>
-    <Head title="Attendance & Leave" sub="Team marking and leave approvals"/>
-    <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="attendance"?"primary":"ghost"} onClick={()=>setView("attendance")}>Today's attendance</Btn><Btn variant={view==="leave"?"primary":"ghost"} onClick={()=>setView("leave")}>Leave requests</Btn></div>
+    <Head title="Attendance & Leave" sub="Team marking, check-in/out log, and leave approvals"/>
+    <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="attendance"?"primary":"ghost"} onClick={()=>setView("attendance")}>Today's attendance</Btn><Btn variant={view==="history"?"primary":"ghost"} onClick={()=>setView("history")}>Check-in/out log</Btn><Btn variant={view==="leave"?"primary":"ghost"} onClick={()=>setView("leave")}>Leave requests</Btn></div>
     {view==="attendance"?(
-      <Card><Table cols={["Employee","Today","In / Out",""]}>{data.employees.filter(e=>e.status==="Active").map(e=>{const a=data.attendance.find(x=>x.employee===e.name&&x.date===today());return(
-        <Row key={e.id}><Td className="font-medium">{e.name}</Td><Td>{a?<span className="text-xs text-slate-600">{a.status}</span>:<span className="text-slate-400 text-xs">Not marked</span>}</Td><Td className="text-xs text-slate-500">{a?.checkIn?timeOf(a.checkIn):"—"} / {a?.checkOut?timeOf(a.checkOut):"—"}</Td>
+      <Card><Table cols={["Employee","Today","In / Out","Location",""]}>{data.employees.filter(e=>e.status==="Active").map(e=>{const a=data.attendance.find(x=>x.employee===e.name&&x.date===today());const ll=locLink(a?.location);return(
+        <Row key={e.id}><Td className="font-medium">{e.name}</Td><Td>{a?<span className="text-xs text-slate-600">{a.status}</span>:<span className="text-slate-400 text-xs">Not marked</span>}</Td><Td className="text-xs text-slate-500">{a?.checkIn?timeOf(a.checkIn):"—"} / {a?.checkOut?timeOf(a.checkOut):"—"}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={12}/>map</a>:<span className="text-slate-400">—</span>}</Td>
         <Td><div className="flex gap-1 justify-end"><button onClick={()=>mark(e.name,"Present")} className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Present</button><button onClick={()=>mark(e.name,"Absent")} className="px-2 py-1 rounded text-xs bg-rose-100 text-rose-700 hover:bg-rose-200">Absent</button><button onClick={()=>mark(e.name,"Leave")} className="px-2 py-1 rounded text-xs bg-amber-100 text-amber-700 hover:bg-amber-200">Leave</button></div></Td></Row>);})}</Table></Card>
+    ):view==="history"?(
+      <Card><Table cols={["Date","Employee","Status","Check-in","Check-out","Location"]}>{history.length===0?<tr><td colSpan={6}><Empty msg="No attendance recorded yet"/></td></tr>:history.map(a=>{const ll=locLink(a.location);return(
+        <Row key={a.id}><Td className="text-slate-500 whitespace-nowrap">{a.date}</Td><Td className="font-medium">{a.employee}</Td><Td>{a.status}</Td><Td className="text-slate-500">{a.checkIn?timeOf(a.checkIn):"—"}</Td><Td className="text-slate-500">{a.checkOut?timeOf(a.checkOut):"—"}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={12}/>view</a>:<span className="text-slate-400">—</span>}</Td></Row>);})}</Table></Card>
     ):(
       <Card><Table cols={["Employee","Type","From","To","Days","Status",""]}>{data.leaves.length===0?<tr><td colSpan={7}><Empty msg="No leave requests"/></td></tr>:data.leaves.map(l=>(
         <Row key={l.id}><Td className="font-medium">{l.employee}</Td><Td className="text-slate-500">{l.type}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td><Pill s={l.status}/></Td>
@@ -885,28 +939,41 @@ function Attendance({ data, update }) {
 function Payroll({ data, patch, update, brand }) {
   const [slip, setSlip] = useState(null);
   const [payProof, setPayProof] = useState(null);
+  const [editDed, setEditDed] = useState(null);
   const month = monthLabel();
   const run=()=>{
-    const ids=[]; data.payables.forEach(p=>{ if(p.kind==="reimbursement"&&p.status==="Approved"&&!p.settled) ids.push(p.id); });
+    const ids=[]; data.payables.forEach(p=>{ if(p.kind==="reimbursement"&&p.status==="Approved"&&!p.settled&&p.payVia==="salary"&&(!p.payMonth||p.payMonth===month)) ids.push(p.id); });
     const runs=data.employees.filter(e=>e.status==="Active").map(e=>computePayslip(e,data,month));
     const newPayables=data.payables.map(p=>ids.includes(p.id)?{...p,settled:true,status:"Paid"}:p);
     const newAdvances=data.advances.map(a=>{ if(a.status==="Active"&&a.remaining>0){ const d=Math.min(+a.installment,a.remaining); const rem=a.remaining-d; return {...a,remaining:rem,status:rem<=0?"Cleared":"Active"};} return a; });
     patch({ payroll:[...runs,...data.payroll], payables:newPayables, advances:newAdvances }, `Ran payroll for ${month}`);
   };
+  const saveDed = () => {
+    const tax=+editDed.tax||0, eobi=+editDed.eobi||0, pf=+editDed.pf||0, advance=+editDed.advance||0;
+    const deductions = tax+eobi+pf+advance;
+    update("payroll", data.payroll.map(x=>x.id===editDed.id?{...x,tax,eobi,pf,advance,deductions}:x), `Adjusted deductions for ${editDed.employee} (${editDed.month})`);
+    setEditDed(null);
+  };
   const pendingReimb = data.payables.filter(p=>p.kind==="reimbursement"&&p.status==="Approved"&&!p.settled).reduce((s,p)=>s+ +p.amount,0);
   const empEmail = (name) => data.employees.find(e=>e.name===name)?.email || "";
   const empAcct = (name) => data.employees.find(e=>e.name===name)?.account || "";
   return (<>
-    <Head title="Payroll & Salary Slips" sub={`${month} · tax, EOBI, PF & advances auto-deducted${pendingReimb?` · ${fmt(pendingReimb)} reimbursements queued`:""}`} action={<Btn onClick={run}><Wallet size={15}/>Run payroll · {month}</Btn>}/>
+    <Head title="Payroll & Salary Slips" sub={`${month} · PF & advances deducted · tax/EOBI are manual (0 unless you set them)${pendingReimb?` · ${fmt(pendingReimb)} reimbursements queued`:""}`} action={<Btn onClick={run}><Wallet size={15}/>Run payroll · {month}</Btn>}/>
     <Card><Table cols={["Employee","Month","Net","Account / IBAN","Payment","",""]}>{data.payroll.length===0?<tr><td colSpan={7}><Empty msg="No payroll runs yet"/></td></tr>:data.payroll.map(p=>(
       <Row key={p.id}>
         <Td className="font-medium">{p.employee}</Td><Td className="text-slate-500">{p.month}</Td><Td className="font-semibold">{fmt(netPay(p))}</Td>
         <Td className="text-slate-500 text-xs">{empAcct(p.employee)||"— not on file —"}</Td>
         <Td>{p.paid?<span className="flex items-center gap-2"><Pill s="Paid"/>{p.proof&&<img src={p.proof} className="w-7 h-7 rounded object-cover border border-slate-200"/>}</span>:<Pill s="Pending"/>}</Td>
         <Td><button onClick={()=>setSlip(p)} className="text-sky-600 text-xs font-medium hover:underline">View slip</button></Td>
-        <Td><RowActions>{!p.paid && <button onClick={()=>setPayProof({ ...p, proof:null })} className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Mark paid</button>}{p.paid && <button onClick={()=>setPayProof({ ...p })} title="Update payment" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Edit3 size={14}/></button>}</RowActions></Td>
+        <Td><RowActions>{!p.paid && <button onClick={()=>setEditDed({...p})} title="Edit deductions (tax/EOBI/PF)" className="px-2 py-1 rounded text-xs bg-slate-100 text-slate-600 hover:bg-slate-200">Deductions</button>}{!p.paid && <button onClick={()=>setPayProof({ ...p, proof:null })} className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Mark paid</button>}{p.paid && <button onClick={()=>setPayProof({ ...p })} title="Update payment" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Edit3 size={14}/></button>}</RowActions></Td>
       </Row>))}</Table></Card>
     {slip && <SlipModal slip={slip} brand={brand} onClose={()=>setSlip(null)}/>}
+    {editDed && <Modal title={`Deductions · ${editDed.employee}`} onClose={()=>setEditDed(null)}>
+      <p className="text-xs text-slate-500">These are blank (0) by default. Enter any amounts that apply for {editDed.month}.</p>
+      <div className="grid grid-cols-2 gap-3"><Field label="Income tax" type="number" value={editDed.tax} onChange={e=>setEditDed({...editDed,tax:e.target.value})}/><Field label="EOBI" type="number" value={editDed.eobi} onChange={e=>setEditDed({...editDed,eobi:e.target.value})}/></div>
+      <div className="grid grid-cols-2 gap-3"><Field label="Provident fund" type="number" value={editDed.pf} onChange={e=>setEditDed({...editDed,pf:e.target.value})}/><Field label="Advance / loan" type="number" value={editDed.advance} onChange={e=>setEditDed({...editDed,advance:e.target.value})}/></div>
+      <Btn onClick={saveDed}><Check size={15}/>Save deductions</Btn>
+    </Modal>}
     {payProof && <PayrollPaidModal rec={payProof} brand={brand} email={empEmail(payProof.employee)} onClose={()=>setPayProof(null)}
       onSave={(proof, method)=>{ update("payroll", data.payroll.map(x=>x.id===payProof.id?{...x,paid:true,proof,payMethod:method,paidOn:today()}:x), `Marked salary paid: ${payProof.employee} (${payProof.month})`); setPayProof(null); }}/>}
   </>);
@@ -956,14 +1023,26 @@ function VendorBills({ data, update, patch, role, brand }) {
     const stamp = { by: role==="admin"?"Founder":"HR", on: today() };
     const next = { ...b, [kind==="hr"?"hrApproved":"founderApproved"]: stamp };
     next.status = statusOf(next);
-    let bills = rows.map(x=>x.id===b.id?next:x);
-    update("vendorBills", bills, `${stamp.by} approved vendor bill: ${b.vendor} ${fmt(b.amount,b.currency)}`);
+    const fullyApproved = next.hrApproved && next.founderApproved && !next.paid;
+    if (fullyApproved) {
+      // both signed off -> mark paid-routed and push into Payables in one write
+      next.paid = true; next.status = "Paid";
+      const payable = { id:uid(), vendor:next.vendor, desc:`Vendor bill: ${next.desc||next.category}`, amount:+next.amount, due:next.due, status:"Pending", kind:"vendorbill", billId:next.id, receipt:next.file, fileType:next.fileType };
+      patch({ vendorBills: rows.map(x=>x.id===b.id?next:x), payables:[payable, ...data.payables] }, `${stamp.by} gave final approval — ${next.vendor} sent to Payables`);
+    } else {
+      update("vendorBills", rows.map(x=>x.id===b.id?next:x), `${stamp.by} approved vendor bill: ${b.vendor} ${fmt(b.amount,b.currency)}`);
+    }
   };
   const sendToPayables = (b) => {
     const payable = { id:uid(), vendor:b.vendor, desc:`Vendor bill: ${b.desc||b.category}`, amount:+b.amount, due:b.due, status:"Pending", kind:"vendorbill", billId:b.id, receipt:b.file };
     patch({ payables:[payable, ...data.payables], vendorBills: rows.map(x=>x.id===b.id?{...x,paid:true,status:"Paid"}:x) }, `Vendor bill sent to Payables: ${b.vendor}`);
   };
-  const onFile = async (f, setFn, cur) => { if(!f) return; const isImg=f.type.startsWith("image/"); setFn({ ...cur, fileName:f.name, file: isImg ? await readImage(f, 1100) : "FILE" }); };
+  const onFile = async (f, setFn, cur) => {
+    if(!f) return;
+    const isImg = f.type.startsWith("image/");
+    const data = isImg ? await readImage(f, 1100) : await readFile(f);
+    setFn({ ...cur, fileName:f.name, fileType: isImg ? "image" : "file", file: data });
+  };
   return (<>
     <Head title="Vendor Bills" sub="Upload vendor / contractor invoices — both HR and Founder must approve before payment" action={<Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Upload bill</Btn>}/>
     <Card><Table cols={["Vendor","For","Amount","Due","HR","Founder","Status",""]}>
@@ -980,11 +1059,11 @@ function VendorBills({ data, update, patch, role, brand }) {
             {b.file && <button onClick={()=>setViewBill(b)} title="View bill" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><FileText size={14}/></button>}
             {!b.hrApproved && role!=="employee" && <button onClick={()=>approve(b,"hr")} title="HR approve" className="px-2 py-1 rounded text-xs bg-amber-100 text-amber-700 hover:bg-amber-200">HR ✓</button>}
             {b.hrApproved && !b.founderApproved && role==="admin" && <button onClick={()=>approve(b,"founder")} title="Founder approve" className="px-2 py-1 rounded text-xs bg-sky-100 text-sky-700 hover:bg-sky-200">Founder ✓</button>}
-            {b.hrApproved && b.founderApproved && !b.paid && <button onClick={()=>sendToPayables(b)} title="Send to Payables" className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Pay →</button>}
+            {b.hrApproved && b.founderApproved && b.paid && <span className="text-xs text-emerald-600">in Payables</span>}
           </RowActions></Td>
         </Row>))}
     </Table></Card>
-    <p className="text-xs text-slate-400 mt-3">Flow: HR uploads → HR approves → Founder approves → "Pay →" sends it to Payables, where you record payment with proof. Approvals are stamped in the Activity Log.</p>
+    <p className="text-xs text-slate-400 mt-3">Flow: HR uploads → HR approves → Founder approves. On the Founder's approval the bill is automatically sent to Payables, where you record payment with proof. Approvals are stamped in the Activity Log.</p>
 
     {edit && <Modal title={edit.id?"Edit vendor bill":"Upload vendor bill"} onClose={()=>setEdit(null)}>
       <Field label="Vendor / contractor name" value={edit.vendor} onChange={e=>setEdit({...edit,vendor:e.target.value})}/>
@@ -994,13 +1073,18 @@ function VendorBills({ data, update, patch, role, brand }) {
       <Field label="Due date" type="date" value={edit.due} onChange={e=>setEdit({...edit,due:e.target.value})}/>
       <div><span className="text-xs text-slate-500 mb-1 block">Bill / invoice file</span>
         <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500"><Paperclip size={15}/>{edit.fileName||"Attach invoice (image or PDF)"}<input type="file" accept="image/*,.pdf" className="hidden" onChange={e=>onFile(e.target.files[0], setEdit, edit)}/></label>
-        {edit.file && edit.file!=="FILE" && <img src={edit.file} className="mt-2 h-32 rounded-lg border border-slate-200 object-cover"/>}
+        {edit.file && (edit.fileType==="image" || edit.file.startsWith("data:image")) && <img src={edit.file} className="mt-2 h-32 rounded-lg border border-slate-200 object-cover"/>}
+        {edit.file && !(edit.fileType==="image" || edit.file.startsWith("data:image")) && <button onClick={()=>openDataUrl(edit.file, edit.fileName)} className="mt-2 text-sky-600 text-xs hover:underline flex items-center gap-1"><FileText size={13}/>Open {edit.fileName||"file"}</button>}
       </div>
       <Btn onClick={()=>{ if(edit.vendor&&edit.amount) save(edit); }}><Check size={15}/>{edit.id?"Save":"Upload bill"}</Btn>
     </Modal>}
 
     {viewBill && <Modal title={`Bill · ${viewBill.vendor}`} onClose={()=>setViewBill(null)}>
-      {viewBill.file && viewBill.file!=="FILE" ? <img src={viewBill.file} className="w-full rounded-lg border border-slate-200"/> : <div className="text-sm text-slate-500 text-center py-6">{viewBill.fileName||"File attached"} — preview not available for this file type.</div>}
+      {viewBill.file && (viewBill.fileType==="image" || (viewBill.file||"").startsWith("data:image"))
+        ? <img src={viewBill.file} className="w-full rounded-lg border border-slate-200"/>
+        : viewBill.file
+          ? <Btn variant="ghost" onClick={()=>openDataUrl(viewBill.file, viewBill.fileName)}><FileText size={15}/>Open {viewBill.fileName||"bill file"}</Btn>
+          : <div className="text-sm text-slate-500 text-center py-6">No file attached.</div>}
       <div className="text-sm space-y-1"><div className="flex justify-between"><span className="text-slate-500">Amount</span><b>{fmt(viewBill.amount,viewBill.currency)}</b></div><div className="flex justify-between"><span className="text-slate-500">Due</span><span>{viewBill.due}</span></div></div>
     </Modal>}
   </>);
@@ -1050,7 +1134,7 @@ function Recruit({ data, update }) {
   const stages=["Applied","Screening","Interview","Offer","Hired","Rejected"];
   const blank={name:"",role:"",email:"",phone:"",stage:"Applied",notes:"",cv:null,cvName:"",date:today()};
   const save=c=>{setRows(c.id?rows.map(r=>r.id===c.id?c:r):[{...c,id:uid()},...rows]);setEdit(null);};
-  const onCv=async(f,cur)=>{ if(!f) return; const isImg=f.type.startsWith("image/"); setEdit({...cur,cvName:f.name,cv:isImg?await readImage(f,1100):"FILE"}); };
+  const onCv=async(f,cur)=>{ if(!f) return; const isImg=f.type.startsWith("image/"); setEdit({...cur,cvName:f.name,cvType:isImg?"image":"file",cv:isImg?await readImage(f,1100):await readFile(f)}); };
   return (<>
     <Head title="Recruitment & Onboarding" sub="Candidate pipeline · every candidate is filed in the CV Bank" action={<Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add candidate</Btn>}/>
     <div className="grid md:grid-cols-3 gap-4">{stages.filter(s=>s!=="Rejected").map(stage=>(<div key={stage}><div className="text-xs uppercase tracking-wider text-slate-500 mb-2 px-1 font-medium">{stage} · {rows.filter(r=>r.stage===stage).length}</div><div className="space-y-2">{rows.filter(r=>r.stage===stage).map(c=>(<div key={c.id} className="bg-white border border-slate-200 rounded-lg p-3 shadow-sm"><div className="flex justify-between items-start"><div><div className="font-medium text-sm">{c.name}</div><div className="text-xs text-slate-500">{c.role}</div></div><button onClick={()=>setEdit(c)} className="text-slate-400 hover:text-sky-600"><Edit3 size={13}/></button></div>{c.notes&&<div className="text-xs text-slate-500 mt-2">{c.notes}</div>}{c.cv&&<button onClick={()=>setViewCv(c)} className="text-sky-600 text-xs mt-2 flex items-center gap-1 hover:underline"><FileText size={12}/>View CV</button>}</div>))}</div></div>))}</div>
@@ -1062,7 +1146,8 @@ function Recruit({ data, update }) {
       <Field label="Notes" value={edit.notes} onChange={e=>setEdit({...edit,notes:e.target.value})}/>
       <div><span className="text-xs text-slate-500 mb-1 block">CV / resume</span>
         <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500"><Paperclip size={15}/>{edit.cvName||"Attach CV (PDF or image)"}<input type="file" accept="image/*,.pdf,.doc,.docx" className="hidden" onChange={e=>onCv(e.target.files[0],edit)}/></label>
-        {edit.cv && edit.cv!=="FILE" && <img src={edit.cv} className="mt-2 h-32 rounded-lg border border-slate-200 object-cover"/>}
+        {edit.cv && (edit.cvType==="image"||edit.cv.startsWith("data:image")) && <img src={edit.cv} className="mt-2 h-32 rounded-lg border border-slate-200 object-cover"/>}
+        {edit.cv && !(edit.cvType==="image"||edit.cv.startsWith("data:image")) && <button onClick={()=>openDataUrl(edit.cv, edit.cvName)} className="mt-2 text-sky-600 text-xs hover:underline flex items-center gap-1"><FileText size={13}/>Open {edit.cvName||"CV"}</button>}
       </div>
       <div className="flex gap-2"><Btn onClick={()=>save(edit)}><Check size={15}/>Save</Btn>{edit.id&&<Btn variant="danger" onClick={()=>{setRows(rows.filter(r=>r.id!==edit.id));setEdit(null);}}><Trash2 size={15}/>Remove</Btn>}</div>
     </Modal>}
@@ -1071,7 +1156,7 @@ function Recruit({ data, update }) {
 }
 function CvModal({ c, onClose }) {
   return (<Modal title={`CV · ${c.name}`} onClose={onClose}>
-    {c.cv && c.cv!=="FILE" ? <img src={c.cv} className="w-full rounded-lg border border-slate-200"/> : <div className="text-sm text-slate-500 text-center py-6">{c.cvName||"File attached"} — preview isn't available for this file type in the browser version.</div>}
+    {c.cv && (c.cvType==="image"||(c.cv||"").startsWith("data:image")) ? <img src={c.cv} className="w-full rounded-lg border border-slate-200"/> : c.cv ? <Btn variant="ghost" onClick={()=>openDataUrl(c.cv,c.cvName)}><FileText size={15}/>Open {c.cvName||"CV"}</Btn> : <div className="text-sm text-slate-500 text-center py-6">No CV attached.</div>}
     <div className="text-sm space-y-1"><div className="flex justify-between"><span className="text-slate-500">Position</span><b>{c.role||"—"}</b></div><div className="flex justify-between"><span className="text-slate-500">Email</span><span>{c.email||"—"}</span></div><div className="flex justify-between"><span className="text-slate-500">Phone</span><span>{c.phone||"—"}</span></div></div>
   </Modal>);
 }
@@ -1082,7 +1167,7 @@ function CVBank({ data, update }) {
   const [viewCv, setViewCv] = useState(null); const [add, setAdd] = useState(null);
   const positions = [...new Set(rows.map(c=>c.role).filter(Boolean))].sort();
   const filtered = rows.filter(c=>(!pos || c.role===pos) && (!q || c.name.toLowerCase().includes(q.toLowerCase())));
-  const onCv = async (f,cur)=>{ if(!f) return; const isImg=f.type.startsWith("image/"); setAdd({...cur,cvName:f.name,cv:isImg?await readImage(f,1100):"FILE"}); };
+  const onCv = async (f,cur)=>{ if(!f) return; const isImg=f.type.startsWith("image/"); setAdd({...cur,cvName:f.name,cvType:isImg?"image":"file",cv:isImg?await readImage(f,1100):await readFile(f)}); };
   const save = (c)=>{ if(!c.name) return; update("candidates", [{ ...c, id:uid(), stage:c.stage||"Applied", date:today() }, ...rows], `Added CV to bank: ${c.name} (${c.role||"unspecified"})`); setAdd(null); };
   return (<>
     <Head title="CV Bank" sub="Every CV ever received — filter by position to shortlist for a role" action={<Btn onClick={()=>setAdd({ name:"",role:"",email:"",phone:"",notes:"",cv:null,cvName:"" })}><Plus size={15}/>Add CV</Btn>}/>
@@ -1109,7 +1194,8 @@ function CVBank({ data, update }) {
       <div className="grid grid-cols-2 gap-3"><Field label="Email" value={add.email} onChange={e=>setAdd({...add,email:e.target.value})}/><Field label="Phone" value={add.phone} onChange={e=>setAdd({...add,phone:e.target.value})}/></div>
       <div><span className="text-xs text-slate-500 mb-1 block">CV / resume</span>
         <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500"><Paperclip size={15}/>{add.cvName||"Attach CV (PDF or image)"}<input type="file" accept="image/*,.pdf,.doc,.docx" className="hidden" onChange={e=>onCv(e.target.files[0],add)}/></label>
-        {add.cv && add.cv!=="FILE" && <img src={add.cv} className="mt-2 h-32 rounded-lg border border-slate-200 object-cover"/>}
+        {add.cv && (add.cvType==="image"||add.cv.startsWith("data:image")) && <img src={add.cv} className="mt-2 h-32 rounded-lg border border-slate-200 object-cover"/>}
+        {add.cv && !(add.cvType==="image"||add.cv.startsWith("data:image")) && <button onClick={()=>openDataUrl(add.cv, add.cvName)} className="mt-2 text-sky-600 text-xs hover:underline flex items-center gap-1"><FileText size={13}/>Open {add.cvName||"CV"}</button>}
       </div>
       <p className="text-xs text-slate-400">Added here, this person also appears in the Recruitment pipeline at the "Applied" stage.</p>
       <Btn onClick={()=>save(add)}><Check size={15}/>Save to bank</Btn>
@@ -1171,14 +1257,18 @@ function Letters({ data, update, brand }) {
   </>);
 }
 
-function Proposals({ data, update, brand }) {
+function Proposals({ data, update, patch, brand }) {
   const rows=data.proposals, setRows=r=>update("proposals",r);
   const [f,setF]=useState({ client:"",title:"",overview:"",scope:"",timeline:"",investment:"" });
   const [signed,setSigned]=useState({});
-  const body=`PROJECT PROPOSAL\nPrepared for: ${f.client||"[Client]"}\nDate: ${new Date().toLocaleDateString()}\n\n${f.title||"[Proposal title]"}\n\n1. Overview\n${f.overview||"…"}\n\n2. Scope of work\n${f.scope||"…"}\n\n3. Timeline\n${f.timeline||"…"}\n\n4. Investment\n${f.investment||"…"}\n\nWe appreciate the opportunity to work with ${f.client||"you"} and are confident in delivering exceptional results.`;
-  const save=()=>setRows([{id:uid(),docType:"Proposal",client:f.client,title:f.title,date:today(),body,signed},...rows]);
+  const [aiText,setAiText]=useState(""); const [busy,setBusy]=useState(false); const [msg,setMsg]=useState("");
+  const [tplOpen,setTplOpen]=useState(false); const [tpl,setTpl]=useState(data.aiTemplates?.proposal||"");
+  const body = aiText || `PROJECT PROPOSAL\nPrepared for: ${f.client||"[Client]"}\nDate: ${new Date().toLocaleDateString()}\n\n${f.title||"[Proposal title]"}\n\n1. Overview\n${f.overview||"…"}\n\n2. Scope of work\n${f.scope||"…"}\n\n3. Timeline\n${f.timeline||"…"}\n\n4. Investment\n${f.investment||"…"}\n\nWe appreciate the opportunity to work with ${f.client||"you"} and are confident in delivering exceptional results.`;
+  const draft=async()=>{ setBusy(true); setMsg(""); try{ const r=await aiDraft("proposal",f,data.aiTemplates?.proposal||""); setAiText(r.text||""); }catch(e){ setMsg(e.message); } setBusy(false); };
+  const save=()=>{ setRows([{id:uid(),docType:"Proposal",client:f.client,title:f.title,date:today(),body,signed},...rows]); setMsg("Proposal saved below."); setAiText(""); setF({ client:"",title:"",overview:"",scope:"",timeline:"",investment:"" }); };
+  const saveTpl=()=>{ patch({ aiTemplates: { ...(data.aiTemplates||{}), proposal: tpl } }, "Saved proposal AI template"); setTplOpen(false); };
   return (<>
-    <Head title="Proposals" sub="Build, sign and stamp a client proposal"/>
+    <Head title="Proposals" sub="Build, AI-draft, sign and save a client proposal" action={<Btn variant="ghost" onClick={()=>setTplOpen(true)}><FileText size={15}/>AI template</Btn>}/>
     <div className="grid lg:grid-cols-2 gap-5">
       <Card><div className="p-5 space-y-3">
         <div className="grid grid-cols-2 gap-3"><ClientInput clients={data.clients} value={f.client} onChange={e=>setF({...f,client:e.target.value})}/><Field label="Title" value={f.title} onChange={e=>setF({...f,title:e.target.value})}/></div>
@@ -1186,11 +1276,22 @@ function Proposals({ data, update, brand }) {
         <Area label="Scope of work" value={f.scope} onChange={e=>setF({...f,scope:e.target.value})}/>
         <Area label="Timeline" value={f.timeline} onChange={e=>setF({...f,timeline:e.target.value})}/>
         <Area label="Investment" value={f.investment} onChange={e=>setF({...f,investment:e.target.value})}/>
-        <div className="flex gap-2"><Btn onClick={save}><Check size={15}/>Save proposal</Btn><Btn variant="ghost" onClick={()=>window.print()}><Download size={15}/>Print</Btn></div>
+        <div className="flex flex-wrap gap-2">
+          <Btn variant="ok" onClick={draft}>{busy?<Loader2 size={15} className="animate-spin"/>:<PenTool size={15}/>}Draft with AI</Btn>
+          <Btn onClick={save}><Check size={15}/>Save proposal</Btn>
+          <Btn variant="ghost" onClick={()=>window.print()}><Download size={15}/>Print</Btn>
+        </div>
+        {aiText && <button onClick={()=>setAiText("")} className="text-xs text-slate-400 hover:underline">Clear AI draft (use template layout)</button>}
+        {msg && <div className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">{msg}</div>}
       </div></Card>
       <Card><div className="p-4"><DocSheet brand={brand} body={body} signed={signed} setSigned={setSigned}/></div></Card>
     </div>
     {rows.length>0 && <div className="mt-6"><div className="text-xs uppercase tracking-wider text-slate-500 mb-2 font-medium">Saved proposals</div><Card><Table cols={["Client","Title","Date",""]}>{rows.map(p=>(<Row key={p.id}><Td className="font-medium">{p.client}</Td><Td className="text-slate-500">{p.title}</Td><Td className="text-slate-500">{p.date}</Td><Td><RowActions onDelete={()=>setRows(rows.filter(r=>r.id!==p.id))}/></Td></Row>))}</Table></Card></div>}
+    {tplOpen && <Modal title="Saved AI template" onClose={()=>setTplOpen(false)}>
+      <p className="text-xs text-slate-500">Save a reusable style/structure. The AI uses it as a guide each time you click "Draft with AI".</p>
+      <Area label="Template / style guide" value={tpl} onChange={e=>setTpl(e.target.value)} placeholder="e.g. Always open with a warm greeting, use three sections (Approach, Deliverables, Investment), keep tone confident and concise, sign off as the Svype team."/>
+      <Btn onClick={saveTpl}><Check size={15}/>Save template</Btn>
+    </Modal>}
   </>);
 }
 
@@ -1228,11 +1329,58 @@ function Quotations({ data, update, brand }) {
   </>);
 }
 
+function retainerInvoiceHTML(inv, brand) {
+  const money = (n) => `${inv.currency || "PKR"} ${Number(n||0).toLocaleString()}`;
+  const logo = brand.logo ? `<img src="${brand.logo}" style="height:54px;object-fit:contain"/>` : "";
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${inv.number}</title>
+  <style>
+    *{font-family:Arial,Helvetica,sans-serif;color:#0f172a;box-sizing:border-box}
+    body{margin:0;padding:40px}
+    .hd{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:3px solid ${brand.accent||"#0284c7"};padding-bottom:16px;margin-bottom:24px}
+    .co{font-size:20px;font-weight:bold}.tag{color:#64748b;font-size:12px}
+    .meta{text-align:right;font-size:12px;color:#475569}
+    h1{font-size:26px;letter-spacing:1px;margin:0 0 4px}
+    table{width:100%;border-collapse:collapse;margin-top:20px}
+    th,td{text-align:left;padding:10px;border-bottom:1px solid #e2e8f0;font-size:14px}
+    th{background:#f8fafc;color:#475569;text-transform:uppercase;font-size:11px}
+    .tot{text-align:right;font-size:18px;font-weight:bold;margin-top:18px}
+    .foot{margin-top:40px;color:#64748b;font-size:12px}
+    .pill{display:inline-block;padding:3px 10px;border-radius:6px;font-size:12px;background:#fef3c7;color:#b45309}
+  </style></head><body>
+  <div class="hd"><div style="display:flex;gap:12px;align-items:center">${logo}<div><div class="co">${brand.company||""}</div><div class="tag">${brand.tagline||""}</div></div></div>
+  <div class="meta">${brand.address||""}<br>${brand.contact||""}</div></div>
+  <h1>INVOICE</h1>
+  <div style="display:flex;justify-content:space-between;font-size:13px;color:#475569;margin-top:8px">
+    <div><b>Billed to:</b><br>${inv.client||""}</div>
+    <div style="text-align:right">
+      <b>Invoice #:</b> ${inv.number}<br>
+      <b>Billing month:</b> ${inv.month||"—"}<br>
+      <b>Issued:</b> ${inv.date||today()}<br>
+      <b>Due:</b> ${inv.due||"—"}
+    </div>
+  </div>
+  <table><thead><tr><th>Description</th><th style="text-align:right">Amount</th></tr></thead>
+  <tbody>
+    <tr><td>Monthly retainer — ${inv.month||""}</td><td style="text-align:right">${money(inv.base)}</td></tr>
+    ${+inv.carry ? `<tr><td>Brought forward (previous balance)</td><td style="text-align:right">${money(inv.carry)}</td></tr>` : ""}
+  </tbody></table>
+  <div class="tot">Total due: ${money(inv.total)}</div>
+  <div class="foot">Status: <span class="pill">${inv.status}</span><br><br>Kindly transfer the amount due and share the receipt. Thank you for your business.</div>
+  <script>window.onload=()=>{setTimeout(()=>window.print(),300)}</script>
+  </body></html>`;
+}
+function openInvoicePDF(inv, brand) {
+  const w = window.open("", "_blank");
+  if (!w) { alert("Allow pop-ups to download the invoice PDF."); return; }
+  w.document.write(retainerInvoiceHTML(inv, brand));
+  w.document.close();
+}
+
 function Retainers({ data, update, patch, brand, go }) {
   const rets = data.retainers, invs = data.retainerInvoices, clients = data.clients;
   const accounts = (data.bankAccounts||[]).map(a=>({ id:a.id, name:a.label }));
   const [view, setView] = useState("invoices");
-  const [edit, setEdit] = useState(null); const [pay, setPay] = useState(null);
+  const [edit, setEdit] = useState(null); const [pay, setPay] = useState(null); const [manual, setManual] = useState(null);
   const blank = { client:"", whatsapp:"", amount:"", currency:"PKR", billingDay:1, status:"Active", carry:0 };
   const onClient=(v)=>{ const c=clients.find(x=>x.name===v); setEdit(e=>({...e,client:v,...(c?{currency:c.currency||"PKR",whatsapp:c.whatsapp||e.whatsapp}:{})})); };
   const saveClient = (c) => {
@@ -1242,7 +1390,17 @@ function Retainers({ data, update, patch, brand, go }) {
     patch({ retainers:newRets, ...extra }, c.id?`Updated retainer ${c.client}`:`Added retainer client ${c.client}`); setEdit(null);
   };
   const genDue = () => { const after = ensureRetainerInvoices(data); if (after !== data) patch({ retainerInvoices: after.retainerInvoices, retainers: after.retainers }); };
-  const sendWA = (inv) => { const r = rets.find(x=>x.id===inv.retainerId); const num = (r?.whatsapp||"").replace(/\D/g,""); const msg = `*${brand.company}*\n\nInvoice: ${inv.number}\nPeriod: ${inv.month}\nAmount due: ${fmt(inv.total,inv.currency)}` + (inv.carry?`\n(Includes ${fmt(inv.carry,inv.currency)} carried forward)`:``) + `\n\nKindly confirm once transferred. Thank you.`; window.open(`https://wa.me/${num}?text=${encodeURIComponent(msg)}`, "_blank"); };
+  // manual invoice
+  const newManual = () => setManual({ client:"", retainerId:"", month: monthLabel(), base:"", carry:0, currency:"PKR", date: today(), due:"", sendOn:"" });
+  const onManualClient = (v) => { const r = rets.find(x=>x.client===v); const c = clients.find(x=>x.name===v); setManual(m=>({ ...m, client:v, retainerId:r?.id||"", base: r? r.amount : m.base, currency: (r?.currency||c?.currency||m.currency) })); };
+  const saveManual = () => {
+    const m = manual; if (!m.client || !m.base) return;
+    const base = +m.base||0, carry = +m.carry||0;
+    const mk = (m.month||"").toLowerCase().replace(/\s+/g,"-");
+    const inv = { id:uid(), retainerId:m.retainerId||null, client:m.client, number:`RET-${Date.now().toString().slice(-6)}`, monthKey:mk, month:m.month, base, carry, total:base+carry, currency:m.currency||"PKR", status:"Unpaid", paidAmount:0, account:"", date:m.date||today(), due:m.due||"", sendOn:m.sendOn||"", paidDate:"" };
+    patch({ retainerInvoices:[...invs, inv] }, `Created invoice for ${m.client} (${m.month})`); setManual(null);
+  };
+  const sendWA = (inv) => { const r = rets.find(x=>x.id===inv.retainerId); const num = (r?.whatsapp||"").replace(/\D/g,""); const msg = `*${brand.company}*\n\nInvoice: ${inv.number}\nPeriod: ${inv.month}\nAmount due: ${fmt(inv.total,inv.currency)}` + (inv.due?`\nDue: ${inv.due}`:``) + (inv.carry?`\n(Includes ${fmt(inv.carry,inv.currency)} carried forward)`:``) + `\n\nKindly confirm once transferred. Thank you.`; window.open(`https://wa.me/${num}?text=${encodeURIComponent(msg)}`, "_blank"); };
   const confirmPay = ({ received, accountName, carryChoice }) => {
     const recv = +received||0; const shortfall = Math.max(0, pay.total - recv);
     const status = shortfall<=0 ? "Paid" : (recv>0 ? "Partial" : "Unpaid");
@@ -1251,15 +1409,15 @@ function Retainers({ data, update, patch, brand, go }) {
     patch({ retainerInvoices:newInvs, retainers:newRets }, `Payment recorded for ${pay.client} (${pay.number})`); setPay(null);
   };
   return (<>
-    <Head title="Retainers" sub="Recurring clients · invoices auto-generate each month" action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>go("accounts")}><Landmark size={15}/>Accounts</Btn><Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn></div>}/>
-    <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="invoices"?"primary":"ghost"} onClick={()=>setView("invoices")}>Invoices</Btn><Btn variant={view==="clients"?"primary":"ghost"} onClick={()=>setView("clients")}>Clients</Btn>{view==="invoices" && <Btn variant="ghost" onClick={genDue}><Repeat size={15}/>Generate due</Btn>}</div>
+    <Head title="Retainers" sub="Recurring clients · auto-generated monthly, or create an invoice manually" action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>go("accounts")}><Landmark size={15}/>Accounts</Btn><Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn></div>}/>
+    <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="invoices"?"primary":"ghost"} onClick={()=>setView("invoices")}>Invoices</Btn><Btn variant={view==="clients"?"primary":"ghost"} onClick={()=>setView("clients")}>Clients</Btn>{view==="invoices" && <><Btn variant="ghost" onClick={genDue}><Repeat size={15}/>Generate this month</Btn><Btn variant="ghost" onClick={newManual}><Plus size={15}/>Create invoice</Btn></>}</div>
     {view==="clients" ? (
       <Card><Table cols={["Client","WhatsApp","Monthly","Carried fwd","Status",""]}>{rets.length===0?<tr><td colSpan={6}><Empty msg="No retainer clients yet"/></td></tr>:rets.map(r=>(
         <Row key={r.id}><Td className="font-medium">{r.client}</Td><Td className="text-slate-500">{r.whatsapp||"—"}</Td><Td>{fmt(r.amount,r.currency)}</Td><Td className={+r.carry?"text-amber-600 font-medium":"text-slate-400"}>{r.carry?fmt(r.carry,r.currency):"—"}</Td><Td><Pill s={r.status}/></Td><Td><RowActions onEdit={()=>setEdit(r)} onDelete={()=>update("retainers",rets.filter(x=>x.id!==r.id))}/></Td></Row>))}</Table></Card>
     ) : (
-      <Card><Table cols={["Invoice","Client","Period","Total","Status",""]}>{invs.length===0?<tr><td colSpan={6}><Empty msg="No invoices yet — add a client or hit Generate due"/></td></tr>:[...invs].reverse().map(i=>(
-        <Row key={i.id}><Td className="font-medium">{i.number}</Td><Td className="text-slate-500">{i.client}</Td><Td className="text-slate-500">{i.month}</Td><Td>{fmt(i.total,i.currency)}{i.status==="Partial"&&<div className="text-xs text-orange-600">received {fmt(i.paidAmount,i.currency)}</div>}{i.status==="Paid"&&i.account&&<div className="text-xs text-slate-400">{i.account}</div>}</Td><Td><Pill s={i.status}/></Td>
-        <Td><RowActions onDelete={()=>update("retainerInvoices",invs.filter(x=>x.id!==i.id))}><button onClick={()=>sendWA(i)} title="Send on WhatsApp" className="p-1.5 rounded text-slate-400 hover:text-green-600 hover:bg-slate-100"><Send size={14}/></button>{i.status!=="Paid" && <button onClick={()=>setPay(i)} title="Mark as paid" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button>}</RowActions></Td></Row>))}</Table></Card>
+      <Card><Table cols={["Invoice","Client","Period","Due","Total","Status",""]}>{invs.length===0?<tr><td colSpan={7}><Empty msg="No invoices yet — generate this month or create one"/></td></tr>:[...invs].reverse().map(i=>(
+        <Row key={i.id}><Td className="font-medium">{i.number}</Td><Td className="text-slate-500">{i.client}</Td><Td className="text-slate-500">{i.month}</Td><Td className="text-slate-500">{i.due||"—"}{i.sendOn?<div className="text-xs text-slate-400">send {i.sendOn}</div>:null}</Td><Td>{fmt(i.total,i.currency)}{i.status==="Partial"&&<div className="text-xs text-orange-600">received {fmt(i.paidAmount,i.currency)}</div>}{i.status==="Paid"&&i.account&&<div className="text-xs text-slate-400">{i.account}</div>}</Td><Td><Pill s={i.status}/></Td>
+        <Td><RowActions onDelete={()=>update("retainerInvoices",invs.filter(x=>x.id!==i.id))}><button onClick={()=>openInvoicePDF(i, brand)} title="Download PDF invoice" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Download size={14}/></button><button onClick={()=>sendWA(i)} title="Send on WhatsApp" className="p-1.5 rounded text-slate-400 hover:text-green-600 hover:bg-slate-100"><Send size={14}/></button>{i.status!=="Paid" && <button onClick={()=>setPay(i)} title="Mark as paid" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button>}</RowActions></Td></Row>))}</Table></Card>
     )}
     {edit && <Modal title={edit.id?"Edit retainer client":"Add retainer client"} onClose={()=>setEdit(null)}>
       <ClientInput clients={clients} label="Client name" value={edit.client} onChange={e=>onClient(e.target.value)}/>
@@ -1268,6 +1426,13 @@ function Retainers({ data, update, patch, brand, go }) {
       <div className="grid grid-cols-2 gap-3"><Field label="Billing day" type="number" value={edit.billingDay} onChange={e=>setEdit({...edit,billingDay:e.target.value})}/><Select label="Status" options={["Active","Paused"]} value={edit.status} onChange={e=>setEdit({...edit,status:e.target.value})}/></div>
       <p className="text-xs text-slate-400">A new client name here is also added to your Clients list automatically.</p>
       <Btn onClick={()=>saveClient(edit)}><Check size={15}/>Save</Btn>
+    </Modal>}
+    {manual && <Modal title="Create invoice" onClose={()=>setManual(null)}>
+      <ClientInput clients={clients} label="Client" value={manual.client} onChange={e=>onManualClient(e.target.value)}/>
+      <div className="grid grid-cols-2 gap-3"><Field label="Billing month" value={manual.month} onChange={e=>setManual({...manual,month:e.target.value})} placeholder="e.g. June 2026"/><Select label="Currency" options={CURRENCIES} value={manual.currency} onChange={e=>setManual({...manual,currency:e.target.value})}/></div>
+      <div className="grid grid-cols-2 gap-3"><Field label="Amount" type="number" value={manual.base} onChange={e=>setManual({...manual,base:e.target.value})}/><Field label="Carry forward (optional)" type="number" value={manual.carry} onChange={e=>setManual({...manual,carry:e.target.value})}/></div>
+      <div className="grid grid-cols-3 gap-3"><Field label="Issue date" type="date" value={manual.date} onChange={e=>setManual({...manual,date:e.target.value})}/><Field label="Due date" type="date" value={manual.due} onChange={e=>setManual({...manual,due:e.target.value})}/><Field label="Send to client on" type="date" value={manual.sendOn} onChange={e=>setManual({...manual,sendOn:e.target.value})}/></div>
+      <Btn onClick={saveManual}><Check size={15}/>Create invoice</Btn>
     </Modal>}
     {pay && <PayModal inv={pay} accounts={accounts} onClose={()=>setPay(null)} onConfirm={confirmPay} onManageAccounts={()=>{setPay(null);go("accounts");}}/>}
   </>);
@@ -1304,13 +1469,37 @@ function Invoices({ data, update }) {
 }
 function Payables({ data, update }) {
   const rows=data.payables, setRows=r=>update("payables",r);
-  const approve=(r)=>update("payables", rows.map(x=>x.id===r.id?{...x,status:"Approved"}:x), `Approved reimbursement: ${r.vendor}`);
-  return <Ledger title="Payables" sub={`Owed · ${fmt(rows.filter(r=>r.status!=="Paid").reduce((s,r)=>s+ +r.amount,0))} · approve a reimbursement to add it to the next payslip`} rows={rows} setRows={setRows}
-    blank={()=>({vendor:"",desc:"",amount:"",due:today(),status:"Pending"})}
-    cols={["Vendor","Description","Amount","Due","Status"]}
-    render={r=>(<><Td className="font-medium">{r.vendor}</Td><Td className="text-slate-500"><div className="flex items-center gap-2">{r.receipt&&<img src={r.receipt} className="w-8 h-8 rounded object-cover border border-slate-200"/>}{r.desc}</div></Td><Td>{fmt(r.amount)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
-    extraActions={r=> r.kind==="reimbursement" && r.status!=="Approved" && r.status!=="Paid" ? <button onClick={()=>approve(r)} title="Approve → adds to next payslip" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button> : null}
-    fields={(e,s)=>(<><Field label="Vendor" value={e.vendor} onChange={ev=>s({...e,vendor:ev.target.value})}/><Field label="Description" value={e.desc} onChange={ev=>s({...e,desc:ev.target.value})}/><Field label="Amount (PKR)" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Field label="Due" type="date" value={e.due} onChange={ev=>s({...e,due:ev.target.value})}/><Select label="Status" options={["Pending","Approved","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>;
+  const [appr, setAppr] = useState(null);
+  const months = Array.from({length:6}).map((_,i)=>{ const d=new Date(); d.setMonth(d.getMonth()+i); return d.toLocaleString("default",{month:"long",year:"numeric"}); });
+  const openApprove = (r)=> setAppr({ id:r.id, vendor:r.vendor, amount:r.amount, mode:"salary", month: months[0], date: today() });
+  const confirmApprove = ()=>{
+    const a = appr;
+    setRows(rows.map(x=>{
+      if (x.id!==a.id) return x;
+      if (a.mode==="salary") return { ...x, status:"Approved", payVia:"salary", payMonth:a.month };
+      // direct / instant
+      return { ...x, status:"Paid", settled:true, payVia:"direct", paidDate:a.date };
+    }));
+    update("audit", [{ id:uid(), who:"HR", action:`Approved reimbursement ${a.vendor} — ${a.mode==="salary"?("with "+a.month+" salary"):("direct on "+a.date)}`, date:new Date().toISOString() }, ...(data.audit||[])].slice(0,500));
+    setAppr(null);
+  };
+  return (<>
+    <Ledger title="Payables" sub={`Owed · ${fmt(rows.filter(r=>r.status!=="Paid").reduce((s,r)=>s+ +r.amount,0))} · approve a reimbursement to choose how it's paid`} rows={rows} setRows={setRows}
+      blank={()=>({vendor:"",desc:"",amount:"",due:today(),status:"Pending"})}
+      cols={["Vendor","Description","Amount","Due","Status"]}
+      render={r=>(<><Td className="font-medium">{r.vendor}</Td><Td className="text-slate-500"><div className="flex items-center gap-2">{r.receipt&&<img src={r.receipt} className="w-8 h-8 rounded object-cover border border-slate-200"/>}{r.desc}{r.payVia==="salary"&&<span className="text-xs text-sky-600">→ {r.payMonth} salary</span>}</div></Td><Td>{fmt(r.amount)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
+      extraActions={r=> r.kind==="reimbursement" && r.status!=="Approved" && r.status!=="Paid" ? <button onClick={()=>openApprove(r)} title="Approve reimbursement" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button> : null}
+      fields={(e,s)=>(<><Field label="Vendor" value={e.vendor} onChange={ev=>s({...e,vendor:ev.target.value})}/><Field label="Description" value={e.desc} onChange={ev=>s({...e,desc:ev.target.value})}/><Field label="Amount (PKR)" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Field label="Due" type="date" value={e.due} onChange={ev=>s({...e,due:ev.target.value})}/><Select label="Status" options={["Pending","Approved","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>
+    {appr && <Modal title={`Approve reimbursement · ${appr.vendor}`} onClose={()=>setAppr(null)}>
+      <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm flex justify-between"><span className="text-slate-500">Amount</span><b>{fmt(appr.amount)}</b></div>
+      <Select label="How should this be paid?" options={["salary","direct"]} value={appr.mode} onChange={e=>setAppr({...appr,mode:e.target.value})}/>
+      {appr.mode==="salary"
+        ? <Select label="Add to which month's salary?" options={months} value={appr.month} onChange={e=>setAppr({...appr,month:e.target.value})}/>
+        : <Field label="Pay on date (today = instant)" type="date" value={appr.date} onChange={e=>setAppr({...appr,date:e.target.value})}/>}
+      <p className="text-xs text-slate-400">{appr.mode==="salary" ? "It will be added to that month's payslip when you run payroll for that month." : "It will be marked paid directly on this date (outside salary)."}</p>
+      <Btn onClick={confirmApprove}><Check size={15}/>Approve</Btn>
+    </Modal>}
+  </>);
 }
 function Receivables({ data, update }) {
   const rows=data.receivables, setRows=r=>update("receivables",r); const clients=data.clients;
@@ -1505,7 +1694,7 @@ function TeamChat({ session }) {
   useEffect(() => { loadChannels(); apiReq("GET", "/chat/directory").then(setDirectory).catch(()=>{}); }, []);
 
   useEffect(() => {
-    const ws = chatSocket((m) => { if (m.type === "message" && m.channelId === active?.id) setMessages((p) => [...p, m.message]); });
+    const ws = chatSocket((m) => { if (m.type === "message" && m.channelId === active?.id) setMessages((p) => p.some(x=>x.id===m.message.id) ? p : [...p, m.message]); });
     wsRef.current = ws;
     return () => ws.close();
   }, [active?.id]);
@@ -1521,7 +1710,7 @@ function TeamChat({ session }) {
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
-  const send = async () => { if (!text.trim() || !active) return; try { await apiReq("POST", `/chat/channels/${active.id}/messages`, { body: text.trim() }); setText(""); } catch {} };
+  const send = async () => { if (!text.trim() || !active) return; const body = text.trim(); setText(""); try { const msg = await apiReq("POST", `/chat/channels/${active.id}/messages`, { body }); if (msg && msg.id) setMessages((p) => p.some(x=>x.id===msg.id) ? p : [...p, msg]); } catch {} };
   const createChannel = async () => { if (!newCh.trim()) return; try { const c = await apiReq("POST", "/chat/channels", { name: newCh.trim() }); setNewCh(""); await loadChannels(); setActive(c); } catch {} };
   const startDm = async (userId) => { try { const c = await apiReq("POST", "/chat/dm", { userId }); setShowDir(false); await loadChannels(); setActive(c); } catch {} };
 

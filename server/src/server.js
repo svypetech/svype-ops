@@ -12,6 +12,7 @@ const auth = require("./routes/auth");
 const special = require("./routes/special");
 const chat = require("./routes/chat");
 const state = require("./routes/state");
+const ai = require("./routes/ai");
 const { crud } = require("./routes/crud");
 
 const app = express();
@@ -26,6 +27,7 @@ app.use("/api/auth", auth);
 app.use("/api", special);
 app.use("/api/chat", chat);
 app.use("/api/state", state);
+app.use("/api/ai", ai);
 
 // generic CRUD modules
 app.use("/api/employees", crud("employees", ["name","role","dept","email","phone","cnic","salary","pf","joined","status","bankName","account","docs"], { jsonCols:["docs"] }));

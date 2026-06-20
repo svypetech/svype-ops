@@ -60,3 +60,17 @@ First screen is first-run setup → create your founding account → you're in.
 - `npm install` must run on your machine / Render — this project was authored in an offline environment, so dependencies aren't pre-installed.
 - Images (logos, receipts, CVs, payment proofs) are stored as base64 in the database for now; moving them to object storage (S3/R2) is a later optimization.
 - The free Render database and web service sleep when idle and have storage limits — fine for testing; move to paid plans for real daily use.
+
+---
+
+## Enabling AI drafting (optional)
+
+Proposals can be drafted by Claude. This needs your own Anthropic API key (usage-based billing, cheap per draft):
+
+1. Go to **console.anthropic.com** → sign in → add a payment method.
+2. **API Keys → Create Key** → copy it.
+3. In **Render → your service → Environment**, add:
+   `ANTHROPIC_API_KEY = your-key`
+4. Save — Render redeploys. The "Draft with AI" button on Proposals now works.
+
+Until the key is set, the AI button shows a friendly "not configured yet" message and the rest of the app works normally. The key lives only on the server and is never exposed to the browser. Payslips, invoices, and quotation totals are always computed exactly (never AI-generated numbers).
