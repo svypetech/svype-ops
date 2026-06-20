@@ -295,9 +295,9 @@ export default function App() {
   const props = { data, update, patch, role, brand, saveBrand, me, restore, wipe, session, go:setTab };
 
   return (
-    <div className="min-h-screen flex bg-slate-50 text-slate-800 font-sans">
+    <div className="h-screen overflow-hidden flex bg-slate-50 text-slate-800 font-sans">
       {navOpen && <div className="fixed inset-0 z-40 lg:hidden" style={{background:"rgba(15,23,42,.5)"}} onClick={()=>setNavOpen(false)}/>}
-      <aside className={`fixed lg:static z-50 inset-y-0 left-0 w-60 shrink-0 bg-slate-900 text-slate-300 flex flex-col transition-transform duration-200 ${navOpen?"translate-x-0":"-translate-x-full"} lg:translate-x-0`}>
+      <aside className={`fixed lg:static z-50 inset-y-0 left-0 w-60 shrink-0 h-screen bg-slate-900 text-slate-300 flex flex-col transition-transform duration-200 ${navOpen?"translate-x-0":"-translate-x-full"} lg:translate-x-0`}>
         <div className="px-5 py-5 flex items-center gap-2 border-b border-slate-700">
           {brand.logo ? <img src={brand.logo} className="w-8 h-8 rounded-lg object-contain bg-slate-800"/> : <div className="w-8 h-8 rounded-lg bg-sky-600 grid place-items-center text-white font-black">S</div>}
           <div className="flex-1 min-w-0"><div className="font-bold tracking-tight leading-none text-sm text-white truncate">{brand.company}</div><div className="text-xs text-slate-400 uppercase tracking-widest">{isEmp?"Team Portal":"HR & Ops"}</div></div>
@@ -729,20 +729,40 @@ function Dashboard({ data, role, go }) {
     </Card></>);
 }
 
-function Clients({ data, update }) {
-  const rows = data.clients, setRows = r=>update("clients", r);
+function Clients({ data, update, patch }) {
+  const rows = data.clients;
   const [edit, setEdit] = useState(null); const [open, setOpen] = useState(null);
-  const blank = { name:"", email:"", whatsapp:"", currency:"PKR", notes:"" };
-  const save = (c)=>{ setRows(c.id?rows.map(r=>r.id===c.id?c:r):[...rows,{...c,id:uid()}]); if(!c.id) update("clients",[...rows,{...c,id:uid()}], `Added client ${c.name}`); setEdit(null); };
-  if (open) { const c = rows.find(r=>r.id===open); if (c) return <ClientProfile c={c} data={data} onBack={()=>setOpen(null)} onEdit={()=>setEdit(c)}/>; }
+  const blank = { name:"", email:"", whatsapp:"", currency:"PKR", notes:"", retainer:"" };
+  const openEdit = (c) => { const r = data.retainers.find(x=>x.client===c.name && x.status==="Active"); setEdit({ ...c, retainer: r ? r.amount : "" }); };
+  const save = (c)=>{
+    if (!c.name) return;
+    const isNew = !c.id;
+    const rec = isNew ? { id:uid(), name:c.name, email:c.email, whatsapp:c.whatsapp, currency:c.currency, notes:c.notes } : { id:c.id, name:c.name, email:c.email, whatsapp:c.whatsapp, currency:c.currency, notes:c.notes };
+    const nextClients = isNew ? [...rows, rec] : rows.map(r=>r.id===rec.id?rec:r);
+    // sync retainer
+    let nextRetainers = data.retainers;
+    const amt = +c.retainer || 0;
+    const existing = data.retainers.find(r=>r.client===c.name);
+    if (amt > 0) {
+      if (existing) nextRetainers = data.retainers.map(r=>r.id===existing.id?{...r,amount:amt,currency:c.currency,whatsapp:c.whatsapp||r.whatsapp,status:"Active"}:r);
+      else nextRetainers = [...data.retainers, { id:uid(), client:c.name, whatsapp:c.whatsapp||"", amount:amt, currency:c.currency||"PKR", billingDay:1, status:"Active", carry:0 }];
+    } else if (existing) {
+      // amount cleared -> pause the retainer (don't delete history)
+      nextRetainers = data.retainers.map(r=>r.id===existing.id?{...r,status:"Paused"}:r);
+    }
+    patch({ clients: nextClients, retainers: nextRetainers }, isNew ? `Added client ${c.name}` : `Updated client ${c.name}`);
+    setEdit(null);
+  };
+  if (open) { const c = rows.find(r=>r.id===open); if (c) return <ClientProfile c={c} data={data} onBack={()=>setOpen(null)} onEdit={()=>openEdit(c)}/>; }
   return (<>
     <Head title="Clients" sub={`${rows.length} clients · used across retainers, invoices, proposals, quotations`} action={<Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn>}/>
-    <Card><Table cols={["Client","Currency","WhatsApp","Email",""]}>{rows.length===0?<tr><td colSpan={5}><Empty msg="No clients yet"/></td></tr>:rows.map(c=>(
-      <Row key={c.id} onClick={()=>setOpen(c.id)}><Td className="font-medium">{c.name}{c.notes&&<div className="text-xs text-slate-400">{c.notes}</div>}</Td><Td>{c.currency}</Td><Td className="text-slate-500">{c.whatsapp||"—"}</Td><Td className="text-slate-500">{c.email||"—"}</Td><Td><RowActions onEdit={()=>setEdit(c)} onDelete={()=>setRows(rows.filter(r=>r.id!==c.id))}/></Td></Row>))}</Table></Card>
+    <Card><Table cols={["Client","Currency","Retainer","WhatsApp","Email",""]}>{rows.length===0?<tr><td colSpan={6}><Empty msg="No clients yet"/></td></tr>:rows.map(c=>{ const r=data.retainers.find(x=>x.client===c.name && x.status==="Active"); return (
+      <Row key={c.id} onClick={()=>setOpen(c.id)}><Td className="font-medium">{c.name}{c.notes&&<div className="text-xs text-slate-400">{c.notes}</div>}</Td><Td>{c.currency}</Td><Td className="text-slate-500">{r?fmt(r.amount,r.currency):"—"}</Td><Td className="text-slate-500">{c.whatsapp||"—"}</Td><Td className="text-slate-500">{c.email||"—"}</Td><Td><RowActions onEdit={()=>openEdit(c)} onDelete={()=>update("clients",rows.filter(r=>r.id!==c.id), `Removed client ${c.name}`)}/></Td></Row>); })}</Table></Card>
     {edit && <Modal title={edit.id?"Edit client":"Add client"} onClose={()=>setEdit(null)}>
       <Field label="Client name" value={edit.name} onChange={e=>setEdit({...edit,name:e.target.value})}/>
       <div className="grid grid-cols-2 gap-3"><Field label="Email" value={edit.email} onChange={e=>setEdit({...edit,email:e.target.value})}/><Field label="WhatsApp" value={edit.whatsapp} onChange={e=>setEdit({...edit,whatsapp:e.target.value})} placeholder="9230..."/></div>
-      <Select label="Default currency" options={CURRENCIES} value={edit.currency} onChange={e=>setEdit({...edit,currency:e.target.value})}/>
+      <div className="grid grid-cols-2 gap-3"><Select label="Default currency" options={CURRENCIES} value={edit.currency} onChange={e=>setEdit({...edit,currency:e.target.value})}/><Field label="Monthly retainer (optional)" type="number" value={edit.retainer} onChange={e=>setEdit({...edit,retainer:e.target.value})} placeholder="leave blank if none"/></div>
+      <p className="text-xs text-slate-400">Set a monthly retainer to add this client to the Retainers section automatically. Leave blank for one-off / project clients.</p>
       <Area label="Notes" value={edit.notes} onChange={e=>setEdit({...edit,notes:e.target.value})}/>
       <Btn onClick={()=>save(edit)}><Check size={15}/>Save</Btn>
     </Modal>}
@@ -1030,6 +1050,7 @@ function VendorBills({ data, update, patch, role, brand }) {
   const [viewBill, setViewBill] = useState(null);
   const blank = { vendor:"", desc:"", category:"Contractor / outsourced", amount:"", currency:"PKR", due:today(), file:null, fileName:"", hrApproved:null, founderApproved:null, status:"Pending HR", paid:false };
   const statusOf = (b) => b.paid ? "Paid" : (b.hrApproved && b.founderApproved) ? "Approved" : b.hrApproved ? "Pending Founder" : "Pending HR";
+  // Note: "Approved" means fully signed off and sitting in Payables, awaiting actual payment.
   const save = (b) => {
     const rec = { ...b, status: statusOf(b) };
     if (b.id) update("vendorBills", rows.map(x=>x.id===b.id?rec:x));
@@ -1037,16 +1058,20 @@ function VendorBills({ data, update, patch, role, brand }) {
     setEdit(null);
   };
   const approve = (b, kind) => {
-    const stamp = { by: role==="admin"?"Founder":"HR", on: today() };
+    // Strict separation: only the founder (admin) can give the founder approval; only HR/founder can give HR approval.
+    if (kind === "founder" && role !== "admin") return;
+    if (kind === "hr" && role === "employee") return;
+    const stamp = { by: kind === "founder" ? "Founder" : "HR", on: today() };
     const next = { ...b, [kind==="hr"?"hrApproved":"founderApproved"]: stamp };
-    next.status = statusOf(next);
-    const fullyApproved = next.hrApproved && next.founderApproved && !next.paid;
-    if (fullyApproved) {
-      // both signed off -> mark paid-routed and push into Payables in one write
-      next.paid = true; next.status = "Paid";
+    const bothApproved = next.hrApproved && next.founderApproved;
+    if (bothApproved && !next.paid) {
+      // Fully approved -> route to Payables as UNPAID. The bill is NOT paid yet.
+      next.status = "Approved"; next.sentToPayables = true;
+      const exists = (data.payables||[]).some(p=>p.kind==="vendorbill" && p.billId===b.id);
       const payable = { id:uid(), vendor:next.vendor, desc:`Vendor bill: ${next.desc||next.category}`, amount:+next.amount, due:next.due, status:"Pending", kind:"vendorbill", billId:next.id, receipt:next.file, fileType:next.fileType };
-      patch({ vendorBills: rows.map(x=>x.id===b.id?next:x), payables:[payable, ...data.payables] }, `${stamp.by} gave final approval — ${next.vendor} sent to Payables`);
+      patch({ vendorBills: rows.map(x=>x.id===b.id?next:x), payables: exists ? data.payables : [payable, ...(data.payables||[])] }, `${stamp.by} gave final approval — ${next.vendor} sent to Payables (awaiting payment)`);
     } else {
+      next.status = statusOf(next);
       update("vendorBills", rows.map(x=>x.id===b.id?next:x), `${stamp.by} approved vendor bill: ${b.vendor} ${fmt(b.amount,b.currency)}`);
     }
   };
@@ -1061,7 +1086,7 @@ function VendorBills({ data, update, patch, role, brand }) {
     setFn({ ...cur, fileName:f.name, fileType: isImg ? "image" : "file", file: data });
   };
   return (<>
-    <Head title="Vendor Bills" sub="Upload vendor / contractor invoices — both HR and Founder must approve before payment" action={<Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Upload bill</Btn>}/>
+    <Head title="Vendor Bills" sub="Upload vendor invoices → HR approves → Founder approves → moves to Payables (unpaid) → mark paid from Payables" action={<Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Upload bill</Btn>}/>
     <Card><Table cols={["Vendor","For","Amount","Due","HR","Founder","Status",""]}>
       {rows.length===0?<tr><td colSpan={8}><Empty msg="No vendor bills uploaded yet"/></td></tr>:rows.map(b=>(
         <Row key={b.id}>
@@ -1076,11 +1101,12 @@ function VendorBills({ data, update, patch, role, brand }) {
             {b.file && <button onClick={()=>setViewBill(b)} title="View bill" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><FileText size={14}/></button>}
             {!b.hrApproved && role!=="employee" && <button onClick={()=>approve(b,"hr")} title="HR approve" className="px-2 py-1 rounded text-xs bg-amber-100 text-amber-700 hover:bg-amber-200">HR ✓</button>}
             {b.hrApproved && !b.founderApproved && role==="admin" && <button onClick={()=>approve(b,"founder")} title="Founder approve" className="px-2 py-1 rounded text-xs bg-sky-100 text-sky-700 hover:bg-sky-200">Founder ✓</button>}
-            {b.hrApproved && b.founderApproved && b.paid && <span className="text-xs text-emerald-600">in Payables</span>}
+            {b.hrApproved && b.founderApproved && !b.paid && <span className="text-xs text-amber-600">in Payables · unpaid</span>}
+            {b.paid && <span className="text-xs text-emerald-600">paid</span>}
           </RowActions></Td>
         </Row>))}
     </Table></Card>
-    <p className="text-xs text-slate-400 mt-3">Flow: HR uploads → HR approves → Founder approves. On the Founder's approval the bill is automatically sent to Payables, where you record payment with proof. Approvals are stamped in the Activity Log.</p>
+    <p className="text-xs text-slate-400 mt-3">Flow: anyone (HR) uploads & gives HR approval → only the Founder can give the final approval → the bill then moves to <b>Payables as unpaid</b>. It is marked <b>Paid</b> only when you settle it in Payables. HR cannot give the Founder approval. All steps are stamped in the Activity Log.</p>
 
     {edit && <Modal title={edit.id?"Edit vendor bill":"Upload vendor bill"} onClose={()=>setEdit(null)}>
       <Field label="Vendor / contractor name" value={edit.vendor} onChange={e=>setEdit({...edit,vendor:e.target.value})}/>
@@ -1494,8 +1520,21 @@ function Invoices({ data, update }) {
     render={r=>(<><Td className="font-medium">{r.number}</Td><Td className="text-slate-500">{r.client}</Td><Td className="text-slate-500">{r.type}</Td><Td>{fmt(r.amount,r.currency)}</Td><Td className="text-slate-500">{r.date}</Td><Td><Pill s={r.status}/></Td></>)}
     fields={(e,s)=>(<><ClientInput clients={clients} value={e.client} onChange={ev=>{const v=ev.target.value;const c=clients.find(x=>x.name===v);s({...e,client:v,...(c?{currency:c.currency||"PKR"}:{})});}}/><Field label="Number" value={e.number} onChange={ev=>s({...e,number:ev.target.value})}/><Select label="Type" options={["Invoice","Receipt"]} value={e.type} onChange={ev=>s({...e,type:ev.target.value})}/><div className="grid grid-cols-2 gap-3"><Field label="Amount" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Select label="Currency" options={CURRENCIES} value={e.currency} onChange={ev=>s({...e,currency:ev.target.value})}/></div><Field label="Date" type="date" value={e.date} onChange={ev=>s({...e,date:ev.target.value})}/><Select label="Status" options={["Draft","Sent","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>;
 }
-function Payables({ data, update }) {
-  const rows=data.payables, setRows=r=>update("payables",r);
+function Payables({ data, update, patch }) {
+  const rows=data.payables;
+  // When a payable changes, if a vendor-bill payable becomes Paid, flip the linked vendor bill to Paid too.
+  const setRows=(r)=>{
+    const wasById = Object.fromEntries(rows.map(p=>[p.id,p]));
+    const newlyPaidBillIds = r.filter(p=>p.kind==="vendorbill" && p.status==="Paid" && wasById[p.id] && wasById[p.id].status!=="Paid").map(p=>p.billId);
+    if (newlyPaidBillIds.length) {
+      patch({ payables:r, vendorBills:(data.vendorBills||[]).map(b=>newlyPaidBillIds.includes(b.id)?{...b,paid:true,status:"Paid",paidDate:today()}:b) }, `Vendor bill paid from Payables`);
+    } else {
+      update("payables", r);
+    }
+  };
+  const markVendorPaid = (r)=>{
+    patch({ payables: rows.map(p=>p.id===r.id?{...p,status:"Paid",settled:true,paidDate:today()}:p), vendorBills:(data.vendorBills||[]).map(b=>b.id===r.billId?{...b,paid:true,status:"Paid",paidDate:today()}:b) }, `Vendor bill paid: ${r.vendor}`);
+  };
   const [appr, setAppr] = useState(null);
   const months = Array.from({length:6}).map((_,i)=>{ const d=new Date(); d.setMonth(d.getMonth()+i); return d.toLocaleString("default",{month:"long",year:"numeric"}); });
   const openApprove = (r)=> setAppr({ id:r.id, vendor:r.vendor, amount:r.amount, mode:"salary", month: months[0], date: today() });
@@ -1507,15 +1546,14 @@ function Payables({ data, update }) {
       // direct / instant
       return { ...x, status:"Paid", settled:true, payVia:"direct", paidDate:a.date };
     }));
-    update("audit", [{ id:uid(), who:"HR", action:`Approved reimbursement ${a.vendor} — ${a.mode==="salary"?("with "+a.month+" salary"):("direct on "+a.date)}`, date:new Date().toISOString() }, ...(data.audit||[])].slice(0,500));
     setAppr(null);
   };
   return (<>
-    <Ledger title="Payables" sub={`Owed · ${fmt(rows.filter(r=>r.status!=="Paid").reduce((s,r)=>s+ +r.amount,0))} · approve a reimbursement to choose how it's paid`} rows={rows} setRows={setRows}
+    <Ledger title="Payables" sub={`Owed · ${fmt(rows.filter(r=>r.status!=="Paid").reduce((s,r)=>s+ +r.amount,0))} · approved vendor bills land here as unpaid until you mark them paid`} rows={rows} setRows={setRows}
       blank={()=>({vendor:"",desc:"",amount:"",due:today(),status:"Pending"})}
       cols={["Vendor","Description","Amount","Due","Status"]}
-      render={r=>(<><Td className="font-medium">{r.vendor}</Td><Td className="text-slate-500"><div className="flex items-center gap-2">{r.receipt&&<img src={r.receipt} className="w-8 h-8 rounded object-cover border border-slate-200"/>}{r.desc}{r.payVia==="salary"&&<span className="text-xs text-sky-600">→ {r.payMonth} salary</span>}</div></Td><Td>{fmt(r.amount)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
-      extraActions={r=> r.kind==="reimbursement" && r.status!=="Approved" && r.status!=="Paid" ? <button onClick={()=>openApprove(r)} title="Approve reimbursement" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button> : null}
+      render={r=>(<><Td className="font-medium">{r.vendor}</Td><Td className="text-slate-500"><div className="flex items-center gap-2">{r.receipt&&<img src={r.receipt} className="w-8 h-8 rounded object-cover border border-slate-200"/>}{r.desc}{r.payVia==="salary"&&<span className="text-xs text-sky-600">→ {r.payMonth} salary</span>}{r.kind==="vendorbill"&&<span className="text-xs text-slate-400">vendor bill</span>}</div></Td><Td>{fmt(r.amount)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
+      extraActions={r=> r.kind==="reimbursement" && r.status!=="Approved" && r.status!=="Paid" ? <button onClick={()=>openApprove(r)} title="Approve reimbursement" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button> : (r.kind==="vendorbill" && r.status!=="Paid" ? <button onClick={()=>markVendorPaid(r)} title="Mark vendor bill as paid" className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Mark paid</button> : null)}
       fields={(e,s)=>(<><Field label="Vendor" value={e.vendor} onChange={ev=>s({...e,vendor:ev.target.value})}/><Field label="Description" value={e.desc} onChange={ev=>s({...e,desc:ev.target.value})}/><Field label="Amount (PKR)" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Field label="Due" type="date" value={e.due} onChange={ev=>s({...e,due:ev.target.value})}/><Select label="Status" options={["Pending","Approved","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>
     {appr && <Modal title={`Approve reimbursement · ${appr.vendor}`} onClose={()=>setAppr(null)}>
       <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm flex justify-between"><span className="text-slate-500">Amount</span><b>{fmt(appr.amount)}</b></div>
