@@ -4,7 +4,7 @@ import {
   FileText, ArrowDownCircle, ArrowUpCircle, ScrollText, Plus, Trash2,
   Edit3, X, Check, LogOut, Search, Download, Building2, Loader2, Settings,
   Upload, PenTool, Stamp, ChevronLeft, FileSignature, Receipt, Paperclip,
-  Repeat, Send, Landmark, Menu, Megaphone, Inbox, UserCircle, Clock, MapPin,
+  Repeat, Send, Landmark, Menu, Megaphone, Inbox, UserCircle, Clock, MapPin, CalendarClock,
   Contact, History, Database, HandCoins, Bell, Mail, MessageSquare, Hash
 } from "lucide-react";
 
@@ -134,18 +134,36 @@ const SEED = {
 };
 const SEED_BRAND = { company: "Svype Tech Limited", tagline: "Digital Marketing & Creative Agency", address: "Islamabad · Lahore, Pakistan", contact: "hello@svype.com · www.svype.com", accent: "#0284c7", logo: null, signatories: [], stamps: [] };
 
-function ensureRetainerInvoices(db) {
-  const mk = monthKey(), ml = monthLabel();
+// Helpers for the billing schedule.
+function pad2(n){ return String(n).padStart(2,"0"); }
+function nextMonthInfo(from){
+  // Given a date, return info about the NEXT month (the period being billed).
+  const d = from ? new Date(from) : new Date();
+  const y = d.getFullYear(), m = d.getMonth(); // 0-11
+  const nm = m === 11 ? 0 : m+1;
+  const ny = m === 11 ? y+1 : y;
+  const key = `${ny}-${pad2(nm+1)}`;                       // e.g. 2026-07
+  const label = new Date(ny, nm, 1).toLocaleString("default",{month:"long",year:"numeric"});
+  const issue = `${ny}-${pad2(nm+1)}-01`;                   // 1st of next month
+  const due = `${ny}-${pad2(nm+1)}-05`;                     // 5th of next month
+  return { key, label, issue, due };
+}
+
+// Build invoices for the upcoming billing cycle. `force` ignores the date gate (manual button).
+function generateRetainerInvoices(db, force){
+  const now = new Date();
+  const onOrAfter30th = now.getDate() >= 30;
+  if (!force && !onOrAfter30th) return db;       // auto path: only on/after the 30th
+  const { key, label, issue, due } = nextMonthInfo(now);
   const inv = [...(db.retainerInvoices || [])];
   let changed = false;
   const rets = (db.retainers || []).map((r) => {
     if (r.status !== "Active") return r;
-    // Only auto-generate ONCE per retainer per month. The marker (lastGenMonth) means
-    // deleting the generated invoice will NOT cause it to come back — generation already happened.
-    if (r.lastGenMonth === mk) return r;
+    if (r.lastGenCycle === key) return r;                  // already generated for this cycle
+    if (inv.some(i => i.retainerId === r.id && i.monthKey === key)) return { ...r, lastGenCycle:key };
     const base = +r.amount || 0, carry = +r.carry || 0;
-    inv.push({ id: uid(), retainerId: r.id, client: r.client, number: `RET-${mk.replace("-", "")}-${inv.length + 1}`, monthKey: mk, month: ml, base, carry, total: base + carry, currency: r.currency || "PKR", status: "Unpaid", paidAmount: 0, account: "", date: today(), paidDate: "" });
-    changed = true; return { ...r, carry: 0, lastGenMonth: mk };
+    inv.push({ id: uid(), retainerId: r.id, client: r.client, number: `RET-${key.replace("-", "")}-${inv.length + 1}`, monthKey: key, month: label, base, carry, total: base + carry, currency: r.currency || "PKR", status: "Unpaid", paidAmount: 0, account: "", date: issue, due, paidDate: "" });
+    changed = true; return { ...r, carry: 0, lastGenCycle: key };
   });
   return changed ? { ...db, retainerInvoices: inv, retainers: rets } : db;
 }
@@ -210,6 +228,29 @@ const NAV = [
   { id:"audit", label:"Activity Log", icon:History },
   { id:"backup", label:"Backup & Data", icon:Database },
 ];
+
+// Grouped navigation: each top-level section opens to a page with sub-tabs.
+const NAV_GROUPS = [
+  { id:"dash", label:"Dashboard", icon:LayoutDashboard, tabs:["dash"] },
+  { id:"chat", label:"Team Chat", icon:MessageSquare, tabs:["chat"] },
+  { id:"people", label:"People", icon:Users, tabs:["employees","attendance","payroll","advances","recruit","cvbank"] },
+  { id:"sales", label:"Clients & Sales", icon:Contact, tabs:["clients","proposals","quotations","retainers","invoices"] },
+  { id:"finance", label:"Finance", icon:Wallet, tabs:["payables","receivables","vendorbills","accounts"] },
+  { id:"documents", label:"Documents", icon:FileSignature, tabs:["offers","letters","meetings"] },
+  { id:"workspace", label:"Workspace", icon:Inbox, tabs:["requests","announce","timesheets"] },
+  { id:"settings", label:"Settings", icon:Settings, adminOnly:true, bottom:true, tabs:["users","permissions","brand","audit","backup"] },
+];
+// Friendly labels for sub-tabs (override the long sidebar labels inside a section)
+const TAB_LABELS = {
+  dash:"Dashboard", chat:"Team Chat",
+  employees:"Employees", attendance:"Attendance & Leave", payroll:"Payroll & Slips", advances:"Advances & Loans", recruit:"Recruitment", cvbank:"CV Bank",
+  clients:"Clients", proposals:"Proposals", quotations:"Quotations", retainers:"Retainers", invoices:"Invoices",
+  payables:"Payables", receivables:"Receivables", vendorbills:"Vendor Bills", accounts:"Bank Accounts",
+  offers:"Offer Letters", letters:"Letters & Certificates", meetings:"Meeting Notes",
+  requests:"Requests", announce:"Announcements", timesheets:"Work & Timesheets",
+  users:"Users & Access", permissions:"Permissions", brand:"Brand & Signatures", audit:"Activity Log", backup:"Backup & Data",
+};
+const groupOfTab = (tabId) => NAV_GROUPS.find(g => g.tabs.includes(tabId)) || NAV_GROUPS[0];
 const EMP_NAV = [
   { id:"dash", label:"Home", icon:LayoutDashboard },
   { id:"chat", label:"Team Chat", icon:MessageSquare },
@@ -239,7 +280,7 @@ export default function App() {
   useEffect(() => { (async () => {
     const d = await DB.get("svype_db", null);
     let merged = d ? { ...SEED, ...d } : SEED;
-    const after = ensureRetainerInvoices(merged);
+    const after = generateRetainerInvoices(merged, false); // only generates on/after the 30th, once per cycle
     setData(after);
     if (!d || after !== merged) DB.set("svype_db", after);
     const b = await DB.get("svype_brand", null);
@@ -282,15 +323,24 @@ export default function App() {
   const isEmp = role === "employee";
   const me = isEmp ? data.employees.find(e=>e.id===meId) : null;
   const perms = session?.perms || null; // null/undefined = full access
-  const canSee = (n) => {
-    if (n.adminOnly && role !== "admin") return false;
-    if (role === "admin") return true; // founder always full
-    if (n.id === "dash") return true;
-    if (!perms) return true; // no restrictions set
-    return perms[n.id] !== false;
+  const canSeeTab = (id) => {
+    if (id === "permissions" && role !== "admin") return false;
+    if (role === "admin") return true;
+    if (id === "dash") return true;
+    if (!perms) return true;
+    return perms[id] !== false;
   };
-  const visible = (isEmp ? EMP_NAV : NAV).filter(canSee);
-  const active = visible.find(n=>n.id===tab) ? tab : "dash";
+  // Employee uses the flat nav; admin uses grouped nav.
+  const canSeeEmp = (n) => true;
+  const empVisible = EMP_NAV.filter(canSeeEmp);
+  // For admins, filter groups to those with at least one visible tab.
+  const groups = NAV_GROUPS
+    .filter(g => !(g.adminOnly && role !== "admin"))
+    .map(g => ({ ...g, tabs: g.tabs.filter(canSeeTab) }))
+    .filter(g => g.tabs.length > 0);
+  const allTabs = isEmp ? empVisible.map(n=>n.id) : groups.flatMap(g=>g.tabs);
+  const active = allTabs.includes(tab) ? tab : "dash";
+  const activeGroup = isEmp ? null : groupOfTab(active);
   const notes = isEmp && me ? empNotes(data, me) : adminNotes(data);
   const props = { data, update, patch, role, brand, saveBrand, me, restore, wipe, session, go:setTab };
 
@@ -304,10 +354,19 @@ export default function App() {
           <button onClick={()=>setNavOpen(false)} className="lg:hidden text-slate-400 hover:text-white"><X size={18}/></button>
         </div>
         <nav className="flex-1 py-3 overflow-y-auto">
-          {visible.map(n=>{ const I=n.icon; return (
-            <button key={n.id} onClick={()=>{setTab(n.id);setNavOpen(false);}} className={`w-full flex items-center gap-3 px-5 py-2.5 text-sm transition ${active===n.id?"bg-slate-800 text-white border-r-2 border-sky-500":"text-slate-400 hover:text-white hover:bg-slate-800"}`}>
-              <I size={17}/> {n.label}</button>); })}
+          {isEmp
+            ? empVisible.map(n=>{ const I=n.icon; return (
+                <button key={n.id} onClick={()=>{setTab(n.id);setNavOpen(false);}} className={`w-full flex items-center gap-3 px-5 py-2.5 text-sm transition ${active===n.id?"bg-slate-800 text-white border-r-2 border-sky-500":"text-slate-400 hover:text-white hover:bg-slate-800"}`}>
+                  <I size={17}/> {n.label}</button>); })
+            : groups.filter(g=>!g.bottom).map(g=>{ const I=g.icon; const on=activeGroup?.id===g.id; return (
+                <button key={g.id} onClick={()=>{ setTab(g.tabs[0]); setNavOpen(false); }} className={`w-full flex items-center gap-3 px-5 py-2.5 text-sm transition ${on?"bg-slate-800 text-white border-r-2 border-sky-500":"text-slate-400 hover:text-white hover:bg-slate-800"}`}>
+                  <I size={17}/> {g.label}</button>); })}
         </nav>
+        <div className="border-t border-slate-700">
+          {!isEmp && groups.filter(g=>g.bottom).map(g=>{ const I=g.icon; const on=activeGroup?.id===g.id; return (
+            <button key={g.id} onClick={()=>{ setTab(g.tabs[0]); setNavOpen(false); }} className={`w-full flex items-center gap-3 px-5 py-2.5 text-sm transition ${on?"bg-slate-800 text-white border-r-2 border-sky-500":"text-slate-400 hover:text-white hover:bg-slate-800"}`}>
+              <I size={17}/> {g.label}</button>); })}
+        </div>
         <div className="p-4 border-t border-slate-700">
           <div className="text-xs text-slate-400 mb-2">{isEmp && me ? me.name : ROLES[role]}</div>
           <button onClick={reset} className="flex items-center gap-2 text-sm text-slate-300 hover:text-white"><LogOut size={15}/>Sign out</button>
@@ -321,6 +380,16 @@ export default function App() {
           <div className="flex-1"/>
           <NotifBell items={notes} go={setTab}/>
         </div>
+        {/* sub-tab bar for grouped admin sections with more than one tab */}
+        {!isEmp && activeGroup && activeGroup.tabs.length > 1 && (
+          <div className="sticky top-[49px] z-20 bg-white border-b border-slate-200 px-4 sm:px-8">
+            <div className="max-w-6xl mx-auto flex gap-1 overflow-x-auto">
+              {activeGroup.tabs.map(t=>(
+                <button key={t} onClick={()=>setTab(t)} className={`px-3 py-2.5 text-sm whitespace-nowrap border-b-2 transition ${active===t?"border-sky-500 text-sky-700 font-medium":"border-transparent text-slate-500 hover:text-slate-800"}`}>{TAB_LABELS[t]||t}</button>
+              ))}
+            </div>
+          </div>
+        )}
         <div className="max-w-6xl mx-auto px-4 sm:px-8 py-6 sm:py-8">
           {isEmp ? (
             (!me && active!=="chat") ? (
@@ -1446,7 +1515,17 @@ function Retainers({ data, update, patch, brand, go }) {
   const rets = data.retainers, invs = data.retainerInvoices, clients = data.clients;
   const accounts = (data.bankAccounts||[]).map(a=>({ id:a.id, name:a.label }));
   const [view, setView] = useState("invoices");
-  const [edit, setEdit] = useState(null); const [pay, setPay] = useState(null); const [manual, setManual] = useState(null);
+  const [edit, setEdit] = useState(null); const [pay, setPay] = useState(null); const [manual, setManual] = useState(null); const [extend, setExtend] = useState(null);
+  const saveExtend = () => { patch({ retainerInvoices: invs.map(i=>i.id===extend.id?{...i, due: extend.due, dueExtended:true}:i) }, `Extended due date for ${extend.client} (${extend.number})`); setExtend(null); };
+  const clearUnpaid = () => {
+    const unpaid = invs.filter(i=>i.status!=="Paid" && i.status!=="Partial");
+    if (!unpaid.length) { alert("No unpaid invoices to clear."); return; }
+    if (!confirm(`Delete ${unpaid.length} unpaid invoice(s)? Paid and partially-paid invoices are kept. This is for clearing invoices that were generated automatically.`)) return;
+    const keepIds = new Set(invs.filter(i=>i.status==="Paid"||i.status==="Partial").map(i=>i.id));
+    // stamp each affected retainer's cycle marker so they don't regenerate this cycle
+    const cycles = {}; unpaid.forEach(i=>{ if(i.retainerId) cycles[i.retainerId]=i.monthKey; });
+    patch({ retainerInvoices: invs.filter(i=>keepIds.has(i.id)), retainers: rets.map(r=>cycles[r.id]?{...r,lastGenCycle:cycles[r.id]}:r) }, `Cleared ${unpaid.length} unpaid retainer invoices`);
+  };
   const blank = { client:"", whatsapp:"", amount:"", currency:"PKR", billingDay:1, status:"Active", carry:0 };
   const onClient=(v)=>{ const c=clients.find(x=>x.name===v); setEdit(e=>({...e,client:v,...(c?{currency:c.currency||"PKR",whatsapp:c.whatsapp||e.whatsapp}:{})})); };
   const saveClient = (c) => {
@@ -1456,15 +1535,9 @@ function Retainers({ data, update, patch, brand, go }) {
     patch({ retainers:newRets, ...extra }, c.id?`Updated retainer ${c.client}`:`Added retainer client ${c.client}`); setEdit(null);
   };
   const genDue = () => {
-    const mk = monthKey(), ml = monthLabel();
-    const existing = invs.filter(i=>i.monthKey===mk);
-    const newInvs = [];
-    rets.filter(r=>r.status==="Active").forEach(r=>{
-      if (existing.find(i=>i.retainerId===r.id)) return; // already has one this month
-      const base=+r.amount||0, carry=+r.carry||0;
-      newInvs.push({ id:uid(), retainerId:r.id, client:r.client, number:`RET-${mk.replace("-","")}-${invs.length+newInvs.length+1}`, monthKey:mk, month:ml, base, carry, total:base+carry, currency:r.currency||"PKR", status:"Unpaid", paidAmount:0, account:"", date:today(), paidDate:"" });
-    });
-    if (newInvs.length) patch({ retainerInvoices:[...invs, ...newInvs], retainers: rets.map(r=>r.status==="Active"?{...r,carry:0,lastGenMonth:mk}:r) }, `Generated ${newInvs.length} retainer invoice(s) for ${ml}`);
+    const after = generateRetainerInvoices(data, true); // force = generate now regardless of date
+    if (after !== data) patch({ retainerInvoices: after.retainerInvoices, retainers: after.retainers }, `Generated retainer invoices`);
+    else alert("Invoices for the upcoming cycle have already been generated.");
   };
   // manual invoice
   const newManual = () => setManual({ client:"", retainerId:"", month: monthLabel(), base:"", carry:0, currency:"PKR", date: today(), due:"", sendOn:"" });
@@ -1488,15 +1561,15 @@ function Retainers({ data, update, patch, brand, go }) {
     patch({ retainerInvoices:newInvs, retainers:newRets }, `Payment recorded for ${pay.client} (${pay.number})`); setPay(null);
   };
   return (<>
-    <Head title="Retainers" sub="Recurring clients · auto-generated monthly, or create an invoice manually" action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>go("accounts")}><Landmark size={15}/>Accounts</Btn><Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn></div>}/>
-    <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="invoices"?"primary":"ghost"} onClick={()=>setView("invoices")}>Invoices</Btn><Btn variant={view==="clients"?"primary":"ghost"} onClick={()=>setView("clients")}>Clients</Btn>{view==="invoices" && <><Btn variant="ghost" onClick={genDue}><Repeat size={15}/>Generate this month</Btn><Btn variant="ghost" onClick={newManual}><Plus size={15}/>Create invoice</Btn></>}</div>
+    <Head title="Retainers" sub="Auto-generated on the 30th (issued 1st, due 5th of next month) · or generate / create manually" action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>go("accounts")}><Landmark size={15}/>Accounts</Btn><Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn></div>}/>
+    <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="invoices"?"primary":"ghost"} onClick={()=>setView("invoices")}>Invoices</Btn><Btn variant={view==="clients"?"primary":"ghost"} onClick={()=>setView("clients")}>Clients</Btn>{view==="invoices" && <><Btn variant="ghost" onClick={genDue}><Repeat size={15}/>Generate now</Btn><Btn variant="ghost" onClick={newManual}><Plus size={15}/>Create invoice</Btn><Btn variant="ghost" onClick={clearUnpaid}><X size={15}/>Clear unpaid</Btn></>}</div>
     {view==="clients" ? (
       <Card><Table cols={["Client","WhatsApp","Monthly","Carried fwd","Status",""]}>{rets.length===0?<tr><td colSpan={6}><Empty msg="No retainer clients yet"/></td></tr>:rets.map(r=>(
         <Row key={r.id}><Td className="font-medium">{r.client}</Td><Td className="text-slate-500">{r.whatsapp||"—"}</Td><Td>{fmt(r.amount,r.currency)}</Td><Td className={+r.carry?"text-amber-600 font-medium":"text-slate-400"}>{r.carry?fmt(r.carry,r.currency):"—"}</Td><Td><Pill s={r.status}/></Td><Td><RowActions onEdit={()=>setEdit(r)} onDelete={()=>update("retainers",rets.filter(x=>x.id!==r.id))}/></Td></Row>))}</Table></Card>
     ) : (
       <Card><Table cols={["Invoice","Client","Period","Due","Total","Status",""]}>{invs.length===0?<tr><td colSpan={7}><Empty msg="No invoices yet — generate this month or create one"/></td></tr>:[...invs].reverse().map(i=>(
-        <Row key={i.id}><Td className="font-medium">{i.number}</Td><Td className="text-slate-500">{i.client}</Td><Td className="text-slate-500">{i.month}</Td><Td className="text-slate-500">{i.due||"—"}{i.sendOn?<div className="text-xs text-slate-400">send {i.sendOn}</div>:null}</Td><Td>{fmt(i.total,i.currency)}{i.status==="Partial"&&<div className="text-xs text-orange-600">received {fmt(i.paidAmount,i.currency)}</div>}{i.status==="Paid"&&i.account&&<div className="text-xs text-slate-400">{i.account}</div>}</Td><Td><Pill s={i.status}/></Td>
-        <Td><RowActions onDelete={()=>{ const parent=rets.find(r=>r.id===i.retainerId); patch({ retainerInvoices:invs.filter(x=>x.id!==i.id), retainers: parent?rets.map(r=>r.id===parent.id?{...r,lastGenMonth: i.monthKey||monthKey()}:r):rets }, `Deleted invoice ${i.number}`); }}><button onClick={()=>openInvoicePDF(i, brand)} title="Download PDF invoice" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Download size={14}/></button><button onClick={()=>sendWA(i)} title="Send on WhatsApp" className="p-1.5 rounded text-slate-400 hover:text-green-600 hover:bg-slate-100"><Send size={14}/></button>{i.status!=="Paid" && <button onClick={()=>setPay(i)} title="Mark as paid" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button>}</RowActions></Td></Row>))}</Table></Card>
+        <Row key={i.id}><Td className="font-medium">{i.number}</Td><Td className="text-slate-500">{i.client}</Td><Td className="text-slate-500">{i.month}</Td><Td className="text-slate-500">{i.due||"—"}{i.dueExtended&&<div className="text-xs text-amber-600">extended</div>}{i.sendOn?<div className="text-xs text-slate-400">send {i.sendOn}</div>:null}</Td><Td>{fmt(i.total,i.currency)}{i.status==="Partial"&&<div className="text-xs text-orange-600">received {fmt(i.paidAmount,i.currency)}</div>}{i.status==="Paid"&&i.account&&<div className="text-xs text-slate-400">{i.account}</div>}</Td><Td><Pill s={i.status}/></Td>
+        <Td><RowActions onDelete={()=>{ const parent=rets.find(r=>r.id===i.retainerId); patch({ retainerInvoices:invs.filter(x=>x.id!==i.id), retainers: parent?rets.map(r=>r.id===parent.id?{...r,lastGenCycle: i.monthKey||r.lastGenCycle}:r):rets }, `Deleted invoice ${i.number}`); }}><button onClick={()=>openInvoicePDF(i, brand)} title="Download PDF invoice" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Download size={14}/></button><button onClick={()=>sendWA(i)} title="Send on WhatsApp" className="p-1.5 rounded text-slate-400 hover:text-green-600 hover:bg-slate-100"><Send size={14}/></button>{i.status!=="Paid" && <button onClick={()=>setExtend({ id:i.id, client:i.client, number:i.number, due:i.due||today() })} title="Extend due date" className="p-1.5 rounded text-slate-400 hover:text-amber-600 hover:bg-slate-100"><CalendarClock size={15}/></button>}{i.status!=="Paid" && <button onClick={()=>setPay(i)} title="Mark as paid" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button>}</RowActions></Td></Row>))}</Table></Card>
     )}
     {edit && <Modal title={edit.id?"Edit retainer client":"Add retainer client"} onClose={()=>setEdit(null)}>
       <ClientInput clients={clients} label="Client name" value={edit.client} onChange={e=>onClient(e.target.value)}/>
@@ -1514,6 +1587,11 @@ function Retainers({ data, update, patch, brand, go }) {
       <Btn onClick={saveManual}><Check size={15}/>Create invoice</Btn>
     </Modal>}
     {pay && <PayModal inv={pay} accounts={accounts} onClose={()=>setPay(null)} onConfirm={confirmPay} onManageAccounts={()=>{setPay(null);go("accounts");}}/>}
+    {extend && <Modal title={`Extend due date · ${extend.number}`} onClose={()=>setExtend(null)}>
+      <p className="text-xs text-slate-500">Give {extend.client} more time to pay. This updates the invoice's due date.</p>
+      <Field label="New due date" type="date" value={extend.due} onChange={e=>setExtend({...extend,due:e.target.value})}/>
+      <Btn onClick={saveExtend}><Check size={15}/>Update due date</Btn>
+    </Modal>}
   </>);
 }
 function PayModal({ inv, accounts, onClose, onConfirm, onManageAccounts }) {
