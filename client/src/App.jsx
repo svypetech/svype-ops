@@ -732,37 +732,58 @@ function Dashboard({ data, role, go }) {
 function Clients({ data, update, patch }) {
   const rows = data.clients;
   const [edit, setEdit] = useState(null); const [open, setOpen] = useState(null);
-  const blank = { name:"", email:"", whatsapp:"", currency:"PKR", notes:"", retainer:"" };
-  const openEdit = (c) => { const r = data.retainers.find(x=>x.client===c.name && x.status==="Active"); setEdit({ ...c, retainer: r ? r.amount : "" }); };
+  const [show, setShow] = useState("active");
+  const blank = { name:"", email:"", whatsapp:"", currency:"PKR", notes:"", retainer:"", status:"Active" };
+  const openEdit = (c) => { const r = data.retainers.find(x=>x.client===c.name && x.status==="Active"); setEdit({ ...c, status:c.status||"Active", retainer: r ? r.amount : "" }); };
   const save = (c)=>{
     if (!c.name) return;
     const isNew = !c.id;
-    const rec = isNew ? { id:uid(), name:c.name, email:c.email, whatsapp:c.whatsapp, currency:c.currency, notes:c.notes } : { id:c.id, name:c.name, email:c.email, whatsapp:c.whatsapp, currency:c.currency, notes:c.notes };
+    const status = c.status || "Active";
+    const rec = isNew ? { id:uid(), name:c.name, email:c.email, whatsapp:c.whatsapp, currency:c.currency, notes:c.notes, status } : { id:c.id, name:c.name, email:c.email, whatsapp:c.whatsapp, currency:c.currency, notes:c.notes, status };
     const nextClients = isNew ? [...rows, rec] : rows.map(r=>r.id===rec.id?rec:r);
     // sync retainer
     let nextRetainers = data.retainers;
     const amt = +c.retainer || 0;
     const existing = data.retainers.find(r=>r.client===c.name);
-    if (amt > 0) {
+    if (status==="Inactive") {
+      // inactive client -> pause any retainer so it stops generating invoices
+      if (existing) nextRetainers = data.retainers.map(r=>r.id===existing.id?{...r,status:"Paused"}:r);
+    } else if (amt > 0) {
       if (existing) nextRetainers = data.retainers.map(r=>r.id===existing.id?{...r,amount:amt,currency:c.currency,whatsapp:c.whatsapp||r.whatsapp,status:"Active"}:r);
       else nextRetainers = [...data.retainers, { id:uid(), client:c.name, whatsapp:c.whatsapp||"", amount:amt, currency:c.currency||"PKR", billingDay:1, status:"Active", carry:0 }];
     } else if (existing) {
-      // amount cleared -> pause the retainer (don't delete history)
       nextRetainers = data.retainers.map(r=>r.id===existing.id?{...r,status:"Paused"}:r);
     }
     patch({ clients: nextClients, retainers: nextRetainers }, isNew ? `Added client ${c.name}` : `Updated client ${c.name}`);
     setEdit(null);
   };
+  const setStatus = (c, status) => {
+    const nextClients = rows.map(r=>r.id===c.id?{...r,status}:r);
+    const existing = data.retainers.find(r=>r.client===c.name);
+    let nextRetainers = data.retainers;
+    if (status==="Inactive" && existing) nextRetainers = data.retainers.map(r=>r.id===existing.id?{...r,status:"Paused"}:r);
+    patch({ clients: nextClients, retainers: nextRetainers }, `${status==="Inactive"?"Deactivated":"Reactivated"} client ${c.name}`);
+  };
   if (open) { const c = rows.find(r=>r.id===open); if (c) return <ClientProfile c={c} data={data} onBack={()=>setOpen(null)} onEdit={()=>openEdit(c)}/>; }
+  const isActive = (c)=> (c.status||"Active")==="Active";
+  const filtered = rows.filter(c=> show==="all" ? true : show==="active" ? isActive(c) : !isActive(c));
+  const activeCount = rows.filter(isActive).length;
   return (<>
-    <Head title="Clients" sub={`${rows.length} clients · used across retainers, invoices, proposals, quotations`} action={<Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn>}/>
-    <Card><Table cols={["Client","Currency","Retainer","WhatsApp","Email",""]}>{rows.length===0?<tr><td colSpan={6}><Empty msg="No clients yet"/></td></tr>:rows.map(c=>{ const r=data.retainers.find(x=>x.client===c.name && x.status==="Active"); return (
-      <Row key={c.id} onClick={()=>setOpen(c.id)}><Td className="font-medium">{c.name}{c.notes&&<div className="text-xs text-slate-400">{c.notes}</div>}</Td><Td>{c.currency}</Td><Td className="text-slate-500">{r?fmt(r.amount,r.currency):"—"}</Td><Td className="text-slate-500">{c.whatsapp||"—"}</Td><Td className="text-slate-500">{c.email||"—"}</Td><Td><RowActions onEdit={()=>openEdit(c)} onDelete={()=>update("clients",rows.filter(r=>r.id!==c.id), `Removed client ${c.name}`)}/></Td></Row>); })}</Table></Card>
+    <Head title="Clients" sub={`${activeCount} active · ${rows.length} total · used across retainers, invoices, proposals, quotations`} action={<Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn>}/>
+    <div className="flex flex-wrap gap-2 mb-4"><Btn variant={show==="active"?"primary":"ghost"} onClick={()=>setShow("active")}>Active</Btn><Btn variant={show==="inactive"?"primary":"ghost"} onClick={()=>setShow("inactive")}>Inactive</Btn><Btn variant={show==="all"?"primary":"ghost"} onClick={()=>setShow("all")}>All</Btn></div>
+    <Card><Table cols={["Client","Status","Currency","Retainer","WhatsApp","Email",""]}>{filtered.length===0?<tr><td colSpan={7}><Empty msg={show==="inactive"?"No inactive clients":"No clients yet"}/></td></tr>:filtered.map(c=>{ const r=data.retainers.find(x=>x.client===c.name && x.status==="Active"); const act=isActive(c); return (
+      <Row key={c.id} onClick={()=>setOpen(c.id)}><Td className="font-medium">{c.name}{c.notes&&<div className="text-xs text-slate-400">{c.notes}</div>}</Td><Td><Pill s={act?"Active":"Inactive"}/></Td><Td>{c.currency}</Td><Td className="text-slate-500">{r?fmt(r.amount,r.currency):"—"}</Td><Td className="text-slate-500">{c.whatsapp||"—"}</Td><Td className="text-slate-500">{c.email||"—"}</Td>
+      <Td><RowActions onEdit={()=>openEdit(c)} onDelete={()=>update("clients",rows.filter(x=>x.id!==c.id), `Removed client ${c.name}`)}>
+        {act
+          ? <button onClick={()=>setStatus(c,"Inactive")} title="Make inactive" className="px-2 py-1 rounded text-xs bg-slate-100 text-slate-600 hover:bg-slate-200">Deactivate</button>
+          : <button onClick={()=>setStatus(c,"Active")} title="Reactivate" className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Reactivate</button>}
+      </RowActions></Td></Row>); })}</Table></Card>
     {edit && <Modal title={edit.id?"Edit client":"Add client"} onClose={()=>setEdit(null)}>
       <Field label="Client name" value={edit.name} onChange={e=>setEdit({...edit,name:e.target.value})}/>
       <div className="grid grid-cols-2 gap-3"><Field label="Email" value={edit.email} onChange={e=>setEdit({...edit,email:e.target.value})}/><Field label="WhatsApp" value={edit.whatsapp} onChange={e=>setEdit({...edit,whatsapp:e.target.value})} placeholder="9230..."/></div>
       <div className="grid grid-cols-2 gap-3"><Select label="Default currency" options={CURRENCIES} value={edit.currency} onChange={e=>setEdit({...edit,currency:e.target.value})}/><Field label="Monthly retainer (optional)" type="number" value={edit.retainer} onChange={e=>setEdit({...edit,retainer:e.target.value})} placeholder="leave blank if none"/></div>
-      <p className="text-xs text-slate-400">Set a monthly retainer to add this client to the Retainers section automatically. Leave blank for one-off / project clients.</p>
+      <Select label="Status" options={["Active","Inactive"]} value={edit.status||"Active"} onChange={e=>setEdit({...edit,status:e.target.value})}/>
+      <p className="text-xs text-slate-400">Set a monthly retainer to add this client to the Retainers section automatically. Marking a client inactive pauses their retainer.</p>
       <Area label="Notes" value={edit.notes} onChange={e=>setEdit({...edit,notes:e.target.value})}/>
       <Btn onClick={()=>save(edit)}><Check size={15}/>Save</Btn>
     </Modal>}
@@ -1048,7 +1069,7 @@ function VendorBills({ data, update, patch, role, brand }) {
   const rows = data.vendorBills || [];
   const [edit, setEdit] = useState(null);
   const [viewBill, setViewBill] = useState(null);
-  const blank = { vendor:"", desc:"", category:"Contractor / outsourced", amount:"", currency:"PKR", due:today(), file:null, fileName:"", hrApproved:null, founderApproved:null, status:"Pending HR", paid:false };
+  const blank = { vendor:"", whatsapp:"", desc:"", category:"Contractor / outsourced", amount:"", currency:"PKR", due:today(), file:null, fileName:"", hrApproved:null, founderApproved:null, status:"Pending HR", paid:false };
   const statusOf = (b) => b.paid ? "Paid" : (b.hrApproved && b.founderApproved) ? "Approved" : b.hrApproved ? "Pending Founder" : "Pending HR";
   // Note: "Approved" means fully signed off and sitting in Payables, awaiting actual payment.
   const save = (b) => {
@@ -1068,7 +1089,7 @@ function VendorBills({ data, update, patch, role, brand }) {
       // Fully approved -> route to Payables as UNPAID. The bill is NOT paid yet.
       next.status = "Approved"; next.sentToPayables = true;
       const exists = (data.payables||[]).some(p=>p.kind==="vendorbill" && p.billId===b.id);
-      const payable = { id:uid(), vendor:next.vendor, desc:`Vendor bill: ${next.desc||next.category}`, amount:+next.amount, due:next.due, status:"Pending", kind:"vendorbill", billId:next.id, receipt:next.file, fileType:next.fileType };
+      const payable = { id:uid(), vendor:next.vendor, whatsapp:next.whatsapp||"", desc:`Vendor bill: ${next.desc||next.category}`, amount:+next.amount, due:next.due, status:"Pending", kind:"vendorbill", billId:next.id, receipt:next.file, fileType:next.fileType };
       patch({ vendorBills: rows.map(x=>x.id===b.id?next:x), payables: exists ? data.payables : [payable, ...(data.payables||[])] }, `${stamp.by} gave final approval — ${next.vendor} sent to Payables (awaiting payment)`);
     } else {
       next.status = statusOf(next);
@@ -1110,6 +1131,7 @@ function VendorBills({ data, update, patch, role, brand }) {
 
     {edit && <Modal title={edit.id?"Edit vendor bill":"Upload vendor bill"} onClose={()=>setEdit(null)}>
       <Field label="Vendor / contractor name" value={edit.vendor} onChange={e=>setEdit({...edit,vendor:e.target.value})}/>
+      <Field label="Vendor WhatsApp number (required, with country code)" value={edit.whatsapp} onChange={e=>setEdit({...edit,whatsapp:e.target.value})} placeholder="923001234567"/>
       <Field label="What is it for?" value={edit.desc} onChange={e=>setEdit({...edit,desc:e.target.value})} placeholder="e.g. Video editing — March, Freelance designer"/>
       <Select label="Category" options={["Contractor / outsourced","Vendor / supplier","Software / tools","Other"]} value={edit.category} onChange={e=>setEdit({...edit,category:e.target.value})}/>
       <div className="grid grid-cols-2 gap-3"><Field label="Amount" type="number" value={edit.amount} onChange={e=>setEdit({...edit,amount:e.target.value})}/><Select label="Currency" options={CURRENCIES} value={edit.currency} onChange={e=>setEdit({...edit,currency:e.target.value})}/></div>
@@ -1119,7 +1141,8 @@ function VendorBills({ data, update, patch, role, brand }) {
         {edit.file && (edit.fileType==="image" || edit.file.startsWith("data:image")) && <img src={edit.file} className="mt-2 h-32 rounded-lg border border-slate-200 object-cover"/>}
         {edit.file && !(edit.fileType==="image" || edit.file.startsWith("data:image")) && <button onClick={()=>openDataUrl(edit.file, edit.fileName)} className="mt-2 text-sky-600 text-xs hover:underline flex items-center gap-1"><FileText size={13}/>Open {edit.fileName||"file"}</button>}
       </div>
-      <Btn onClick={()=>{ if(edit.vendor&&edit.amount) save(edit); }}><Check size={15}/>{edit.id?"Save":"Upload bill"}</Btn>
+      {edit._err && <div className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{edit._err}</div>}
+      <Btn onClick={()=>{ if(!edit.vendor){ setEdit({...edit,_err:"Vendor name is required."}); return; } if(!edit.whatsapp){ setEdit({...edit,_err:"Vendor WhatsApp number is required."}); return; } if(!edit.amount){ setEdit({...edit,_err:"Amount is required."}); return; } save(edit); }}><Check size={15}/>{edit.id?"Save":"Upload bill"}</Btn>
     </Modal>}
 
     {viewBill && <Modal title={`Bill · ${viewBill.vendor}`} onClose={()=>setViewBill(null)}>
@@ -1445,7 +1468,7 @@ function Retainers({ data, update, patch, brand, go }) {
   };
   // manual invoice
   const newManual = () => setManual({ client:"", retainerId:"", month: monthLabel(), base:"", carry:0, currency:"PKR", date: today(), due:"", sendOn:"" });
-  const onManualClient = (v) => { const r = rets.find(x=>x.client===v); const c = clients.find(x=>x.name===v); setManual(m=>({ ...m, client:v, retainerId:r?.id||"", base: r? r.amount : m.base, currency: (r?.currency||c?.currency||m.currency) })); };
+  const onManualClient = (v) => { const r = rets.find(x=>x.client===v); const c = clients.find(x=>x.name===v); setManual(m=>({ ...m, client:v, retainerId:r?.id||"", base: r? r.amount : m.base, carry: r? (+r.carry||0) : 0, currency: (r?.currency||c?.currency||m.currency) })); };
   const saveManual = () => {
     const m = manual; if (!m.client || !m.base) return;
     const base = +m.base||0, carry = +m.carry||0;
@@ -1454,11 +1477,14 @@ function Retainers({ data, update, patch, brand, go }) {
     patch({ retainerInvoices:[...invs, inv] }, `Created invoice for ${m.client} (${m.month})`); setManual(null);
   };
   const sendWA = (inv) => { const r = rets.find(x=>x.id===inv.retainerId); const num = (r?.whatsapp||"").replace(/\D/g,""); const msg = `*${brand.company}*\n\nInvoice: ${inv.number}\nPeriod: ${inv.month}\nAmount due: ${fmt(inv.total,inv.currency)}` + (inv.due?`\nDue: ${inv.due}`:``) + (inv.carry?`\n(Includes ${fmt(inv.carry,inv.currency)} carried forward)`:``) + `\n\nKindly confirm once transferred. Thank you.`; window.open(`https://wa.me/${num}?text=${encodeURIComponent(msg)}`, "_blank"); };
-  const confirmPay = ({ received, accountName, carryChoice }) => {
-    const recv = +received||0; const shortfall = Math.max(0, pay.total - recv);
+  const confirmPay = ({ received, accountName, carryChoice, overChoice }) => {
+    const recv = +received||0; const shortfall = Math.max(0, pay.total - recv); const overpay = Math.max(0, recv - pay.total);
     const status = shortfall<=0 ? "Paid" : (recv>0 ? "Partial" : "Unpaid");
     const newInvs = invs.map(i=>i.id===pay.id ? { ...i, status, paidAmount:recv, account:accountName, paidDate:today() } : i);
-    let newRets = rets; if (shortfall>0 && carryChoice==="next") newRets = rets.map(r=>r.id===pay.retainerId ? { ...r, carry:(+r.carry||0)+shortfall } : r);
+    let newRets = rets;
+    if (shortfall>0 && carryChoice==="next") newRets = rets.map(r=>r.id===pay.retainerId ? { ...r, carry:(+r.carry||0)+shortfall } : r);
+    // overpayment credited to next month reduces next invoice (stored as negative carry = credit)
+    if (overpay>0 && overChoice==="credit") newRets = newRets.map(r=>r.id===pay.retainerId ? { ...r, carry:(+r.carry||0)-overpay } : r);
     patch({ retainerInvoices:newInvs, retainers:newRets }, `Payment recorded for ${pay.client} (${pay.number})`); setPay(null);
   };
   return (<>
@@ -1494,13 +1520,17 @@ function PayModal({ inv, accounts, onClose, onConfirm, onManageAccounts }) {
   const [received, setReceived] = useState(String(inv.total));
   const [accountName, setAccountName] = useState(accounts[0]?.name || "");
   const [carryChoice, setCarryChoice] = useState("next");
-  const shortfall = Math.max(0, inv.total - (+received||0));
+  const [overChoice, setOverChoice] = useState("credit");
+  const recv = +received||0;
+  const shortfall = Math.max(0, inv.total - recv);
+  const overpay = Math.max(0, recv - inv.total);
   return (<Modal title={`Record payment · ${inv.number}`} onClose={onClose}>
     <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm flex justify-between"><span className="text-slate-500">Amount due</span><b>{fmt(inv.total,inv.currency)}</b></div>
     <Field label={`How much was received? (${inv.currency})`} type="number" value={received} onChange={e=>setReceived(e.target.value)}/>
     {accounts.length>0 ? (<div><Select label="Received in which account?" options={accounts.map(a=>a.name)} value={accountName} onChange={e=>setAccountName(e.target.value)}/><button onClick={onManageAccounts} className="text-sky-600 text-xs mt-1 hover:underline">Manage accounts</button></div>) : (<Field label="Received in which account?" value={accountName} onChange={e=>setAccountName(e.target.value)} placeholder="Type account name"/>)}
-    {shortfall>0 && <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2"><div className="text-sm text-amber-800">Shortfall of {fmt(shortfall,inv.currency)}. What should happen to it?</div><label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" checked={carryChoice==="next"} onChange={()=>setCarryChoice("next")} className="accent-sky-600"/> Add to next month's invoice</label><label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" checked={carryChoice==="discard"} onChange={()=>setCarryChoice("discard")} className="accent-sky-600"/> Discard / write off</label></div>}
-    <Btn onClick={()=>onConfirm({ received, accountName, carryChoice })}><Check size={15}/>{shortfall>0?"Record partial payment":"Mark as paid"}</Btn>
+    {shortfall>0 && <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2"><div className="text-sm text-amber-800">Short by {fmt(shortfall,inv.currency)}. What should happen to the rest?</div><label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" checked={carryChoice==="next"} onChange={()=>setCarryChoice("next")} className="accent-sky-600"/> Carry forward to next month's invoice</label><label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" checked={carryChoice==="discard"} onChange={()=>setCarryChoice("discard")} className="accent-sky-600"/> Leave it / write off</label></div>}
+    {overpay>0 && <div className="bg-sky-50 border border-sky-200 rounded-lg p-3 space-y-2"><div className="text-sm text-sky-800">Paid {fmt(overpay,inv.currency)} more than due. What should happen to the extra?</div><label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" checked={overChoice==="credit"} onChange={()=>setOverChoice("credit")} className="accent-sky-600"/> Credit to next month (reduces next invoice)</label><label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" checked={overChoice==="keep"} onChange={()=>setOverChoice("keep")} className="accent-sky-600"/> Keep as extra / advance (no adjustment)</label></div>}
+    <Btn onClick={()=>onConfirm({ received, accountName, carryChoice, overChoice })}><Check size={15}/>{shortfall>0?"Record partial payment":"Mark as paid"}</Btn>
   </Modal>);
 }
 function Ledger({ title, sub, rows, setRows, blank, fields, cols, render, extraActions }) {
@@ -1520,7 +1550,7 @@ function Invoices({ data, update }) {
     render={r=>(<><Td className="font-medium">{r.number}</Td><Td className="text-slate-500">{r.client}</Td><Td className="text-slate-500">{r.type}</Td><Td>{fmt(r.amount,r.currency)}</Td><Td className="text-slate-500">{r.date}</Td><Td><Pill s={r.status}/></Td></>)}
     fields={(e,s)=>(<><ClientInput clients={clients} value={e.client} onChange={ev=>{const v=ev.target.value;const c=clients.find(x=>x.name===v);s({...e,client:v,...(c?{currency:c.currency||"PKR"}:{})});}}/><Field label="Number" value={e.number} onChange={ev=>s({...e,number:ev.target.value})}/><Select label="Type" options={["Invoice","Receipt"]} value={e.type} onChange={ev=>s({...e,type:ev.target.value})}/><div className="grid grid-cols-2 gap-3"><Field label="Amount" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Select label="Currency" options={CURRENCIES} value={e.currency} onChange={ev=>s({...e,currency:ev.target.value})}/></div><Field label="Date" type="date" value={e.date} onChange={ev=>s({...e,date:ev.target.value})}/><Select label="Status" options={["Draft","Sent","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>;
 }
-function Payables({ data, update, patch }) {
+function Payables({ data, update, patch, brand }) {
   const rows=data.payables;
   // When a payable changes, if a vendor-bill payable becomes Paid, flip the linked vendor bill to Paid too.
   const setRows=(r)=>{
@@ -1534,6 +1564,14 @@ function Payables({ data, update, patch }) {
   };
   const markVendorPaid = (r)=>{
     patch({ payables: rows.map(p=>p.id===r.id?{...p,status:"Paid",settled:true,paidDate:today()}:p), vendorBills:(data.vendorBills||[]).map(b=>b.id===r.billId?{...b,paid:true,status:"Paid",paidDate:today()}:b) }, `Vendor bill paid: ${r.vendor}`);
+    // notify the vendor on WhatsApp
+    const bill = (data.vendorBills||[]).find(b=>b.id===r.billId);
+    const num = (r.whatsapp || bill?.whatsapp || "").replace(/\D/g,"");
+    const work = (r.desc||"").replace(/^Vendor bill:\s*/,"") || bill?.desc || "your work";
+    if (num) {
+      const msg = `*${brand.company}*\n\nAssalamu Alaikum ${r.vendor},\n\nYour payment of ${fmt(r.amount)} for ${work} has been processed. Please confirm once received.\n\nJazakAllah, thank you for your work.`;
+      window.open(`https://wa.me/${num}?text=${encodeURIComponent(msg)}`, "_blank");
+    }
   };
   const [appr, setAppr] = useState(null);
   const months = Array.from({length:6}).map((_,i)=>{ const d=new Date(); d.setMonth(d.getMonth()+i); return d.toLocaleString("default",{month:"long",year:"numeric"}); });
