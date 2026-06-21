@@ -280,9 +280,12 @@ export default function App() {
   useEffect(() => { (async () => {
     const d = await DB.get("svype_db", null);
     let merged = d ? { ...SEED, ...d } : SEED;
-    const after = generateRetainerInvoices(merged, false); // only generates on/after the 30th, once per cycle
-    setData(after);
-    if (!d || after !== merged) DB.set("svype_db", after);
+    // NOTE: retainer invoices are NEVER generated on page load. They are created only by the
+    // "Generate now" button, or by the scheduled check (runMonthlyGeneration) which the
+    // Retainers screen runs and which itself only acts on/after the 30th. This guarantees a
+    // refresh can never create invoices.
+    setData(merged);
+    if (!d) DB.set("svype_db", merged);
     const b = await DB.get("svype_brand", null);
     if (b) setBrand(b); else { await DB.set("svype_brand", SEED_BRAND); setNeedsSetup(true); }
     // re-issue a chat token if we restored a session but lost the token
@@ -572,7 +575,15 @@ const Select = ({ label, options, ...p }) => (<label className="block"><span cla
 const Table = ({ cols, children }) => (<div className="overflow-x-auto"><table className="w-full text-sm" style={{minWidth:480}}><thead><tr className="text-left text-slate-500 text-xs uppercase tracking-wider border-b border-slate-200 bg-slate-50">{cols.map(c=><th key={c} className="px-4 py-3 font-medium">{c}</th>)}</tr></thead><tbody>{children}</tbody></table></div>);
 const Row = ({ children, onClick }) => <tr onClick={onClick} className={`border-b border-slate-100 last:border-0 hover:bg-slate-50 ${onClick?"cursor-pointer":""}`}>{children}</tr>;
 const Td = ({ children, className="" }) => <td className={`px-4 py-3 ${className}`}>{children}</td>;
-const RowActions = ({ onEdit, onDelete, children }) => (<div className="flex gap-1 justify-end items-center" onClick={e=>e.stopPropagation()}>{children}{onEdit&&<button onClick={onEdit} className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Edit3 size={14}/></button>}{onDelete&&<button onClick={onDelete} className="p-1.5 rounded text-slate-400 hover:text-rose-500 hover:bg-slate-100"><Trash2 size={14}/></button>}</div>);
+const RowActions = ({ onEdit, onDelete, children }) => {
+  const [confirming, setConfirming] = useState(false);
+  return (<div className="flex gap-1 justify-end items-center" onClick={e=>e.stopPropagation()}>
+    {children}
+    {onEdit&&<button onClick={onEdit} className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Edit3 size={14}/></button>}
+    {onDelete&&!confirming&&<button onClick={()=>setConfirming(true)} title="Delete" className="p-1.5 rounded text-slate-400 hover:text-rose-500 hover:bg-slate-100"><Trash2 size={14}/></button>}
+    {onDelete&&confirming&&<span className="flex items-center gap-1 bg-rose-50 border border-rose-200 rounded-lg px-2 py-1"><span className="text-xs text-rose-600">Delete?</span><button onClick={()=>{ setConfirming(false); onDelete(); }} className="text-xs font-medium text-white bg-rose-600 hover:bg-rose-700 rounded px-2 py-0.5">Yes</button><button onClick={()=>setConfirming(false)} className="text-xs text-slate-500 hover:text-slate-700 px-1">No</button></span>}
+  </div>);
+};
 const Empty = ({ msg }) => <div className="px-4 py-12 text-center text-slate-400 text-sm">{msg}</div>;
 function ClientInput({ label="Client", clients, value, onChange }) {
   return (<label className="block"><span className="text-xs text-slate-500 mb-1 block">{label}</span>
@@ -1284,7 +1295,7 @@ function Recruit({ data, update }) {
         {edit.cv && (edit.cvType==="image"||edit.cv.startsWith("data:image")) && <img src={edit.cv} className="mt-2 h-32 rounded-lg border border-slate-200 object-cover"/>}
         {edit.cv && !(edit.cvType==="image"||edit.cv.startsWith("data:image")) && <button onClick={()=>openDataUrl(edit.cv, edit.cvName)} className="mt-2 text-sky-600 text-xs hover:underline flex items-center gap-1"><FileText size={13}/>Open {edit.cvName||"CV"}</button>}
       </div>
-      <div className="flex gap-2"><Btn onClick={()=>save(edit)}><Check size={15}/>Save</Btn>{edit.id&&<Btn variant="danger" onClick={()=>{setRows(rows.filter(r=>r.id!==edit.id));setEdit(null);}}><Trash2 size={15}/>Remove</Btn>}</div>
+      <div className="flex gap-2"><Btn onClick={()=>save(edit)}><Check size={15}/>Save</Btn>{edit.id&&<Btn variant="danger" onClick={()=>{ if(window.confirm(`Delete candidate "${edit.name}"? This cannot be undone.`)){ setRows(rows.filter(r=>r.id!==edit.id)); setEdit(null); } }}><Trash2 size={15}/>Remove</Btn>}</div>
     </Modal>}
     {viewCv && <CvModal c={viewCv} onClose={()=>setViewCv(null)}/>}
   </>);
@@ -1561,7 +1572,7 @@ function Retainers({ data, update, patch, brand, go }) {
     patch({ retainerInvoices:newInvs, retainers:newRets }, `Payment recorded for ${pay.client} (${pay.number})`); setPay(null);
   };
   return (<>
-    <Head title="Retainers" sub="Auto-generated on the 30th (issued 1st, due 5th of next month) · or generate / create manually" action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>go("accounts")}><Landmark size={15}/>Accounts</Btn><Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn></div>}/>
+    <Head title="Retainers" sub="Invoices are created only when you click Generate now (never on refresh). Issued 1st, due 5th of next month." action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>go("accounts")}><Landmark size={15}/>Accounts</Btn><Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn></div>}/>
     <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="invoices"?"primary":"ghost"} onClick={()=>setView("invoices")}>Invoices</Btn><Btn variant={view==="clients"?"primary":"ghost"} onClick={()=>setView("clients")}>Clients</Btn>{view==="invoices" && <><Btn variant="ghost" onClick={genDue}><Repeat size={15}/>Generate now</Btn><Btn variant="ghost" onClick={newManual}><Plus size={15}/>Create invoice</Btn><Btn variant="ghost" onClick={clearUnpaid}><X size={15}/>Clear unpaid</Btn></>}</div>
     {view==="clients" ? (
       <Card><Table cols={["Client","WhatsApp","Monthly","Carried fwd","Status",""]}>{rets.length===0?<tr><td colSpan={6}><Empty msg="No retainer clients yet"/></td></tr>:rets.map(r=>(
@@ -1701,11 +1712,11 @@ function Requests({ data, update }) {
   </>);
 }
 function Announcements({ data, update }) {
-  const rows = data.announcements; const [f, setF] = useState(null);
+  const rows = data.announcements; const [f, setF] = useState(null); const [confirmId, setConfirmId] = useState(null);
   const save = ()=>{ update("announcements", [{ id:uid(), title:f.title, body:f.body, date:today() }, ...rows], `Posted announcement: ${f.title}`); setF(null); };
   return (<>
     <Head title="Announcements" sub="Posted to every team member's home screen" action={<Btn onClick={()=>setF({title:"",body:""})}><Plus size={15}/>New post</Btn>}/>
-    <div className="space-y-3">{rows.length===0?<Card><Empty msg="No announcements yet"/></Card>:rows.map(an=>(<Card key={an.id}><div className="p-5 flex justify-between gap-4"><div><div className="font-semibold">{an.title}</div><div className="text-sm text-slate-600 mt-1">{an.body}</div><div className="text-xs text-slate-400 mt-2">{an.date}</div></div><button onClick={()=>update("announcements",rows.filter(x=>x.id!==an.id))} className="text-slate-400 hover:text-rose-500 shrink-0"><Trash2 size={16}/></button></div></Card>))}</div>
+    <div className="space-y-3">{rows.length===0?<Card><Empty msg="No announcements yet"/></Card>:rows.map(an=>(<Card key={an.id}><div className="p-5 flex justify-between gap-4"><div><div className="font-semibold">{an.title}</div><div className="text-sm text-slate-600 mt-1">{an.body}</div><div className="text-xs text-slate-400 mt-2">{an.date}</div></div>{confirmId===an.id?<span className="flex items-center gap-1 self-start shrink-0"><button onClick={()=>{update("announcements",rows.filter(x=>x.id!==an.id));setConfirmId(null);}} className="text-xs font-medium text-white bg-rose-600 hover:bg-rose-700 rounded px-2 py-1">Delete?</button><button onClick={()=>setConfirmId(null)} className="text-xs text-slate-500 px-1">No</button></span>:<button onClick={()=>setConfirmId(an.id)} className="text-slate-400 hover:text-rose-500 shrink-0"><Trash2 size={16}/></button>}</div></Card>))}</div>
     {f && <Modal title="New announcement" onClose={()=>setF(null)}><Field label="Title" value={f.title} onChange={e=>setF({...f,title:e.target.value})}/><Area label="Message" value={f.body} onChange={e=>setF({...f,body:e.target.value})}/><Btn onClick={save}><Check size={15}/>Post</Btn></Modal>}
   </>);
 }
