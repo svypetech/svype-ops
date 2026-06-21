@@ -127,6 +127,7 @@ const SEED = {
   letters: [], proposals: [], quotations: [], offers: [],
   retainers: [],
   retainerInvoices: [],
+  receipts: [],
   accounts: [],
   announcements: [],
   requests: [], audit: [],
@@ -221,6 +222,7 @@ const NAV = [
   { id:"quotations", label:"Quotations", icon:Receipt },
   { id:"retainers", label:"Retainers", icon:Repeat },
   { id:"invoices", label:"Invoices & Receipts", icon:FolderOpen },
+  { id:"receipts", label:"Receipts", icon:Receipt },
   { id:"payables", label:"Payables", icon:ArrowUpCircle },
   { id:"receivables", label:"Receivables", icon:ArrowDownCircle },
   { id:"accounts", label:"Bank Accounts", icon:Landmark },
@@ -234,7 +236,7 @@ const NAV_GROUPS = [
   { id:"dash", label:"Dashboard", icon:LayoutDashboard, tabs:["dash"] },
   { id:"chat", label:"Team Chat", icon:MessageSquare, tabs:["chat"] },
   { id:"people", label:"People", icon:Users, tabs:["employees","attendance","payroll","advances","recruit","cvbank"] },
-  { id:"sales", label:"Clients & Sales", icon:Contact, tabs:["clients","proposals","quotations","retainers","invoices"] },
+  { id:"sales", label:"Clients & Sales", icon:Contact, tabs:["clients","proposals","quotations","retainers","invoices","receipts"] },
   { id:"finance", label:"Finance", icon:Wallet, tabs:["payables","receivables","vendorbills","accounts"] },
   { id:"documents", label:"Documents", icon:FileSignature, tabs:["offers","letters","meetings"] },
   { id:"workspace", label:"Workspace", icon:Inbox, tabs:["requests","announce","timesheets"] },
@@ -244,7 +246,7 @@ const NAV_GROUPS = [
 const TAB_LABELS = {
   dash:"Dashboard", chat:"Team Chat",
   employees:"Employees", attendance:"Attendance & Leave", payroll:"Payroll & Slips", advances:"Advances & Loans", recruit:"Recruitment", cvbank:"CV Bank",
-  clients:"Clients", proposals:"Proposals", quotations:"Quotations", retainers:"Retainers", invoices:"Invoices",
+  clients:"Clients", proposals:"Proposals", quotations:"Quotations", retainers:"Retainers", invoices:"Invoices", receipts:"Receipts",
   payables:"Payables", receivables:"Receivables", vendorbills:"Vendor Bills", accounts:"Bank Accounts",
   offers:"Offer Letters", letters:"Letters & Certificates", meetings:"Meeting Notes",
   requests:"Requests", announce:"Announcements", timesheets:"Work & Timesheets",
@@ -432,6 +434,7 @@ export default function App() {
             {active==="quotations" && <Quotations {...props}/>}
             {active==="retainers" && <Retainers {...props}/>}
             {active==="invoices" && <Invoices {...props}/>}
+            {active==="receipts" && <Receipts {...props}/>}
             {active==="payables" && <Payables {...props}/>}
             {active==="receivables" && <Receivables {...props}/>}
             {active==="accounts" && <BankAccounts {...props}/>}
@@ -681,7 +684,7 @@ function EmpProfile({ data, update, me }) {
     <div className="flex items-center gap-4 mb-6"><div className="w-14 h-14 rounded-2xl bg-sky-100 text-sky-700 grid place-items-center font-bold text-xl">{me.name[0]}</div><div><div className="text-lg font-bold text-slate-900">{me.name}</div><div className="text-sm text-slate-500">{me.role} · {me.dept}</div></div></div>
     <div className="grid sm:grid-cols-2 gap-4 mb-6">{[["Email",me.email],["Phone",me.phone],["CNIC",me.cnic],["Salary",fmt(me.salary)],["Joined",me.joined],["Status",me.status]].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-xs text-slate-500">{k}</div><div className="font-medium mt-0.5">{v||"—"}</div></div></Card>))}</div>
     <div className="text-xs uppercase tracking-wider text-slate-500 mb-2 font-medium">My documents</div>
-    <Card><div className="p-4">{(!me.docs||me.docs.length===0)?<Empty msg="No documents on file"/>:<div className="grid sm:grid-cols-3 gap-3">{me.docs.map(d=>(<div key={d.id} className="bg-slate-50 border border-slate-200 rounded-lg overflow-hidden">{d.img?<img src={d.img} className="w-full h-32 object-cover"/>:<div className="h-32 grid place-items-center text-slate-400"><FileText/></div>}<div className="p-2 text-xs truncate">{d.name}{d.expiry&&<span className="block text-slate-400">exp {d.expiry}</span>}</div></div>))}</div>}</div></Card>
+    <Card><div className="p-4">{(!me.docs||me.docs.length===0)?<Empty msg="No documents on file"/>:<div className="grid sm:grid-cols-3 gap-3">{me.docs.map(d=>(<button key={d.id} onClick={()=>openDataUrl(d.file||d.img, d.name)} className="text-left bg-slate-50 border border-slate-200 rounded-lg overflow-hidden hover:border-sky-400 hover:shadow-sm transition">{d.img?<img src={d.img} className="w-full h-32 object-cover"/>:<div className="h-32 grid place-items-center text-slate-400"><FileText/></div>}<div className="p-2 text-xs truncate flex items-center gap-1"><span className="text-sky-600">↗</span>{d.name}{d.expiry&&<span className="block text-slate-400">exp {d.expiry}</span>}</div></button>))}</div>}</div></Card>
     {req!==null && <Modal title="Request a profile change" onClose={()=>setReq(null)}><Area label="What needs updating?" value={req} onChange={e=>setReq(e.target.value)} placeholder="e.g. New phone number, updated CNIC scan"/><Btn onClick={submit}><Check size={15}/>Send to HR</Btn></Modal>}
     {cert && <Modal title="Request a certificate / letter" onClose={()=>setCert(null)}>
       <Select label="What do you need?" options={["Salary Certificate","Experience Certificate","Employment Verification","Appointment Letter","Other"]} value={cert.type} onChange={e=>setCert({...cert,type:e.target.value})}/>
@@ -1015,7 +1018,7 @@ function Employees({ data, update }) {
   </>);
 }
 function EmployeeForm({ edit, setEdit, save }) {
-  const addDocs = async (files) => { const arr = [...(edit.docs||[])]; for (const f of files) { const isImg = f.type.startsWith("image/"); arr.push({ id:uid(), name:f.name, type:isImg?"image":"file", img: isImg ? await readImage(f, 900) : null, expiry:"", date:today() }); } setEdit({ ...edit, docs: arr }); };
+  const addDocs = async (files) => { const arr = [...(edit.docs||[])]; for (const f of files) { const isImg = f.type.startsWith("image/"); arr.push({ id:uid(), name:f.name, type:isImg?"image":"file", img: isImg ? await readImage(f, 1100) : null, file: isImg ? null : await readFile(f), expiry:"", date:today() }); } setEdit({ ...edit, docs: arr }); };
   const setDocExpiry = (id, v) => setEdit({ ...edit, docs: edit.docs.map(d=>d.id===id?{...d,expiry:v}:d) });
   return <Modal title={edit.id?"Edit employee":"Add employee"} onClose={()=>setEdit(null)}>
     <Field label="Full name" value={edit.name} onChange={e=>setEdit({...edit,name:e.target.value})}/>
@@ -1027,7 +1030,7 @@ function EmployeeForm({ edit, setEdit, save }) {
     <div className="grid grid-cols-2 gap-3"><Field label="Bank name" value={edit.bankName||""} onChange={e=>setEdit({...edit,bankName:e.target.value})} placeholder="e.g. Meezan Bank"/><Field label="Account number / IBAN" value={edit.account||""} onChange={e=>setEdit({...edit,account:e.target.value})}/></div>
     <div><span className="text-xs text-slate-500 mb-1 block">Documents (set an expiry to get reminders)</span>
       <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500"><Paperclip size={15}/> Upload files<input type="file" multiple accept="image/*,.pdf" className="hidden" onChange={e=>addDocs([...e.target.files])}/></label>
-      {(edit.docs||[]).length>0 && <div className="mt-2 space-y-2">{edit.docs.map(d=>(<div key={d.id} className="bg-slate-50 border border-slate-200 rounded px-2 py-2"><div className="flex items-center justify-between text-xs"><span className="truncate">{d.name}</span><button onClick={()=>setEdit({...edit,docs:edit.docs.filter(x=>x.id!==d.id)})} className="text-slate-400 hover:text-rose-500"><X size={13}/></button></div><div className="flex items-center gap-2 mt-1"><span className="text-xs text-slate-400">Expiry</span><input type="date" value={d.expiry||""} onChange={e=>setDocExpiry(d.id,e.target.value)} className="bg-white border border-slate-300 rounded px-2 py-1 text-xs outline-none focus:border-sky-500"/></div></div>))}</div>}
+      {(edit.docs||[]).length>0 && <div className="mt-2 space-y-2">{edit.docs.map(d=>(<div key={d.id} className="bg-slate-50 border border-slate-200 rounded px-2 py-2"><div className="flex items-center justify-between text-xs"><button onClick={()=>openDataUrl(d.file||d.img, d.name)} className="truncate text-sky-600 hover:underline flex items-center gap-1"><span>↗</span>{d.name}</button><button onClick={()=>setEdit({...edit,docs:edit.docs.filter(x=>x.id!==d.id)})} className="text-slate-400 hover:text-rose-500"><X size={13}/></button></div><div className="flex items-center gap-2 mt-1"><span className="text-xs text-slate-400">Expiry</span><input type="date" value={d.expiry||""} onChange={e=>setDocExpiry(d.id,e.target.value)} className="bg-white border border-slate-300 rounded px-2 py-1 text-xs outline-none focus:border-sky-500"/></div></div>))}</div>}
     </div>
     <Btn onClick={()=>save(edit)}><Check size={15}/>Save</Btn>
   </Modal>;
@@ -1043,7 +1046,7 @@ function EmployeeProfile({ emp, data, onBack, onEdit }) {
     <div className="flex items-start justify-between mb-6"><div className="flex items-center gap-4"><div className="w-14 h-14 rounded-2xl bg-sky-100 text-sky-700 grid place-items-center font-bold text-xl">{emp.name[0]}</div><div><h2 className="text-xl font-bold tracking-tight text-slate-900">{emp.name}</h2><p className="text-sm text-slate-500">{emp.role} · {emp.dept}</p></div></div><Btn variant="ghost" onClick={onEdit}><Edit3 size={15}/>Edit</Btn></div>
     <div className="flex gap-1 mb-5 border-b border-slate-200 overflow-x-auto">{tabs.map(([k,l])=>(<button key={k} onClick={()=>setT(k)} className={`px-4 py-2 text-sm border-b-2 -mb-px whitespace-nowrap ${t===k?"border-sky-600 text-sky-700 font-medium":"border-transparent text-slate-500 hover:text-slate-800"}`}>{l}</button>))}</div>
     {t==="overview" && <div className="grid sm:grid-cols-2 gap-4">{[["Email",emp.email],["Phone",emp.phone],["CNIC",emp.cnic],["Salary",fmt(emp.salary)],["Provident fund",(emp.pf||0)+"%"],["Joined",emp.joined],["Bank",emp.bankName],["Account / IBAN",emp.account]].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-xs text-slate-500">{k}</div><div className="font-medium mt-0.5">{v||"—"}</div></div></Card>))}</div>}
-    {t==="docs" && <Card><div className="p-4">{(!emp.docs||emp.docs.length===0)?<Empty msg="No documents on file."/>:<div className="grid sm:grid-cols-3 gap-3">{emp.docs.map(d=>{const dd=d.expiry?daysUntil(d.expiry):null;return(<div key={d.id} className="bg-slate-50 border border-slate-200 rounded-lg overflow-hidden">{d.img?<img src={d.img} className="w-full h-32 object-cover"/>:<div className="h-32 grid place-items-center text-slate-400"><FileText/></div>}<div className="p-2 text-xs"><div className="truncate">{d.name}</div>{d.expiry&&<div className={dd<=30?"text-rose-600":"text-slate-400"}>exp {d.expiry}{dd<=30?` · ${dd<0?"expired":dd+"d"}`:""}</div>}</div></div>);})}</div>}</div></Card>}
+    {t==="docs" && <Card><div className="p-4">{(!emp.docs||emp.docs.length===0)?<Empty msg="No documents on file."/>:<div className="grid sm:grid-cols-3 gap-3">{emp.docs.map(d=>{const dd=d.expiry?daysUntil(d.expiry):null;return(<button key={d.id} onClick={()=>openDataUrl(d.file||d.img, d.name)} className="text-left bg-slate-50 border border-slate-200 rounded-lg overflow-hidden hover:border-sky-400 hover:shadow-sm transition">{d.img?<img src={d.img} className="w-full h-32 object-cover"/>:<div className="h-32 grid place-items-center text-slate-400"><FileText/></div>}<div className="p-2 text-xs"><div className="truncate flex items-center gap-1"><span className="text-sky-600">↗</span>{d.name}</div>{d.expiry&&<div className={dd<=30?"text-rose-600":"text-slate-400"}>exp {d.expiry}{dd<=30?` · ${dd<0?"expired":dd+"d"}`:""}</div>}</div></button>);})}</div>}</div></Card>}
     {t==="payroll" && <Card><Table cols={["Month","Basic","Net","Status"]}>{slips.length===0?<tr><td colSpan={4}><Empty msg="No payroll history"/></td></tr>:slips.map(p=>(<Row key={p.id}><Td>{p.month}</Td><Td>{fmt(p.basic)}</Td><Td className="font-semibold">{fmt(netPay(p))}</Td><Td><Pill s={p.paid?"Paid":"Pending"}/></Td></Row>))}</Table></Card>}
     {t==="advances" && <Card><Table cols={["Date","Total","Installment","Remaining","Status"]}>{advs.length===0?<tr><td colSpan={5}><Empty msg="No advances"/></td></tr>:advs.map(a=>(<Row key={a.id}><Td className="text-slate-500">{a.date}</Td><Td>{fmt(a.total)}</Td><Td>{fmt(a.installment)}</Td><Td>{fmt(a.remaining)}</Td><Td><Pill s={a.status}/></Td></Row>))}</Table></Card>}
     {t==="letters" && <Card><Table cols={["Type","Date"]}>{empLetters.length===0?<tr><td colSpan={2}><Empty msg="No letters issued"/></td></tr>:empLetters.map(l=>(<Row key={l.id}><Td>{l.docType||l.type}</Td><Td className="text-slate-500">{l.date}</Td></Row>))}</Table></Card>}
@@ -1522,6 +1525,61 @@ function openInvoicePDF(inv, brand) {
   w.document.close();
 }
 
+// Build a payment receipt record from a paid invoice.
+function makeReceipt({ client, amount, currency, forText, account, source, sourceNumber }) {
+  return {
+    id: uid(),
+    number: `RCPT-${Date.now().toString().slice(-6)}`,
+    client, amount: +amount || 0, currency: currency || "PKR",
+    for: forText || "", account: account || "", source: source || "", sourceNumber: sourceNumber || "",
+    date: today(),
+  };
+}
+function receiptHTML(r, brand) {
+  const money = (n) => `${r.currency || "PKR"} ${Number(n||0).toLocaleString()}`;
+  const logo = brand.logo ? `<img src="${brand.logo}" style="height:54px;object-fit:contain"/>` : "";
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${r.number}</title>
+  <style>
+    *{font-family:Arial,Helvetica,sans-serif;color:#0f172a;box-sizing:border-box}
+    body{margin:0;padding:40px}
+    .hd{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:3px solid ${brand.accent||"#0284c7"};padding-bottom:16px;margin-bottom:24px}
+    .co{font-size:20px;font-weight:bold}.tag{color:#64748b;font-size:12px}
+    .meta{text-align:right;font-size:12px;color:#475569}
+    h1{font-size:26px;letter-spacing:1px;margin:0 0 4px;color:#16a34a}
+    table{width:100%;border-collapse:collapse;margin-top:20px}
+    th,td{text-align:left;padding:10px;border-bottom:1px solid #e2e8f0;font-size:14px}
+    th{background:#f8fafc;color:#475569;text-transform:uppercase;font-size:11px}
+    .tot{text-align:right;font-size:18px;font-weight:bold;margin-top:18px}
+    .stamp{display:inline-block;border:3px solid #16a34a;color:#16a34a;font-weight:bold;letter-spacing:2px;padding:6px 16px;border-radius:8px;transform:rotate(-8deg);font-size:18px;margin-top:24px}
+    .foot{margin-top:30px;color:#64748b;font-size:12px}
+  </style></head><body>
+  <div class="hd"><div style="display:flex;gap:12px;align-items:center">${logo}<div><div class="co">${brand.company||""}</div><div class="tag">${brand.tagline||""}</div></div></div>
+  <div class="meta">${brand.address||""}<br>${brand.contact||""}</div></div>
+  <h1>PAYMENT RECEIPT</h1>
+  <div style="display:flex;justify-content:space-between;font-size:13px;color:#475569;margin-top:8px">
+    <div><b>Received from:</b><br>${r.client||""}</div>
+    <div style="text-align:right">
+      <b>Receipt #:</b> ${r.number}<br>
+      <b>Date:</b> ${r.date||today()}<br>
+      ${r.sourceNumber?`<b>Against invoice:</b> ${r.sourceNumber}<br>`:""}
+      ${r.account?`<b>Received in:</b> ${r.account}`:""}
+    </div>
+  </div>
+  <table><thead><tr><th>Description</th><th style="text-align:right">Amount</th></tr></thead>
+  <tbody><tr><td>${r.for||"Payment received"}</td><td style="text-align:right">${money(r.amount)}</td></tr></tbody></table>
+  <div class="tot">Total received: ${money(r.amount)}</div>
+  <div class="stamp">PAID</div>
+  <div class="foot">This is a computer-generated receipt confirming the amount above has been received with thanks.</div>
+  <script>window.onload=()=>{setTimeout(()=>window.print(),300)}</script>
+  </body></html>`;
+}
+function openReceiptPDF(r, brand) {
+  const w = window.open("", "_blank");
+  if (!w) { alert("Allow pop-ups to download the receipt PDF."); return; }
+  w.document.write(receiptHTML(r, brand));
+  w.document.close();
+}
+
 function Retainers({ data, update, patch, brand, go }) {
   const rets = data.retainers, invs = data.retainerInvoices, clients = data.clients;
   const accounts = (data.bankAccounts||[]).map(a=>({ id:a.id, name:a.label }));
@@ -1567,9 +1625,14 @@ function Retainers({ data, update, patch, brand, go }) {
     const newInvs = invs.map(i=>i.id===pay.id ? { ...i, status, paidAmount:recv, account:accountName, paidDate:today() } : i);
     let newRets = rets;
     if (shortfall>0 && carryChoice==="next") newRets = rets.map(r=>r.id===pay.retainerId ? { ...r, carry:(+r.carry||0)+shortfall } : r);
-    // overpayment credited to next month reduces next invoice (stored as negative carry = credit)
     if (overpay>0 && overChoice==="credit") newRets = newRets.map(r=>r.id===pay.retainerId ? { ...r, carry:(+r.carry||0)-overpay } : r);
-    patch({ retainerInvoices:newInvs, retainers:newRets }, `Payment recorded for ${pay.client} (${pay.number})`); setPay(null);
+    // create a payment receipt for the amount received
+    const patchObj = { retainerInvoices:newInvs, retainers:newRets };
+    if (recv > 0) {
+      const r = makeReceipt({ client:pay.client, amount:recv, currency:pay.currency, forText:`Retainer — ${pay.month}`, account:accountName, source:"retainer", sourceNumber:pay.number });
+      patchObj.receipts = [r, ...(data.receipts||[])];
+    }
+    patch(patchObj, `Payment recorded for ${pay.client} (${pay.number})`); setPay(null);
   };
   return (<>
     <Head title="Retainers" sub="Invoices are created only when you click Generate now (never on refresh). Issued 1st, due 5th of next month." action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>go("accounts")}><Landmark size={15}/>Accounts</Btn><Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn></div>}/>
@@ -1631,13 +1694,44 @@ function Ledger({ title, sub, rows, setRows, blank, fields, cols, render, extraA
     {edit && <Modal title={edit.id?"Edit":"Add"} onClose={()=>setEdit(null)}>{fields(edit,setEdit)}<Btn onClick={()=>save(edit)}><Check size={15}/>Save</Btn></Modal>}
   </>);
 }
-function Invoices({ data, update }) {
-  const rows=data.invoices, setRows=r=>update("invoices",r); const clients=data.clients;
-  return <Ledger title="Invoices & Receipts" sub="Billing to clients" rows={rows} setRows={setRows}
+function Invoices({ data, update, patch }) {
+  const rows=data.invoices; const clients=data.clients;
+  const setRows=(r)=>{
+    const wasById = Object.fromEntries(rows.map(x=>[x.id,x]));
+    const newlyPaid = r.filter(x=>x.status==="Paid" && (!wasById[x.id] || wasById[x.id].status!=="Paid"));
+    if (newlyPaid.length) {
+      const receipts = newlyPaid.map(x=>makeReceipt({ client:x.client, amount:x.amount, currency:x.currency, forText:`Invoice ${x.number}`, source:"invoice", sourceNumber:x.number }));
+      patch({ invoices:r, receipts:[...receipts, ...(data.receipts||[])] }, `Invoice marked paid — receipt created`);
+    } else {
+      update("invoices", r);
+    }
+  };
+  return <Ledger title="Invoices & Receipts" sub="Billing to clients · marking an invoice Paid creates a receipt in the Receipts tab" rows={rows} setRows={setRows}
     blank={()=>({client:"",number:"INV-"+(1000+rows.length+1),amount:"",currency:"PKR",date:today(),status:"Draft",type:"Invoice"})}
     cols={["Number","Client","Type","Amount","Date","Status"]}
     render={r=>(<><Td className="font-medium">{r.number}</Td><Td className="text-slate-500">{r.client}</Td><Td className="text-slate-500">{r.type}</Td><Td>{fmt(r.amount,r.currency)}</Td><Td className="text-slate-500">{r.date}</Td><Td><Pill s={r.status}/></Td></>)}
     fields={(e,s)=>(<><ClientInput clients={clients} value={e.client} onChange={ev=>{const v=ev.target.value;const c=clients.find(x=>x.name===v);s({...e,client:v,...(c?{currency:c.currency||"PKR"}:{})});}}/><Field label="Number" value={e.number} onChange={ev=>s({...e,number:ev.target.value})}/><Select label="Type" options={["Invoice","Receipt"]} value={e.type} onChange={ev=>s({...e,type:ev.target.value})}/><div className="grid grid-cols-2 gap-3"><Field label="Amount" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Select label="Currency" options={CURRENCIES} value={e.currency} onChange={ev=>s({...e,currency:ev.target.value})}/></div><Field label="Date" type="date" value={e.date} onChange={ev=>s({...e,date:ev.target.value})}/><Select label="Status" options={["Draft","Sent","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>;
+}
+function Receipts({ data, update, brand }) {
+  const rows = data.receipts || [];
+  const clients = data.clients || [];
+  const waNum = (client) => (clients.find(c=>c.name===client)?.whatsapp || "").replace(/\D/g,"");
+  const sendWA = (r) => {
+    const num = waNum(r.client);
+    const msg = `*${brand.company}*\n\nPayment Receipt: ${r.number}\nReceived: ${fmt(r.amount,r.currency)}\nFor: ${r.for}\nDate: ${r.date}` + (r.account?`\nReceived in: ${r.account}`:``) + `\n\nThank you for your payment.`;
+    if (num) window.open(`https://wa.me/${num}?text=${encodeURIComponent(msg)}`, "_blank");
+    else alert("No WhatsApp number on file for this client.");
+  };
+  const total = rows.reduce((s,r)=>s+ +r.amount,0);
+  return (<>
+    <Head title="Receipts" sub={`Payment receipts · ${rows.length} issued · ${fmt(total)} received in total`}/>
+    <Card><Table cols={["Receipt","Client","For","Amount","Account","Date",""]}>{rows.length===0?<tr><td colSpan={7}><Empty msg="No receipts yet — they're created automatically when you mark a client invoice or retainer as paid"/></td></tr>:rows.map(r=>(
+      <Row key={r.id}><Td className="font-medium">{r.number}</Td><Td className="text-slate-500">{r.client}</Td><Td className="text-slate-500">{r.for}</Td><Td className="font-semibold">{fmt(r.amount,r.currency)}</Td><Td className="text-slate-500">{r.account||"—"}</Td><Td className="text-slate-500">{r.date}</Td>
+      <Td><RowActions onDelete={()=>update("receipts", rows.filter(x=>x.id!==r.id), `Deleted receipt ${r.number}`)}>
+        <button onClick={()=>openReceiptPDF(r, brand)} title="Download receipt PDF" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Download size={14}/></button>
+        <button onClick={()=>sendWA(r)} title="Send on WhatsApp" className="p-1.5 rounded text-slate-400 hover:text-green-600 hover:bg-slate-100"><Send size={14}/></button>
+      </RowActions></Td></Row>))}</Table></Card>
+  </>);
 }
 function Payables({ data, update, patch, brand }) {
   const rows=data.payables;
