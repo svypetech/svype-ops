@@ -135,6 +135,29 @@ const SEED = {
 };
 const SEED_BRAND = { company: "Svype Tech Limited", tagline: "Digital Marketing & Creative Agency", address: "Islamabad · Lahore, Pakistan", contact: "hello@svype.com · www.svype.com", accent: "#0284c7", logo: null, signatories: [], stamps: [] };
 
+// Office geofence: check-in/out only allowed within RADIUS metres of an office.
+const OFFICES = [
+  { name: "Islamabad office", lat: 33.65028635688238, lng: 73.15295963866075 },
+  { name: "Lahore office", lat: 31.505179320998522, lng: 74.34525968090706 },
+];
+const GEOFENCE_RADIUS_M = 300;
+// Haversine distance in metres.
+function distanceMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000, toRad = (d) => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+// Returns the nearest office within radius, or null. { office, distance }
+function nearestOffice(lat, lng) {
+  let best = null;
+  for (const o of OFFICES) {
+    const d = distanceMeters(lat, lng, o.lat, o.lng);
+    if (best === null || d < best.distance) best = { office: o.name, distance: d };
+  }
+  return best;
+}
+
 // Helpers for the billing schedule.
 function pad2(n){ return String(n).padStart(2,"0"); }
 function nextMonthInfo(from){
@@ -562,7 +585,7 @@ function BrandSetup({ brand, saveBrand, done }) {
 
 /* ---------------- shared UI ---------------- */
 const Head = ({ title, sub, action }) => (<div className="flex flex-wrap items-end justify-between gap-3 mb-6"><div><h2 className="text-xl font-bold tracking-tight text-slate-900">{title}</h2>{sub && <p className="text-sm text-slate-500 mt-0.5">{sub}</p>}</div>{action}</div>);
-const Btn = ({ children, onClick, variant="primary" }) => { const s={primary:"bg-sky-600 text-white hover:bg-sky-700",ghost:"bg-white border border-slate-300 text-slate-700 hover:bg-slate-100",danger:"bg-white border border-rose-300 text-rose-600 hover:bg-rose-50",ok:"bg-emerald-600 text-white hover:bg-emerald-700"}; return <button onClick={onClick} className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-medium transition ${s[variant]}`}>{children}</button>; };
+const Btn = ({ children, onClick, variant="primary", disabled=false }) => { const s={primary:"bg-sky-600 text-white hover:bg-sky-700",ghost:"bg-white border border-slate-300 text-slate-700 hover:bg-slate-100",danger:"bg-white border border-rose-300 text-rose-600 hover:bg-rose-50",ok:"bg-emerald-600 text-white hover:bg-emerald-700"}; return <button onClick={onClick} disabled={disabled} className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-medium transition ${s[variant]} ${disabled?"opacity-60 cursor-not-allowed":""}`}>{children}</button>; };
 const Card = ({ children }) => <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">{children}</div>;
 const Pill = ({ s }) => { const m={Active:"bg-emerald-100 text-emerald-700",Paid:"bg-emerald-100 text-emerald-700",Sent:"bg-sky-100 text-sky-700",Accepted:"bg-emerald-100 text-emerald-700",Done:"bg-emerald-100 text-emerald-700",Cleared:"bg-emerald-100 text-emerald-700",Pending:"bg-amber-100 text-amber-700",Unpaid:"bg-amber-100 text-amber-700",Open:"bg-amber-100 text-amber-700",Requested:"bg-amber-100 text-amber-700","Pending HR":"bg-amber-100 text-amber-700","Pending Founder":"bg-sky-100 text-sky-700",Partial:"bg-orange-100 text-orange-700",Outstanding:"bg-amber-100 text-amber-700",Overdue:"bg-rose-100 text-rose-700",Approved:"bg-emerald-100 text-emerald-700",Rejected:"bg-rose-100 text-rose-700",Draft:"bg-slate-100 text-slate-600",Inactive:"bg-slate-100 text-slate-600",Paused:"bg-slate-100 text-slate-600"}; return <span className={`px-2 py-0.5 rounded-md text-xs font-medium ${m[s]||"bg-slate-100 text-slate-600"}`}>{s}</span>; };
 function Modal({ title, onClose, children }) {
@@ -641,25 +664,56 @@ function DocSheet({ brand, body, signed, setSigned }) {
 }
 
 /* ================= EMPLOYEE PORTAL ================= */
-function checkInOut(data, update, name, which) {
-  const set = (loc) => {
+function checkInOut(data, update, name, which, onResult) {
+  const apply = (loc) => {
+    const near = loc ? nearestOffice(loc.lat, loc.lng) : null;
+    if (!loc) { onResult && onResult({ ok:false, msg:"Couldn't get your location. Please enable location access and try again — check-in requires being at a Svype office." }); return; }
+    if (!near || near.distance > GEOFENCE_RADIUS_M) {
+      onResult && onResult({ ok:false, msg:`You're not at a Svype office. You must be within ${GEOFENCE_RADIUS_M}m of the Lahore or Islamabad office to check ${which}. ${near?`(You're about ${Math.round(near.distance)}m from the ${near.office}.)`:""}` });
+      return;
+    }
+    const stampedLoc = { ...loc, office: near.office, distance: Math.round(near.distance) };
     const ex = data.attendance.find(a=>a.employee===name && a.date===today());
     const now = new Date().toISOString();
-    if (ex) update("attendance", data.attendance.map(a=>a===ex ? { ...a, status:"Present", ...(which==="in"?{checkIn:now,location:loc||a.location}:{checkOut:now}) } : a));
-    else update("attendance", [...data.attendance, { id:uid(), employee:name, date:today(), status:"Present", checkIn:which==="in"?now:null, checkOut:which==="out"?now:null, location:loc }]);
+    if (ex) {
+      update("attendance", data.attendance.map(a=>a===ex ? { ...a, status:"Present",
+        ...(which==="in" ? { checkIn:now, location:stampedLoc, office:near.office } : { checkOut:now, checkOutLocation:stampedLoc, checkOutOffice:near.office }) } : a));
+    } else {
+      update("attendance", [...data.attendance, { id:uid(), employee:name, date:today(), status:"Present",
+        checkIn: which==="in"?now:null, checkOut: which==="out"?now:null,
+        location: which==="in"?stampedLoc:null, office: which==="in"?near.office:null,
+        checkOutLocation: which==="out"?stampedLoc:null, checkOutOffice: which==="out"?near.office:null }]);
+    }
+    onResult && onResult({ ok:true, msg:`Checked ${which} · ${near.office}`, office:near.office });
   };
-  if (which==="in" && navigator.geolocation) navigator.geolocation.getCurrentPosition(p=>set({lat:p.coords.latitude,lng:p.coords.longitude}), ()=>set(null), {timeout:4000});
-  else set(null);
+  if (navigator.geolocation) {
+    navigator.geolocation.getCurrentPosition(
+      p=>apply({lat:p.coords.latitude,lng:p.coords.longitude}),
+      ()=>apply(null),
+      { enableHighAccuracy:true, timeout:8000, maximumAge:0 }
+    );
+  } else {
+    onResult && onResult({ ok:false, msg:"This device can't share location, so check-in isn't available here." });
+  }
 }
 function CheckInCard({ data, update, me }) {
   const a = data.attendance.find(x=>x.employee===me.name && x.date===today());
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const doAction = (which) => {
+    setBusy(true); setMsg(null);
+    checkInOut(data, update, me.name, which, (res)=>{ setBusy(false); setMsg(res); });
+  };
   return (<Card><div className="p-5">
     <div className="flex items-center gap-2 text-sm font-semibold mb-3"><Clock size={16} className="text-sky-600"/>Today · {new Date().toLocaleDateString()}</div>
     <div className="flex flex-wrap items-center gap-3">
-      <Btn variant={a?.checkIn?"ghost":"primary"} onClick={()=>checkInOut(data,update,me.name,"in")}>Check in{a?.checkIn?` · ${timeOf(a.checkIn)}`:""}</Btn>
-      <Btn variant={a?.checkOut?"ghost":"ok"} onClick={()=>checkInOut(data,update,me.name,"out")}>Check out{a?.checkOut?` · ${timeOf(a.checkOut)}`:""}</Btn>
-      {a?.location && <span className="text-xs text-slate-400 flex items-center gap-1"><MapPin size={12}/>location saved</span>}
-    </div></div></Card>);
+      <Btn variant={a?.checkIn?"ghost":"primary"} disabled={busy} onClick={()=>doAction("in")}>{busy?<Loader2 size={14} className="animate-spin"/>:null}Check in{a?.checkIn?` · ${timeOf(a.checkIn)}`:""}</Btn>
+      <Btn variant={a?.checkOut?"ghost":"ok"} disabled={busy} onClick={()=>doAction("out")}>{busy?<Loader2 size={14} className="animate-spin"/>:null}Check out{a?.checkOut?` · ${timeOf(a.checkOut)}`:""}</Btn>
+      {a?.office && <span className="text-xs text-slate-500 flex items-center gap-1"><MapPin size={12}/>{a.office}</span>}
+    </div>
+    {msg && <div className={`mt-3 text-xs rounded-lg px-3 py-2 ${msg.ok?"bg-emerald-50 border border-emerald-200 text-emerald-700":"bg-rose-50 border border-rose-200 text-rose-700"}`}>{msg.msg}</div>}
+    <div className="mt-3 text-xs text-slate-400">Check-in and check-out require being within {GEOFENCE_RADIUS_M}m of a Svype office.</div>
+  </div></Card>);
 }
 function EmpDashboard({ data, update, me }) {
   const myClaims = data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===me.name && p.status!=="Paid").length;
@@ -707,7 +761,7 @@ function EmpAttendance({ data, update, me }) {
       <div className="flex justify-between items-center"><div className="text-xs uppercase tracking-wider text-slate-500 font-medium">My leave requests</div><Btn onClick={()=>setLf(blank)}><Plus size={15}/>Request leave</Btn></div>
       <Card><Table cols={["Type","From","To","Days","Status"]}>{myLeaves.length===0?<tr><td colSpan={5}><Empty msg="No leave requests yet"/></td></tr>:myLeaves.map(l=>(<Row key={l.id}><Td>{l.type}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td><Pill s={l.status}/></Td></Row>))}</Table></Card>
       <div className="text-xs uppercase tracking-wider text-slate-500 font-medium">Recent attendance</div>
-      <Card><Table cols={["Date","Status","In","Out"]}>{myAtt.length===0?<tr><td colSpan={4}><Empty msg="No attendance recorded"/></td></tr>:myAtt.map(a=>(<Row key={a.id}><Td>{a.date}</Td><Td>{a.status}</Td><Td className="text-slate-500">{timeOf(a.checkIn)||"—"}</Td><Td className="text-slate-500">{timeOf(a.checkOut)||"—"}</Td></Row>))}</Table></Card>
+      <Card><Table cols={["Date","Office","In","Out"]}>{myAtt.length===0?<tr><td colSpan={4}><Empty msg="No attendance recorded"/></td></tr>:myAtt.map(a=>(<Row key={a.id}><Td>{a.date}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td><Td className="text-slate-500">{timeOf(a.checkIn)||"—"}</Td><Td className="text-slate-500">{timeOf(a.checkOut)||"—"}</Td></Row>))}</Table></Card>
     </div>
     {lf && <Modal title="Request leave" onClose={()=>setLf(null)}><Select label="Type" options={["Annual","Sick","Casual","Unpaid"]} value={lf.type} onChange={e=>setLf({...lf,type:e.target.value})}/><div className="grid grid-cols-2 gap-3"><Field label="From" type="date" value={lf.from} onChange={e=>setLf({...lf,from:e.target.value})}/><Field label="To" type="date" value={lf.to} onChange={e=>setLf({...lf,to:e.target.value})}/></div><Field label="Reason" value={lf.reason} onChange={e=>setLf({...lf,reason:e.target.value})}/><Btn onClick={()=>save(lf)}><Check size={15}/>Submit</Btn></Modal>}
   </>);
@@ -1063,12 +1117,12 @@ function Attendance({ data, update }) {
     <Head title="Attendance & Leave" sub="Team marking, check-in/out log, and leave approvals"/>
     <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="attendance"?"primary":"ghost"} onClick={()=>setView("attendance")}>Today's attendance</Btn><Btn variant={view==="history"?"primary":"ghost"} onClick={()=>setView("history")}>Check-in/out log</Btn><Btn variant={view==="leave"?"primary":"ghost"} onClick={()=>setView("leave")}>Leave requests</Btn></div>
     {view==="attendance"?(
-      <Card><Table cols={["Employee","Today","In / Out","Location",""]}>{data.employees.filter(e=>e.status==="Active").map(e=>{const a=data.attendance.find(x=>x.employee===e.name&&x.date===today());const ll=locLink(a?.location);return(
-        <Row key={e.id}><Td className="font-medium">{e.name}</Td><Td>{a?<span className="text-xs text-slate-600">{a.status}</span>:<span className="text-slate-400 text-xs">Not marked</span>}</Td><Td className="text-xs text-slate-500">{a?.checkIn?timeOf(a.checkIn):"—"} / {a?.checkOut?timeOf(a.checkOut):"—"}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={12}/>map</a>:<span className="text-slate-400">—</span>}</Td>
+      <Card><Table cols={["Employee","Today","In / Out","Office","Location",""]}>{data.employees.filter(e=>e.status==="Active").map(e=>{const a=data.attendance.find(x=>x.employee===e.name&&x.date===today());const ll=locLink(a?.location);const lo=locLink(a?.checkOutLocation);return(
+        <Row key={e.id}><Td className="font-medium">{e.name}</Td><Td>{a?<span className="text-xs text-slate-600">{a.status}</span>:<span className="text-slate-400 text-xs">Not marked</span>}</Td><Td className="text-xs text-slate-500">{a?.checkIn?timeOf(a.checkIn):"—"} / {a?.checkOut?timeOf(a.checkOut):"—"}</Td><Td className="text-xs text-slate-600">{a?.office||a?.checkOutOffice||"—"}</Td><Td className="text-xs"><div className="flex flex-col gap-0.5">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>in</a>:null}{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>out</a>:null}{!ll&&!lo&&<span className="text-slate-400">—</span>}</div></Td>
         <Td><div className="flex gap-1 justify-end"><button onClick={()=>mark(e.name,"Present")} className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Present</button><button onClick={()=>mark(e.name,"Absent")} className="px-2 py-1 rounded text-xs bg-rose-100 text-rose-700 hover:bg-rose-200">Absent</button><button onClick={()=>mark(e.name,"Leave")} className="px-2 py-1 rounded text-xs bg-amber-100 text-amber-700 hover:bg-amber-200">Leave</button></div></Td></Row>);})}</Table></Card>
     ):view==="history"?(
-      <Card><Table cols={["Date","Employee","Status","Check-in","Check-out","Location"]}>{history.length===0?<tr><td colSpan={6}><Empty msg="No attendance recorded yet"/></td></tr>:history.map(a=>{const ll=locLink(a.location);return(
-        <Row key={a.id}><Td className="text-slate-500 whitespace-nowrap">{a.date}</Td><Td className="font-medium">{a.employee}</Td><Td>{a.status}</Td><Td className="text-slate-500">{a.checkIn?timeOf(a.checkIn):"—"}</Td><Td className="text-slate-500">{a.checkOut?timeOf(a.checkOut):"—"}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={12}/>view</a>:<span className="text-slate-400">—</span>}</Td></Row>);})}</Table></Card>
+      <Card><Table cols={["Date","Employee","Office","Check-in","Check-out","In loc","Out loc"]}>{history.length===0?<tr><td colSpan={7}><Empty msg="No attendance recorded yet"/></td></tr>:history.map(a=>{const ll=locLink(a.location);const lo=locLink(a.checkOutLocation);return(
+        <Row key={a.id}><Td className="text-slate-500 whitespace-nowrap">{a.date}</Td><Td className="font-medium">{a.employee}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td><Td className="text-slate-500">{a.checkIn?timeOf(a.checkIn):"—"}</Td><Td className="text-slate-500">{a.checkOut?timeOf(a.checkOut):"—"}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td><Td className="text-xs">{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td></Row>);})}</Table></Card>
     ):(
       <Card><Table cols={["Employee","Type","From","To","Days","Status",""]}>{data.leaves.length===0?<tr><td colSpan={7}><Empty msg="No leave requests"/></td></tr>:data.leaves.map(l=>(
         <Row key={l.id}><Td className="font-medium">{l.employee}</Td><Td className="text-slate-500">{l.type}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td><Pill s={l.status}/></Td>
