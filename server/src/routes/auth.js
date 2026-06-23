@@ -12,8 +12,17 @@ async function logAudit(who, action) {
 
 // Is first-run? (no admin/hr accounts yet)
 router.get("/state", async (req, res) => {
-  const r = await pool.query("SELECT COUNT(*) FILTER (WHERE role IN ('admin','hr')) AS founders FROM users");
-  res.json({ hasFounders: +r.rows[0].founders > 0 });
+  try {
+    const a = await pool.query("SELECT doc FROM app_state WHERE id=1");
+    const doc = a.rows[0]?.doc;
+    const users = (doc && doc.users) || [];
+    const docFounders = Array.isArray(users) && users.some(u => u && (u.role === "admin" || u.role === "hr"));
+    if (docFounders) return res.json({ hasFounders: true });
+    const r = await pool.query("SELECT COUNT(*) FILTER (WHERE role IN ('admin','hr')) AS founders FROM users");
+    res.json({ hasFounders: +r.rows[0].founders > 0 });
+  } catch (e) {
+    res.json({ hasFounders: true });
+  }
 });
 
 // First-run: create founding admin/hr account

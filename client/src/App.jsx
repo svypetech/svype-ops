@@ -4,7 +4,7 @@ import {
   FileText, ArrowDownCircle, ArrowUpCircle, ScrollText, Plus, Trash2,
   Edit3, X, Check, LogOut, Search, Download, Building2, Loader2, Settings,
   Upload, PenTool, Stamp, ChevronLeft, FileSignature, Receipt, Paperclip,
-  Repeat, Send, Landmark, Menu, Megaphone, Inbox, UserCircle, Clock, MapPin, CalendarClock,
+  Repeat, Send, Landmark, Menu, Megaphone, Inbox, UserCircle, Clock, MapPin, CalendarClock, Lock, Eye, EyeOff, Copy,
   Contact, History, Database, HandCoins, Bell, Mail, MessageSquare, Hash
 } from "lucide-react";
 
@@ -132,6 +132,8 @@ const SEED = {
   announcements: [],
   requests: [], audit: [],
   users: [],
+  vault: [],
+  vaultMeta: null,
 };
 const SEED_BRAND = { company: "Svype Tech Limited", tagline: "Digital Marketing & Creative Agency", address: "Islamabad · Lahore, Pakistan", contact: "hello@svype.com · www.svype.com", accent: "#0284c7", logo: null, signatories: [], stamps: [] };
 
@@ -250,6 +252,7 @@ const NAV = [
   { id:"receivables", label:"Receivables", icon:ArrowDownCircle },
   { id:"accounts", label:"Bank Accounts", icon:Landmark },
   { id:"brand", label:"Brand & Signatures", icon:Settings },
+  { id:"vault", label:"Vault", icon:Settings },
   { id:"audit", label:"Activity Log", icon:History },
   { id:"backup", label:"Backup & Data", icon:Database },
 ];
@@ -263,7 +266,7 @@ const NAV_GROUPS = [
   { id:"finance", label:"Finance", icon:Wallet, tabs:["payables","receivables","vendorbills","accounts"] },
   { id:"documents", label:"Documents", icon:FileSignature, tabs:["offers","letters","meetings"] },
   { id:"workspace", label:"Workspace", icon:Inbox, tabs:["requests","announce","timesheets"] },
-  { id:"settings", label:"Settings", icon:Settings, adminOnly:true, bottom:true, tabs:["users","permissions","brand","audit","backup"] },
+  { id:"settings", label:"Settings", icon:Settings, adminOnly:true, bottom:true, tabs:["users","permissions","vault","brand","audit","backup"] },
 ];
 // Friendly labels for sub-tabs (override the long sidebar labels inside a section)
 const TAB_LABELS = {
@@ -273,7 +276,7 @@ const TAB_LABELS = {
   payables:"Payables", receivables:"Receivables", vendorbills:"Vendor Bills", accounts:"Bank Accounts",
   offers:"Offer Letters", letters:"Letters & Certificates", meetings:"Meeting Notes",
   requests:"Requests", announce:"Announcements", timesheets:"Work & Timesheets",
-  users:"Users & Access", permissions:"Permissions", brand:"Brand & Signatures", audit:"Activity Log", backup:"Backup & Data",
+  users:"Users & Access", permissions:"Permissions", vault:"Vault", brand:"Brand & Signatures", audit:"Activity Log", backup:"Backup & Data",
 };
 const groupOfTab = (tabId) => NAV_GROUPS.find(g => g.tabs.includes(tabId)) || NAV_GROUPS[0];
 const EMP_NAV = [
@@ -301,19 +304,24 @@ export default function App() {
   const [data, setData] = useState(SEED);
   const [brand, setBrand] = useState(SEED_BRAND);
   const [needsSetup, setNeedsSetup] = useState(false);
+  const [serverHasFounders, setServerHasFounders] = useState(null); // null = unknown yet
 
   useEffect(() => { (async () => {
+    // Ask the SERVER (the database) whether any founder/staff account exists.
+    // This is the single source of truth and is shared across every domain.
+    let serverFounders = null;
+    try {
+      const st = await apiReq("GET", "/auth/state");
+      serverFounders = !!st.hasFounders;
+    } catch { serverFounders = null; }
+    setServerHasFounders(serverFounders);
+
     const d = await DB.get("svype_db", null);
     let merged = d ? { ...SEED, ...d } : SEED;
-    // NOTE: retainer invoices are NEVER generated on page load. They are created only by the
-    // "Generate now" button, or by the scheduled check (runMonthlyGeneration) which the
-    // Retainers screen runs and which itself only acts on/after the 30th. This guarantees a
-    // refresh can never create invoices.
     setData(merged);
-    if (!d) DB.set("svype_db", merged);
+    if (!d && serverFounders === false) DB.set("svype_db", merged); // only seed empty doc on a genuine fresh install
     const b = await DB.get("svype_brand", null);
-    if (b) setBrand(b); else { await DB.set("svype_brand", SEED_BRAND); setNeedsSetup(true); }
-    // re-issue a chat token if we restored a session but lost the token
+    if (b) setBrand(b); else if (serverFounders === false) { await DB.set("svype_brand", SEED_BRAND); setNeedsSetup(true); }
     try {
       const s = localStorage.getItem("svype_session");
       if (s && !getChatToken()) await identifyForChat(JSON.parse(s));
@@ -343,8 +351,13 @@ export default function App() {
   const reset = () => { setSession(null); setTab("dash"); };
 
   if (loading) return <div className="min-h-screen grid place-items-center bg-slate-50 text-sky-600"><Loader2 className="animate-spin"/></div>;
-  const hasFounders = (data.users||[]).some(u=>u.role==="admin" || u.role==="hr");
-  if (!hasFounders) return <FirstRunSetup data={data} brand={brand} onCreate={(u)=>{ update("users", [...(data.users||[]), u], `Created first ${u.role} account "${u.username}"`); }}/>;
+  const localHasFounders = (data.users||[]).some(u=>u.role==="admin" || u.role==="hr");
+  // First-run setup is shown ONLY when the database itself confirms there are no founder/staff
+  // accounts yet (a genuinely fresh install). If the server says founders exist, or we cannot
+  // reach the server, we NEVER show setup — we show Login. This prevents anyone from hitting the
+  // setup screen and creating an account on an already-initialised system.
+  const showSetup = serverHasFounders === false && !localHasFounders;
+  if (showSetup) return <FirstRunSetup data={data} brand={brand} onCreate={(u)=>{ update("users", [...(data.users||[]), u], `Created first ${u.role} account "${u.username}"`); }}/>;
   if (!session) return <Login data={data} brand={brand} onLogin={(u)=>{ identifyForChat(u); setSession(u); setTab("dash"); }}/>;
   if (needsSetup && role !== "employee") return <BrandSetup brand={brand} saveBrand={saveBrand} done={()=>setNeedsSetup(false)} />;
 
@@ -464,6 +477,7 @@ export default function App() {
             {active==="brand" && <BrandSettings {...props}/>}
             {active==="audit" && <Audit {...props}/>}
             {active==="backup" && <Backup {...props}/>}
+            {active==="vault" && <Vault {...props}/>}
           </>)}
         </div>
       </main>
@@ -1579,6 +1593,29 @@ function openInvoicePDF(inv, brand) {
   w.document.close();
 }
 
+// ===== Vault crypto (AES-GCM with PBKDF2-derived key from a master password) =====
+const _enc = new TextEncoder(), _dec = new TextDecoder();
+const _b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const _unb64 = (s) => Uint8Array.from(atob(s), c=>c.charCodeAt(0));
+async function deriveKey(masterPw, saltB64) {
+  const salt = _unb64(saltB64);
+  const baseKey = await crypto.subtle.importKey("raw", _enc.encode(masterPw), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name:"PBKDF2", salt, iterations:150000, hash:"SHA-256" },
+    baseKey, { name:"AES-GCM", length:256 }, false, ["encrypt","decrypt"]
+  );
+}
+async function vaultEncrypt(key, plaintext) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name:"AES-GCM", iv }, key, _enc.encode(plaintext));
+  return { iv:_b64(iv), ct:_b64(ct) };
+}
+async function vaultDecrypt(key, ivB64, ctB64) {
+  const pt = await crypto.subtle.decrypt({ name:"AES-GCM", iv:_unb64(ivB64) }, key, _unb64(ctB64));
+  return _dec.decode(pt);
+}
+function randSaltB64(){ return _b64(crypto.getRandomValues(new Uint8Array(16))); }
+
 // Build a payment receipt record from a paid invoice.
 function makeReceipt({ client, amount, currency, forText, account, source, sourceNumber }) {
   return {
@@ -1873,6 +1910,109 @@ function Audit({ data }) {
   return (<>
     <Head title="Activity Log" sub="A record of key changes made in the workspace"/>
     <Card><Table cols={["When","Who","Action"]}>{(!data.audit||data.audit.length===0)?<tr><td colSpan={3}><Empty msg="No activity logged yet"/></td></tr>:data.audit.map(a=>(<Row key={a.id}><Td className="text-slate-500 whitespace-nowrap">{dtOf(a.date)}</Td><Td className="font-medium whitespace-nowrap">{a.who}</Td><Td>{a.action}</Td></Row>))}</Table></Card>
+  </>);
+}
+
+function Vault({ data, patch }) {
+  const meta = data.vaultMeta; // { salt, check:{iv,ct} } — check is the word "ok" encrypted, to verify the master pw
+  const rows = data.vault || [];
+  const [key, setKey] = useState(null);        // unlocked AES key (in memory only)
+  const [pw, setPw] = useState(""); const [pw2, setPw2] = useState("");
+  const [err, setErr] = useState(""); const [busy, setBusy] = useState(false);
+  const [edit, setEdit] = useState(null);      // entry being added/edited (plaintext password in memory)
+  const [reveal, setReveal] = useState({});    // id -> decrypted password string
+  const [q, setQ] = useState("");
+
+  // First-time: set master password
+  const setupMaster = async () => {
+    if (pw.length < 6) { setErr("Use at least 6 characters."); return; }
+    if (pw !== pw2) { setErr("Passwords don't match."); return; }
+    setBusy(true);
+    const salt = randSaltB64();
+    const k = await deriveKey(pw, salt);
+    const check = await vaultEncrypt(k, "vault-ok");
+    patch({ vaultMeta: { salt, check } }, "Initialised the credentials vault");
+    setKey(k); setPw(""); setPw2(""); setErr(""); setBusy(false);
+  };
+  // Unlock existing vault
+  const unlock = async () => {
+    setBusy(true); setErr("");
+    try {
+      const k = await deriveKey(pw, meta.salt);
+      const test = await vaultDecrypt(k, meta.check.iv, meta.check.ct);
+      if (test !== "vault-ok") throw new Error();
+      setKey(k); setPw("");
+    } catch { setErr("Wrong master password."); }
+    setBusy(false);
+  };
+  const lock = () => { setKey(null); setReveal({}); };
+
+  const saveEntry = async () => {
+    if (!edit.label) { setErr("Add a label."); return; }
+    const enc = await vaultEncrypt(key, edit.password || "");
+    const rec = { id: edit.id || uid(), label:edit.label, username:edit.username||"", url:edit.url||"", category:edit.category||"Other", relatedTo:edit.relatedTo||"", notes:edit.notes||"", iv:enc.iv, ct:enc.ct, date: edit.date||today() };
+    const next = edit.id ? rows.map(r=>r.id===edit.id?rec:r) : [...rows, rec];
+    patch({ vault: next }, edit.id?`Updated vault entry "${edit.label}"`:`Added vault entry "${edit.label}"`);
+    setEdit(null);
+  };
+  const openEdit = async (r) => {
+    let plain = "";
+    if (r) { try { plain = await vaultDecrypt(key, r.iv, r.ct); } catch {} }
+    setEdit(r ? { ...r, password:plain } : { label:"", username:"", password:"", url:"", category:"Client", relatedTo:"", notes:"" });
+  };
+  const toggleReveal = async (r) => {
+    if (reveal[r.id]) { setReveal(s=>{ const n={...s}; delete n[r.id]; return n; }); return; }
+    try { const p = await vaultDecrypt(key, r.iv, r.ct); setReveal(s=>({ ...s, [r.id]:p })); } catch {}
+  };
+  const copyPw = async (r) => { try { const p = await vaultDecrypt(key, r.iv, r.ct); await navigator.clipboard.writeText(p); } catch {} };
+  const del = (r) => patch({ vault: rows.filter(x=>x.id!==r.id) }, `Deleted vault entry "${r.label}"`);
+
+  // --- screens ---
+  if (!meta) return (<>
+    <Head title="Vault" sub="Securely store usernames & passwords for clients, platforms and your own accounts"/>
+    <Card><div className="p-6 max-w-md">
+      <div className="flex items-center gap-2 font-semibold mb-1"><Lock size={16} className="text-sky-600"/>Set a master password</div>
+      <p className="text-sm text-slate-500 mb-4">This unlocks the vault and encrypts every stored password. <b>If it's lost, stored passwords can't be recovered</b> — keep it safe.</p>
+      <Field label="Master password" type="password" value={pw} onChange={e=>{setPw(e.target.value);setErr("");}}/>
+      <Field label="Confirm master password" type="password" value={pw2} onChange={e=>{setPw2(e.target.value);setErr("");}}/>
+      {err && <div className="text-sm text-rose-600 mb-2">{err}</div>}
+      <Btn onClick={setupMaster} disabled={busy}>{busy?<Loader2 size={15} className="animate-spin"/>:<Lock size={15}/>}Create vault</Btn>
+    </div></Card>
+  </>);
+
+  if (!key) return (<>
+    <Head title="Vault" sub="Locked — enter the master password to view stored credentials"/>
+    <Card><div className="p-6 max-w-md">
+      <div className="flex items-center gap-2 font-semibold mb-3"><Lock size={16} className="text-sky-600"/>Unlock vault</div>
+      <Field label="Master password" type="password" value={pw} onChange={e=>{setPw(e.target.value);setErr("");}}/>
+      {err && <div className="text-sm text-rose-600 mb-2">{err}</div>}
+      <Btn onClick={unlock} disabled={busy}>{busy?<Loader2 size={15} className="animate-spin"/>:<Lock size={15}/>}Unlock</Btn>
+    </div></Card>
+  </>);
+
+  const filtered = rows.filter(r=>{ const s=(q||"").toLowerCase(); return !s || r.label.toLowerCase().includes(s) || (r.username||"").toLowerCase().includes(s) || (r.relatedTo||"").toLowerCase().includes(s) || (r.category||"").toLowerCase().includes(s); });
+  return (<>
+    <Head title="Vault" sub={`${rows.length} stored credentials · encrypted`} action={<div className="flex gap-2"><Btn variant="ghost" onClick={lock}><Lock size={15}/>Lock</Btn><Btn onClick={()=>openEdit(null)}><Plus size={15}/>Add credential</Btn></div>}/>
+    <div className="mb-4"><Field label="" value={q} onChange={e=>setQ(e.target.value)} placeholder="Search by platform, username, client…"/></div>
+    <Card><Table cols={["Platform / label","Username / email","Password","Category","Related to",""]}>{filtered.length===0?<tr><td colSpan={6}><Empty msg="No credentials stored yet"/></td></tr>:filtered.map(r=>(
+      <Row key={r.id}><Td className="font-medium">{r.label}{r.url&&<a href={r.url.startsWith("http")?r.url:"https://"+r.url} target="_blank" rel="noopener" className="block text-xs text-sky-600 hover:underline truncate max-w-[160px]">{r.url}</a>}</Td>
+      <Td className="text-slate-500">{r.username||"—"}</Td>
+      <Td><div className="flex items-center gap-2"><span className="font-mono text-xs">{reveal[r.id]?reveal[r.id]:"••••••••"}</span><button onClick={()=>toggleReveal(r)} className="text-slate-400 hover:text-sky-600" title={reveal[r.id]?"Hide":"Reveal"}>{reveal[r.id]?<EyeOff size={14}/>:<Eye size={14}/>}</button><button onClick={()=>copyPw(r)} className="text-slate-400 hover:text-sky-600" title="Copy"><Copy size={14}/></button></div></Td>
+      <Td><span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-600">{r.category}</span></Td>
+      <Td className="text-slate-500">{r.relatedTo||"—"}</Td>
+      <Td><RowActions onEdit={()=>openEdit(r)} onDelete={()=>del(r)}/></Td></Row>))}</Table></Card>
+
+    {edit && <Modal title={edit.id?"Edit credential":"Add credential"} onClose={()=>setEdit(null)}>
+      <Field label="Platform / label" value={edit.label} onChange={e=>setEdit({...edit,label:e.target.value})} placeholder="e.g. Meta Ads — Ixora, Gmail, Bank portal"/>
+      <Select label="Category" options={["Client","Own","Platform","Bank","Other"]} value={edit.category} onChange={e=>setEdit({...edit,category:e.target.value})}/>
+      <Field label="Related to (client / person, optional)" value={edit.relatedTo} onChange={e=>setEdit({...edit,relatedTo:e.target.value})}/>
+      <Field label="Username / email" value={edit.username} onChange={e=>setEdit({...edit,username:e.target.value})}/>
+      <Field label="Password" value={edit.password} onChange={e=>setEdit({...edit,password:e.target.value})}/>
+      <Field label="URL (optional)" value={edit.url} onChange={e=>setEdit({...edit,url:e.target.value})} placeholder="https://…"/>
+      <Area label="Notes (optional)" value={edit.notes} onChange={e=>setEdit({...edit,notes:e.target.value})}/>
+      {err && <div className="text-sm text-rose-600">{err}</div>}
+      <Btn onClick={saveEntry}><Check size={15}/>Save</Btn>
+    </Modal>}
   </>);
 }
 
