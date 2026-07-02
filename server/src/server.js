@@ -17,7 +17,7 @@ const { crud } = require("./routes/crud");
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "12mb" })); // images are base64
+app.use(express.json({ limit: "50mb" })); // images are base64; large HR document sets need headroom
 
 // health
 app.get("/api/health", (req, res) => res.json({ ok: true }));

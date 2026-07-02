@@ -35,10 +35,10 @@ const DB = {
     } catch { return fb; }
   },
   async set(key, v) {
-    try {
-      if (key === "svype_db") { _stateCache.doc = v; await apiReq("PUT", "/state", { doc: v }); }
-      else if (key === "svype_brand") { _stateCache.brand = v; await apiReq("PUT", "/state", { brand: v }); }
-    } catch (e) { console.error("save failed", e); }
+    // NOTE: failures are RE-THROWN so the caller can warn the user. Silently swallowing a failed
+    // save is what made uploads appear to "revert" — the UI kept the change but the server didn't.
+    if (key === "svype_db") { _stateCache.doc = v; await apiReq("PUT", "/state", { doc: v }); }
+    else if (key === "svype_brand") { _stateCache.brand = v; await apiReq("PUT", "/state", { brand: v }); }
   },
 };
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -64,13 +64,16 @@ function annualTax(a) {
 }
 const EOBI = 250; // employee monthly contribution
 
-function readImage(file, maxW = 700) {
+function readImage(file, maxW = 700, asJpeg = false, quality = 0.82) {
   return new Promise((res) => {
     const r = new FileReader();
     r.onload = () => { const img = new Image(); img.onload = () => {
       const scale = Math.min(1, maxW / img.width);
       const c = document.createElement("canvas"); c.width = img.width * scale; c.height = img.height * scale;
-      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height); res(c.toDataURL("image/png"));
+      const ctx = c.getContext("2d");
+      if (asJpeg) { ctx.fillStyle = "#fff"; ctx.fillRect(0,0,c.width,c.height); } // white bg for jpeg
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      res(c.toDataURL(asJpeg ? "image/jpeg" : "image/png", asJpeg ? quality : undefined));
     }; img.src = r.result; };
     r.readAsDataURL(file);
   });
@@ -338,7 +341,11 @@ export default function App() {
     setData((cur) => {
       let next = mutate(cur);
       if (msg) next = { ...next, audit: [auditEntry(msg), ...(cur.audit||[])].slice(0,500) };
-      DB.set("svype_db", next);
+      // Persist to the server. If it fails (e.g. document too large / network), tell the user
+      // immediately so they know the change was NOT saved — rather than silently reverting later.
+      DB.set("svype_db", next).catch((e) => {
+        alert("⚠️ Your last change could NOT be saved to the server, so it will be lost on refresh.\n\nMost common cause: an uploaded photo/PDF is too large. Try a smaller image.\n\n(Technical detail: " + (e?.message || "save failed") + ")");
+      });
       return next;
     });
   };
@@ -642,16 +649,18 @@ function LeaveBalances({ data, name }) {
 /* ---------------- payroll calc ---------------- */
 function computePayslip(e, data, month) {
   const basic = +e.salary || 0;
-  const allowances = Math.round(basic * 0.1);
+  const allowances = 0; // no automatic allowance — add increases manually with a reason
   const reimb = data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===e.name && p.status==="Approved" && !p.settled && p.payVia==="salary" && (!p.payMonth || p.payMonth===month)).reduce((s,p)=>s+ +p.amount,0);
   const tax = 0;   // not auto-calculated — set manually per payslip if needed
   const eobi = 0;  // not auto-calculated
   const pf = Math.round(basic * (+e.pf||0) / 100);
   const advance = data.advances.filter(a=>a.employee===e.name && a.status==="Active" && a.remaining>0).reduce((s,a)=>s+Math.min(+a.installment, a.remaining),0);
   const deductions = tax + eobi + pf + advance;
-  return { id:uid(), employee:e.name, month, basic, allowances, reimbursements:reimb, tax, eobi, pf, advance, deductions, paid:false, date:today() };
+  return { id:uid(), employee:e.name, month, basic, allowances, reimbursements:reimb, tax, eobi, pf, advance, deductions, adjustments:[], paid:false, date:today() };
 }
-const netPay = (p) => +p.basic + +p.allowances + (+p.reimbursements||0) - (+p.deductions||0);
+// Sum of manual adjustments (+ increase / - deduction)
+const adjTotal = (p) => (p.adjustments||[]).reduce((s,a)=>s + (+a.amount||0), 0);
+const netPay = (p) => +p.basic + +p.allowances + (+p.reimbursements||0) + adjTotal(p) - (+p.deductions||0);
 
 /* ---------------- document sheet ---------------- */
 function Letterhead({ brand }) {
@@ -850,10 +859,11 @@ function SlipModal({ slip, brand, onClose }) {
       <div className="flex justify-between mb-3"><span className="text-slate-500">Period</span><b>{slip.month}</b></div>
       <div className="space-y-1 border-t pt-3">
         <div className="flex justify-between"><span>Basic</span><span>{fmt(slip.basic)}</span></div>
-        <div className="flex justify-between"><span>Allowances</span><span>{fmt(slip.allowances)}</span></div>
+        {+slip.allowances>0 && <div className="flex justify-between"><span>Allowances</span><span>{fmt(slip.allowances)}</span></div>}
         {+slip.reimbursements>0 && <div className="flex justify-between"><span>Reimbursements</span><span>{fmt(slip.reimbursements)}</span></div>}
-        <div className="flex justify-between text-slate-500 pt-2"><span>Income tax</span><span>-{fmt(slip.tax)}</span></div>
-        <div className="flex justify-between text-slate-500"><span>EOBI</span><span>-{fmt(slip.eobi)}</span></div>
+        {(slip.adjustments||[]).map(a=>(<div key={a.id} className={`flex justify-between ${a.amount<0?"text-rose-600":"text-emerald-700"}`}><span>{a.reason}</span><span>{a.amount<0?"-":"+"}{fmt(Math.abs(a.amount))}</span></div>))}
+        {+slip.tax>0 && <div className="flex justify-between text-slate-500 pt-2"><span>Income tax</span><span>-{fmt(slip.tax)}</span></div>}
+        {+slip.eobi>0 && <div className="flex justify-between text-slate-500"><span>EOBI</span><span>-{fmt(slip.eobi)}</span></div>}
         {+slip.pf>0 && <div className="flex justify-between text-slate-500"><span>Provident fund</span><span>-{fmt(slip.pf)}</span></div>}
         {+slip.advance>0 && <div className="flex justify-between text-slate-500"><span>Advance / loan</span><span>-{fmt(slip.advance)}</span></div>}
         <div className="flex justify-between border-t pt-2 mt-2 font-bold"><span>Net pay</span><span>{fmt(netPay(slip))}</span></div>
@@ -1071,7 +1081,7 @@ function Employees({ data, update }) {
   };
   const filtered = rows.filter(r=>r.name.toLowerCase().includes(q.toLowerCase()));
   const found = lookup ? rows.find(r=>r.name.toLowerCase().includes(lookup.toLowerCase())) : null;
-  if (open) { const emp = rows.find(r=>r.id===open); if (emp) return <EmployeeProfile emp={emp} data={data} onBack={()=>setOpen(null)} onEdit={()=>setEdit(emp)} />; }
+  if (open) { const emp = rows.find(r=>r.id===open); if (emp) return <EmployeeProfile emp={emp} data={data} onBack={()=>setOpen(null)} onEdit={()=>{ setEdit(emp); setOpen(null); }} />; }
   return (<>
     <Head title="Employees" sub={`${rows.length} on record · tap a name to open their file`} action={<Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add employee</Btn>}/>
     <Card><div className="p-4">
@@ -1086,7 +1096,7 @@ function Employees({ data, update }) {
   </>);
 }
 function EmployeeForm({ edit, setEdit, save }) {
-  const addDocs = async (files) => { const arr = [...(edit.docs||[])]; for (const f of files) { const isImg = f.type.startsWith("image/"); arr.push({ id:uid(), name:f.name, type:isImg?"image":"file", img: isImg ? await readImage(f, 1100) : null, file: isImg ? null : await readFile(f), expiry:"", date:today() }); } setEdit({ ...edit, docs: arr }); };
+  const addDocs = async (files) => { const arr = [...(edit.docs||[])]; for (const f of files) { const isImg = f.type.startsWith("image/"); arr.push({ id:uid(), name:f.name, type:isImg?"image":"file", img: isImg ? await readImage(f, 1400, true, 0.8) : null, file: isImg ? null : await readFile(f), expiry:"", date:today() }); } setEdit({ ...edit, docs: arr }); };
   const setDocExpiry = (id, v) => setEdit({ ...edit, docs: edit.docs.map(d=>d.id===id?{...d,expiry:v}:d) });
   return <Modal title={edit.id?"Edit employee":"Add employee"} onClose={()=>setEdit(null)}>
     <Field label="Full name" value={edit.name} onChange={e=>setEdit({...edit,name:e.target.value})}/>
@@ -1149,6 +1159,7 @@ function Payroll({ data, patch, update, brand }) {
   const [slip, setSlip] = useState(null);
   const [payProof, setPayProof] = useState(null);
   const [editDed, setEditDed] = useState(null);
+  const [adj, setAdj] = useState(null);
   const month = monthLabel();
   const run=()=>{
     const ids=[]; data.payables.forEach(p=>{ if(p.kind==="reimbursement"&&p.status==="Approved"&&!p.settled&&p.payVia==="salary"&&(!p.payMonth||p.payMonth===month)) ids.push(p.id); });
@@ -1163,20 +1174,43 @@ function Payroll({ data, patch, update, brand }) {
     update("payroll", data.payroll.map(x=>x.id===editDed.id?{...x,tax,eobi,pf,advance,deductions}:x), `Adjusted deductions for ${editDed.employee} (${editDed.month})`);
     setEditDed(null);
   };
+  // adjustments (increase or deduction with a reason)
+  const addAdjLine = (sign) => setAdj(a=>({ ...a, list:[...a.list, { id:uid(), reason:"", amount:"", sign }] }));
+  const setAdjLine = (id,k,v) => setAdj(a=>({ ...a, list:a.list.map(l=>l.id===id?{...l,[k]:v}:l) }));
+  const rmAdjLine = (id) => setAdj(a=>({ ...a, list:a.list.filter(l=>l.id!==id) }));
+  const saveAdj = () => {
+    const adjustments = adj.list.filter(l=>l.reason && l.amount).map(l=>({ id:l.id, reason:l.reason, amount: (l.sign==="-"?-1:1)*Math.abs(+l.amount||0) }));
+    update("payroll", data.payroll.map(x=>x.id===adj.id?{...x,adjustments}:x), `Adjusted pay for ${adj.employee} (${adj.month})`);
+    setAdj(null);
+  };
+  const openAdj = (p) => setAdj({ id:p.id, employee:p.employee, month:p.month, list: (p.adjustments||[]).map(a=>({ id:a.id||uid(), reason:a.reason, amount:Math.abs(a.amount), sign: a.amount<0?"-":"+" })) });
   const pendingReimb = data.payables.filter(p=>p.kind==="reimbursement"&&p.status==="Approved"&&!p.settled).reduce((s,p)=>s+ +p.amount,0);
   const empEmail = (name) => data.employees.find(e=>e.name===name)?.email || "";
   const empAcct = (name) => data.employees.find(e=>e.name===name)?.account || "";
   return (<>
-    <Head title="Payroll & Salary Slips" sub={`${month} · PF & advances deducted · tax/EOBI are manual (0 unless you set them)${pendingReimb?` · ${fmt(pendingReimb)} reimbursements queued`:""}`} action={<Btn onClick={run}><Wallet size={15}/>Run payroll · {month}</Btn>}/>
+    <Head title="Payroll & Salary Slips" sub={`${month} · base salary + your adjustments − deductions (no automatic allowance)${pendingReimb?` · ${fmt(pendingReimb)} reimbursements queued`:""}`} action={<Btn onClick={run}><Wallet size={15}/>Run payroll · {month}</Btn>}/>
     <Card><Table cols={["Employee","Month","Net","Account / IBAN","Payment","",""]}>{data.payroll.length===0?<tr><td colSpan={7}><Empty msg="No payroll runs yet"/></td></tr>:data.payroll.map(p=>(
       <Row key={p.id}>
-        <Td className="font-medium">{p.employee}</Td><Td className="text-slate-500">{p.month}</Td><Td className="font-semibold">{fmt(netPay(p))}</Td>
+        <Td className="font-medium">{p.employee}</Td><Td className="text-slate-500">{p.month}</Td><Td className="font-semibold">{fmt(netPay(p))}{(p.adjustments||[]).length>0&&<div className="text-xs text-slate-400 font-normal">{adjTotal(p)>=0?"+":""}{fmt(adjTotal(p))} adj.</div>}</Td>
         <Td className="text-slate-500 text-xs">{empAcct(p.employee)||"— not on file —"}</Td>
         <Td>{p.paid?<span className="flex items-center gap-2"><Pill s="Paid"/>{p.proof&&<img src={p.proof} className="w-7 h-7 rounded object-cover border border-slate-200"/>}</span>:<Pill s="Pending"/>}</Td>
         <Td><button onClick={()=>setSlip(p)} className="text-sky-600 text-xs font-medium hover:underline">View slip</button></Td>
-        <Td><RowActions>{!p.paid && <button onClick={()=>setEditDed({...p})} title="Edit deductions (tax/EOBI/PF)" className="px-2 py-1 rounded text-xs bg-slate-100 text-slate-600 hover:bg-slate-200">Deductions</button>}{!p.paid && <button onClick={()=>setPayProof({ ...p, proof:null })} className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Mark paid</button>}{p.paid && <button onClick={()=>setPayProof({ ...p })} title="Update payment" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Edit3 size={14}/></button>}</RowActions></Td>
+        <Td><RowActions>{!p.paid && <button onClick={()=>openAdj(p)} title="Add increase / deduction with reason" className="px-2 py-1 rounded text-xs bg-sky-100 text-sky-700 hover:bg-sky-200">Adjust</button>}{!p.paid && <button onClick={()=>setEditDed({...p})} title="Tax / EOBI / PF / advance" className="px-2 py-1 rounded text-xs bg-slate-100 text-slate-600 hover:bg-slate-200">Deductions</button>}{!p.paid && <button onClick={()=>setPayProof({ ...p, proof:null })} className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Mark paid</button>}{p.paid && <button onClick={()=>setPayProof({ ...p })} title="Update payment" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Edit3 size={14}/></button>}</RowActions></Td>
       </Row>))}</Table></Card>
     {slip && <SlipModal slip={slip} brand={brand} onClose={()=>setSlip(null)}/>}
+    {adj && <Modal title={`Adjust pay · ${adj.employee}`} onClose={()=>setAdj(null)}>
+      <p className="text-xs text-slate-500">Add an increase (bonus, arrears) or a deduction (fine, leave-without-pay) with a reason. Each line appears on the payslip.</p>
+      <div className="space-y-2">{adj.list.length===0 && <div className="text-xs text-slate-400">No adjustments yet.</div>}
+        {adj.list.map(l=>(<div key={l.id} className="flex items-center gap-2">
+          <select value={l.sign} onChange={e=>setAdjLine(l.id,"sign",e.target.value)} className="bg-white border border-slate-300 rounded-lg px-2 py-2 text-sm"><option value="+">+ Add</option><option value="-">− Deduct</option></select>
+          <input value={l.reason} onChange={e=>setAdjLine(l.id,"reason",e.target.value)} placeholder="Reason (e.g. Eid bonus, 2 days unpaid leave)" className="flex-1 bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-sky-500"/>
+          <input type="number" value={l.amount} onChange={e=>setAdjLine(l.id,"amount",e.target.value)} placeholder="amount" className="w-28 bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-sky-500"/>
+          <button onClick={()=>rmAdjLine(l.id)} className="text-slate-400 hover:text-rose-500"><X size={15}/></button>
+        </div>))}
+      </div>
+      <div className="flex gap-2"><Btn variant="ghost" onClick={()=>addAdjLine("+")}><Plus size={14}/>Add increase</Btn><Btn variant="ghost" onClick={()=>addAdjLine("-")}><Plus size={14}/>Add deduction</Btn></div>
+      <Btn onClick={saveAdj}><Check size={15}/>Save adjustments</Btn>
+    </Modal>}
     {editDed && <Modal title={`Deductions · ${editDed.employee}`} onClose={()=>setEditDed(null)}>
       <p className="text-xs text-slate-500">These are blank (0) by default. Enter any amounts that apply for {editDed.month}.</p>
       <div className="grid grid-cols-2 gap-3"><Field label="Income tax" type="number" value={editDed.tax} onChange={e=>setEditDed({...editDed,tax:e.target.value})}/><Field label="EOBI" type="number" value={editDed.eobi} onChange={e=>setEditDed({...editDed,eobi:e.target.value})}/></div>
@@ -1191,9 +1225,26 @@ function PayrollPaidModal({ rec, brand, email, onClose, onSave }) {
   const [proof, setProof] = useState(rec.proof || null);
   const [method, setMethod] = useState(rec.payMethod || "Bank transfer");
   const onImg = async (f) => { if (f) setProof(await readImage(f, 1000)); };
-  const subject = `Salary Disbursed — ${rec.month} — ${brand.company}`;
-  const bodyText = `Dear ${rec.employee},\n\nWe're pleased to inform you that your salary for ${rec.month} has been disbursed.\n\n  Net amount:   ${fmt(netPay(rec))}\n  Method:       ${method}\n  Date:         ${today()}\n\nThe payment proof has been recorded in our system. Please allow a short time for it to reflect in your account. If you have any questions about your payslip, reach out to HR.\n\nThank you for your continued contribution.\n\nWarm regards,\n${brand.company}\n${brand.contact || ""}`;
-  const sendEmail = () => {
+  const slipLines = () => {
+    const L = [];
+    L.push(`Basic: ${fmt(rec.basic)}`);
+    if (+rec.allowances>0) L.push(`Allowances: ${fmt(rec.allowances)}`);
+    if (+rec.reimbursements>0) L.push(`Reimbursements: ${fmt(rec.reimbursements)}`);
+    (rec.adjustments||[]).forEach(a=>L.push(`${a.reason}: ${a.amount<0?"-":"+"}${fmt(Math.abs(a.amount))}`));
+    if (+rec.tax>0) L.push(`Income tax: -${fmt(rec.tax)}`);
+    if (+rec.eobi>0) L.push(`EOBI: -${fmt(rec.eobi)}`);
+    if (+rec.pf>0) L.push(`Provident fund: -${fmt(rec.pf)}`);
+    if (+rec.advance>0) L.push(`Advance / loan: -${fmt(rec.advance)}`);
+    return L.join("\n");
+  };
+  const subject = `Salary Slip — ${rec.month} — ${brand.company}`;
+  const bodyText = `Dear ${rec.employee},\n\nYour salary for ${rec.month} has been disbursed. Here is your payslip summary:\n\n${slipLines()}\n----------------------------\nNet pay: ${fmt(netPay(rec))}\nMethod: ${method}\nDate: ${today()}\n\nIf you have any questions about your payslip, please reach out to HR.\n\nWarm regards,\n${brand.company}\n${brand.contact || ""}`;
+  const sendGmail = () => {
+    if (!email) { alert("This employee has no email on file. Add one under Employees."); return; }
+    const url = `https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(email)}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(bodyText)}`;
+    window.open(url, "_blank");
+  };
+  const sendMailto = () => {
     if (!email) { alert("This employee has no email on file. Add one under Employees."); return; }
     window.open(`mailto:${email}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(bodyText)}`, "_blank");
   };
@@ -1205,14 +1256,15 @@ function PayrollPaidModal({ rec, brand, email, onClose, onSave }) {
       {proof && <img src={proof} className="mt-2 h-32 rounded-lg border border-slate-200 object-cover"/>}
     </div>
     <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
-      <div className="text-xs font-medium text-slate-600 mb-1 flex items-center gap-1.5"><Mail size={13}/>Disbursement email {email?`→ ${email}`:"(no email on file)"}</div>
-      <div className="text-xs text-slate-500 whitespace-pre-wrap" style={{maxHeight:120, overflow:"auto"}}>{bodyText}</div>
+      <div className="text-xs font-medium text-slate-600 mb-1 flex items-center gap-1.5"><Mail size={13}/>Email {email?`→ ${email}`:"(no email on file)"}</div>
+      <div className="text-xs text-slate-500 whitespace-pre-wrap" style={{maxHeight:140, overflow:"auto"}}>{bodyText}</div>
     </div>
-    <div className="flex gap-2">
+    <div className="flex flex-wrap gap-2">
       <Btn variant="ok" onClick={()=>onSave(proof, method)}><Check size={15}/>Save as paid</Btn>
-      <Btn variant="ghost" onClick={sendEmail}><Mail size={15}/>Email employee</Btn>
+      <Btn onClick={sendGmail}><Mail size={15}/>Send via Gmail</Btn>
+      <Btn variant="ghost" onClick={sendMailto}><Mail size={15}/>Default mail app</Btn>
     </div>
-    <p className="text-xs text-slate-400">"Email employee" opens your mail app with the message pre-filled — you press send.</p>
+    <p className="text-xs text-slate-400">"Send via Gmail" opens Gmail compose with the employee's address, subject and full payslip pre-filled — you just press Send. (Attaching a file isn't possible via a link; the payslip details are in the email body.)</p>
   </Modal>);
 }
 
