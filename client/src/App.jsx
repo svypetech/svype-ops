@@ -23,24 +23,76 @@ async function apiReq(method, url, body) {
   return data;
 }
 // Whole-app shared state persisted as one document on the server.
-let _stateCache = { doc: null, brand: null };
+let _stateCache = { doc: null, brand: null, rev: 0 };
 const DB = {
   async get(key, fb) {
     try {
       const st = await apiReq("GET", "/state");
-      _stateCache = st || { doc: null, brand: null };
+      _stateCache = { doc: st?.doc ?? null, brand: st?.brand ?? null, rev: +st?.rev || 0 };
       if (key === "svype_db") return _stateCache.doc ?? fb;
       if (key === "svype_brand") return _stateCache.brand ?? fb;
       return fb;
     } catch { return fb; }
   },
   async set(key, v) {
-    // NOTE: failures are RE-THROWN so the caller can warn the user. Silently swallowing a failed
-    // save is what made uploads appear to "revert" — the UI kept the change but the server didn't.
+    // NOTE: failures are RE-THROWN so the caller can warn the user.
     if (key === "svype_db") { _stateCache.doc = v; await apiReq("PUT", "/state", { doc: v }); }
     else if (key === "svype_brand") { _stateCache.brand = v; await apiReq("PUT", "/state", { brand: v }); }
   },
 };
+
+// ===== Conflict-safe save queue =====
+// Every save states which server revision it was based on. If another tab/user saved
+// in the meantime, the server rejects (409) and returns the latest doc; we re-apply
+// our change ON TOP of that and retry. This stops one person's save from wiping
+// another person's recent changes (the cause of "my data disappeared on refresh").
+// Visible build tag so we can always verify which version is actually deployed.
+const APP_BUILD = "Build 2 Jul 2026 · saves-v3";
+// Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
+let _statusCb = null;
+function onSaveStatus(cb) { _statusCb = cb; }
+function _setSaveStatus(s) { try { _statusCb && _statusCb(s); } catch {} }
+
+let _rev = 0;            // last server revision we know
+let _serverDoc = null;   // the doc as the server has it after our last confirmed write
+let _saveQueue = [];
+let _saving = false;
+function initSaveState(doc, rev) { _serverDoc = doc; _rev = rev || 0; }
+async function _putState(doc, baseRev) {
+  const res = await fetch("/api/state", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...(getChatToken() ? { Authorization: "Bearer " + getChatToken() } : {}) },
+    body: JSON.stringify({ doc, baseRev }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 409) return { conflict: true, doc: data.doc, rev: +data.rev || 0 };
+  if (!res.ok) throw new Error(data.error || "Save failed");
+  return { conflict: false, rev: +data.rev || 0 };
+}
+function enqueueSave(mutate, onMerged) { _saveQueue.push({ mutate, onMerged }); _setSaveStatus("saving"); _drainSaves(); }
+async function _drainSaves() {
+  if (_saving) return; _saving = true;
+  try {
+    while (_saveQueue.length) {
+      const { mutate, onMerged } = _saveQueue.shift();
+      let attempts = 0, done = false, hadConflict = false;
+      while (!done && attempts < 6) {
+        attempts++;
+        const next = mutate(_serverDoc || undefined);
+        const r = await _putState(next, _rev);
+        if (r.conflict) { hadConflict = true; _serverDoc = r.doc; _rev = r.rev; continue; }
+        _serverDoc = next; _rev = r.rev; _stateCache.doc = next; done = true;
+        if (hadConflict && onMerged) onMerged(next); // re-sync UI with merged result
+      }
+      if (!done) throw new Error("could not save after several retries");
+    }
+    _setSaveStatus("saved");
+  } catch (e) {
+    _saveQueue = [];
+    _setSaveStatus("error");
+    alert("⚠️ Your last change could NOT be saved to the server, so it will be lost on refresh.\n\nPlease sign out and back in, then try again. If it keeps happening, check your internet connection.\n\n(Technical detail: " + (e?.message || "save failed") + ")");
+  } finally { _saving = false; }
+}
 const uid = () => Math.random().toString(36).slice(2, 10);
 const today = () => new Date().toISOString().slice(0, 10);
 const monthKey = () => new Date().toISOString().slice(0, 7);
@@ -321,6 +373,7 @@ export default function App() {
 
     const d = await DB.get("svype_db", null);
     let merged = d ? { ...SEED, ...d } : SEED;
+    initSaveState(d || null, _stateCache.rev); // conflict-safe saves start from the fetched revision
     setData(merged);
     if (!d && serverFounders === false) DB.set("svype_db", merged); // only seed empty doc on a genuine fresh install
     const b = await DB.get("svype_brand", null);
@@ -338,16 +391,14 @@ export default function App() {
   const auditEntry = (msg) => ({ id:uid(), who:who(), action:msg, date:new Date().toISOString() });
   // Always merge against the freshest state (functional updater) so two quick saves never clobber each other.
   const commit = (mutate, msg) => {
-    setData((cur) => {
+    const fullMutate = (curIn) => {
+      const cur = curIn || SEED;
       let next = mutate(cur);
       if (msg) next = { ...next, audit: [auditEntry(msg), ...(cur.audit||[])].slice(0,500) };
-      // Persist to the server. If it fails (e.g. document too large / network), tell the user
-      // immediately so they know the change was NOT saved — rather than silently reverting later.
-      DB.set("svype_db", next).catch((e) => {
-        alert("⚠️ Your last change could NOT be saved to the server, so it will be lost on refresh.\n\nMost common cause: an uploaded photo/PDF is too large. Try a smaller image.\n\n(Technical detail: " + (e?.message || "save failed") + ")");
-      });
       return next;
-    });
+    };
+    setData((cur) => fullMutate(cur));                       // instant UI update
+    enqueueSave(fullMutate, (merged) => setData({ ...SEED, ...merged })); // conflict-safe persist
   };
   const persist = (n) => commit(() => n);
   const update = (k, rows, audit) => commit((cur) => ({ ...cur, [k]: rows }), audit);
@@ -418,6 +469,7 @@ export default function App() {
         <div className="p-4 border-t border-slate-700">
           <div className="text-xs text-slate-400 mb-2">{isEmp && me ? me.name : ROLES[role]}</div>
           <button onClick={reset} className="flex items-center gap-2 text-sm text-slate-300 hover:text-white"><LogOut size={15}/>Sign out</button>
+          <div className="text-[10px] text-slate-500 mt-2">{APP_BUILD}</div>
         </div>
       </aside>
 
@@ -426,6 +478,7 @@ export default function App() {
           <button onClick={()=>setNavOpen(true)} className="lg:hidden text-slate-600"><Menu size={22}/></button>
           {!isEmp ? <GlobalSearch data={data} go={setTab}/> : <div className="font-semibold text-sm text-slate-700">Team Portal</div>}
           <div className="flex-1"/>
+          <SaveStatus/>
           <NotifBell items={notes} go={setTab}/>
         </div>
         {/* sub-tab bar for grouped admin sections with more than one tab */}
@@ -564,6 +617,13 @@ function FirstRunSetup({ data, brand, onCreate }) {
 }
 
 /* ---------------- login (username + password) ---------------- */
+function SaveStatus() {
+  const [st, setSt] = useState("saved");
+  useEffect(() => { onSaveStatus(setSt); return () => onSaveStatus(null); }, []);
+  if (st === "saving") return <span className="text-xs text-slate-400 flex items-center gap-1"><Loader2 size={12} className="animate-spin"/>Saving…</span>;
+  if (st === "error") return <span className="text-xs text-rose-600 font-medium flex items-center gap-1">⚠️ Not saved</span>;
+  return <span className="text-xs text-emerald-600 flex items-center gap-1"><Check size={12}/>Saved</span>;
+}
 function Login({ data, brand, onLogin }) {
   const [u, setU] = useState(""); const [p, setP] = useState(""); const [err, setErr] = useState("");
   const submit = () => {
@@ -587,6 +647,7 @@ function Login({ data, brand, onLogin }) {
       <button onClick={submit} className="w-full py-2.5 rounded-lg bg-sky-600 hover:bg-sky-700 text-white font-medium transition">Sign in</button>
     </div>
     <p className="text-xs text-slate-500 mt-6">Don't have an account? Ask HR to create one for you.</p>
+    <p className="text-[10px] text-slate-600 mt-2">{APP_BUILD}</p>
   </div></div>);
 }
 function BrandSetup({ brand, saveBrand, done }) {

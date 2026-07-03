@@ -313,6 +313,9 @@ CREATE TABLE IF NOT EXISTS app_state (
   id         INTEGER PRIMARY KEY DEFAULT 1,
   doc        JSONB,
   brand      JSONB,
+  rev        BIGINT NOT NULL DEFAULT 0,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   CONSTRAINT app_state_singleton CHECK (id = 1)
 );
+-- migration for existing databases (safe to re-run)
+ALTER TABLE app_state ADD COLUMN IF NOT EXISTS rev BIGINT NOT NULL DEFAULT 0;
