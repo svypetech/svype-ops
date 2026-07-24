@@ -47,7 +47,7 @@ const DB = {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 2 Jul 2026 · saves-v3";
+const APP_BUILD = "Build 24 Jul 2026 · onboarding-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -233,7 +233,8 @@ function nextMonthInfo(from){
 // Build invoices for the upcoming billing cycle. `force` ignores the date gate (manual button).
 function generateRetainerInvoices(db, force){
   const now = new Date();
-  const onOrAfter30th = now.getDate() >= 30;
+  const lastDay = new Date(now.getFullYear(), now.getMonth()+1, 0).getDate();
+  const onOrAfter30th = now.getDate() >= Math.min(30, lastDay); // Feb-safe (28/29-day months)
   if (!force && !onOrAfter30th) return db;       // auto path: only on/after the 30th
   const { key, label, issue, due } = nextMonthInfo(now);
   const inv = [...(db.retainerInvoices || [])];
@@ -441,7 +442,7 @@ export default function App() {
   const active = allTabs.includes(tab) ? tab : "dash";
   const activeGroup = isEmp ? null : groupOfTab(active);
   const notes = isEmp && me ? empNotes(data, me) : adminNotes(data);
-  const props = { data, update, patch, role, brand, saveBrand, me, restore, wipe, session, go:setTab };
+  const props = { data, update, patch, mutateData: commit, role, brand, saveBrand, me, restore, wipe, session, go:setTab };
 
   return (
     <div className="h-screen overflow-hidden flex bg-slate-50 text-slate-800 font-sans">
@@ -748,7 +749,7 @@ function DocSheet({ brand, body, signed, setSigned }) {
 }
 
 /* ================= EMPLOYEE PORTAL ================= */
-function checkInOut(data, update, name, which, onResult) {
+function checkInOut(mutateData, name, which, onResult) {
   const apply = (loc) => {
     const near = loc ? nearestOffice(loc.lat, loc.lng) : null;
     if (!loc) { onResult && onResult({ ok:false, msg:"Couldn't get your location. Please enable location access and try again — check-in requires being at a Svype office." }); return; }
@@ -757,17 +758,20 @@ function checkInOut(data, update, name, which, onResult) {
       return;
     }
     const stampedLoc = { ...loc, office: near.office, distance: Math.round(near.distance) };
-    const ex = data.attendance.find(a=>a.employee===name && a.date===today());
     const now = new Date().toISOString();
-    if (ex) {
-      update("attendance", data.attendance.map(a=>a===ex ? { ...a, status:"Present",
-        ...(which==="in" ? { checkIn:now, location:stampedLoc, office:near.office } : { checkOut:now, checkOutLocation:stampedLoc, checkOutOffice:near.office }) } : a));
-    } else {
-      update("attendance", [...data.attendance, { id:uid(), employee:name, date:today(), status:"Present",
-        checkIn: which==="in"?now:null, checkOut: which==="out"?now:null,
-        location: which==="in"?stampedLoc:null, office: which==="in"?near.office:null,
-        checkOutLocation: which==="out"?stampedLoc:null, checkOutOffice: which==="out"?near.office:null }]);
-    }
+    const stamp = which==="in"
+      ? { checkIn:now, location:stampedLoc, office:near.office }
+      : { checkOut:now, checkOutLocation:stampedLoc, checkOutOffice:near.office };
+    // FUNCTIONAL mutation: recomputed against the freshest data on every save retry, so
+    // simultaneous check-ins from many employees merge instead of overwriting each other.
+    mutateData((cur) => {
+      const list = cur.attendance || [];
+      const ex = list.find(a=>a.employee===name && a.date===today());
+      const attendance = ex
+        ? list.map(a=>a===ex ? { ...a, status:"Present", ...stamp } : a)
+        : [...list, { id:uid(), employee:name, date:today(), status:"Present", checkIn:null, checkOut:null, location:null, office:null, checkOutLocation:null, checkOutOffice:null, ...stamp }];
+      return { ...cur, attendance };
+    }, `${name} checked ${which} · ${near.office}`);
     onResult && onResult({ ok:true, msg:`Checked ${which} · ${near.office}`, office:near.office });
   };
   if (navigator.geolocation) {
@@ -780,13 +784,13 @@ function checkInOut(data, update, name, which, onResult) {
     onResult && onResult({ ok:false, msg:"This device can't share location, so check-in isn't available here." });
   }
 }
-function CheckInCard({ data, update, me }) {
+function CheckInCard({ data, mutateData, me }) {
   const a = data.attendance.find(x=>x.employee===me.name && x.date===today());
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState(null);
   const doAction = (which) => {
     setBusy(true); setMsg(null);
-    checkInOut(data, update, me.name, which, (res)=>{ setBusy(false); setMsg(res); });
+    checkInOut(mutateData, me.name, which, (res)=>{ setBusy(false); setMsg(res); });
   };
   return (<Card><div className="p-5">
     <div className="flex items-center gap-2 text-sm font-semibold mb-3"><Clock size={16} className="text-sky-600"/>Today · {new Date().toLocaleDateString()}</div>
@@ -799,12 +803,12 @@ function CheckInCard({ data, update, me }) {
     <div className="mt-3 text-xs text-slate-400">Check-in and check-out require being within {GEOFENCE_RADIUS_M}m of a Svype office.</div>
   </div></Card>);
 }
-function EmpDashboard({ data, update, me }) {
+function EmpDashboard({ data, update, mutateData, me }) {
   const myClaims = data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===me.name && p.status!=="Paid").length;
   return (<>
     <Head title={`Hi, ${me.name.split(" ")[0]}`} sub={`${me.role} · ${me.dept}`}/>
     <div className="space-y-5">
-      <CheckInCard data={data} update={update} me={me}/>
+      <CheckInCard data={data} mutateData={mutateData} me={me}/>
       <div><div className="text-xs uppercase tracking-wider text-slate-500 mb-2 font-medium">Leave balance</div><LeaveBalances data={data} name={me.name}/></div>
       <Card><div className="px-5 py-4 border-b border-slate-200 font-semibold text-sm flex items-center gap-2"><Megaphone size={15} className="text-sky-600"/>Announcements</div>
         {data.announcements.length===0?<Empty msg="No announcements"/>:<div className="divide-y divide-slate-100">{data.announcements.map(an=>(<div key={an.id} className="px-5 py-3"><div className="font-medium text-sm">{an.title}</div><div className="text-sm text-slate-600 mt-0.5">{an.body}</div><div className="text-xs text-slate-400 mt-1">{an.date}</div></div>))}</div>}
@@ -831,7 +835,7 @@ function EmpProfile({ data, update, me }) {
     </Modal>}
   </>);
 }
-function EmpAttendance({ data, update, me }) {
+function EmpAttendance({ data, update, mutateData, me }) {
   const [lf, setLf] = useState(null);
   const blank = { employee:me.name, type:"Annual", from:today(), to:today(), reason:"", status:"Pending" };
   const myLeaves = data.leaves.filter(l=>l.employee===me.name);
@@ -840,7 +844,7 @@ function EmpAttendance({ data, update, me }) {
   return (<>
     <Head title="Attendance & Leave" sub="Check in, track your days, request leave"/>
     <div className="space-y-5">
-      <CheckInCard data={data} update={update} me={me}/>
+      <CheckInCard data={data} mutateData={mutateData} me={me}/>
       <LeaveBalances data={data} name={me.name}/>
       <div className="flex justify-between items-center"><div className="text-xs uppercase tracking-wider text-slate-500 font-medium">My leave requests</div><Btn onClick={()=>setLf(blank)}><Plus size={15}/>Request leave</Btn></div>
       <Card><Table cols={["Type","From","To","Days","Status"]}>{myLeaves.length===0?<tr><td colSpan={5}><Empty msg="No leave requests yet"/></td></tr>:myLeaves.map(l=>(<Row key={l.id}><Td>{l.type}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td><Pill s={l.status}/></Td></Row>))}</Table></Card>
@@ -951,10 +955,172 @@ function Dashboard({ data, role, go }) {
     </Card></>);
 }
 
+
+// ===== Client Onboarding (Svype Client Intake Ledger v1.0) =====
+// Field types: t=text n=number a=textarea s=select m=multi-select d=date b=checkbox
+const OB_STEPS = [
+  { id:"entity", title:"Client & Company", fields:[
+    {k:"legalName", l:"Full legal business name", t:"t", req:1},
+    {k:"tradeName", l:"Trading / brand name (if different)", t:"t"},
+    {k:"licence", l:"Trade licence / registration no. (UAE licence, NTN…)", t:"t"},
+    {k:"industry", l:"Industry / sector", t:"s", o:["Real Estate & Hospitality","F&B / Restaurant","Retail & E-commerce","Professional Services","Healthcare","Technology / SaaS","Other"]},
+    {k:"yearEst", l:"Year established", t:"t"},
+    {k:"size", l:"Company size", t:"s", o:["Solo / 1–10","11–50","51–200","200+"]},
+    {k:"regAddress", l:"Registered address", t:"a"},
+    {k:"locationsServed", l:"Physical location(s) served (for local SEO / GBP)", t:"a", ph:"list every branch"},
+    {k:"languages", l:"Languages audience is served in", t:"m", o:["English","Arabic","Urdu","Other"]},
+    {k:"markets", l:"Primary markets / regions targeted", t:"t", ph:"e.g. UAE only, GCC-wide, UK, Pakistan"},
+    {k:"contactName", l:"Primary contact — name & title", t:"t", req:1},
+    {k:"contactEmail", l:"Primary contact — email", t:"t", req:1},
+    {k:"contactPhone", l:"Primary contact — phone / WhatsApp", t:"t", ph:"9230… / 9715…"},
+    {k:"decisionMaker", l:"Final decision-maker (if different)", t:"t"},
+    {k:"escalation", l:"Escalation contact for urgent issues", t:"t"},
+  ]},
+  { id:"comms", title:"Communication & Workflow", fields:[
+    {k:"contactMethod", l:"Preferred contact method", t:"s", o:["Email","WhatsApp","Phone","Slack"]},
+    {k:"cadence", l:"Preferred meeting cadence", t:"s", o:["Weekly","Biweekly","Monthly","As-needed only"]},
+    {k:"timezone", l:"Time zone & working hours", t:"t"},
+    {k:"reporting", l:"Preferred reporting format", t:"s", o:["Live dashboard","PDF report","Walkthrough call","Slack summary"]},
+    {k:"approver", l:"Who approves content before publishing?", t:"t"},
+    {k:"turnaround", l:"Expected approval turnaround", t:"s", o:["Same day","Within 48 hours","Within a week","Flexible"]},
+    {k:"revisions", l:"Revision rounds per deliverable", t:"s", o:["1","2","3","Unlimited (specify in contract)"]},
+  ]},
+  { id:"digital", title:"Current Digital Presence", fields:[
+    {k:"website", l:"Website URL", t:"t"},
+    {k:"cms", l:"CMS / platform", t:"s", o:["WordPress","Shopify","Webflow","Custom-built","No website yet"]},
+    {k:"registrar", l:"Domain registrar", t:"t"},
+    {k:"domainExpiry", l:"Domain expiry date", t:"d"},
+    {k:"hosting", l:"Hosting provider", t:"t"},
+    {k:"adminAccess", l:"Who holds admin access to hosting / DNS?", t:"t", ph:"credentials go in the Vault, never here"},
+    {k:"ga4", l:"Google Analytics (GA4) access?", t:"s", o:["Yes — will share","No / not set up","Not sure"]},
+    {k:"gsc", l:"Search Console verified?", t:"s", o:["Yes","No","Not sure"]},
+    {k:"gbp", l:"Google Business Profile status", t:"s", o:["Claimed & verified","Claimed, not verified","Not claimed","Not applicable"]},
+    {k:"seoTools", l:"Existing Ahrefs / SEMrush / other SEO tools", t:"t"},
+    {k:"crm", l:"CRM or email marketing platform in use", t:"t"},
+    {k:"socials", l:"Social handles (IG, LinkedIn, FB, TikTok)", t:"a"},
+    {k:"contentVolume", l:"Approx. existing blog / content volume", t:"t"},
+    {k:"brandGuide", l:"Brand guideline / style guide (link)", t:"t"},
+  ]},
+  { id:"history", title:"Service History & Current Needs", fields:[
+    {k:"prevAgency", l:"Worked with an SEO / marketing agency before?", t:"s", o:["Yes","No"]},
+    {k:"prevAgencyDetail", l:"If yes — agency, duration, why it ended", t:"a"},
+    {k:"penalties", l:"Known Google penalties / manual actions?", t:"s", o:["Yes","No","Not sure"]},
+    {k:"notWorking", l:"What's not working right now?", t:"a", req:1},
+    {k:"techIssues", l:"Known technical issues", t:"m", o:["Slow site speed","Broken links","No rankings","No leads/conversions","Thin or outdated content","Other"]},
+    {k:"keywords", l:"Priority keywords already tracked", t:"a"},
+    {k:"urgency", l:"Urgency", t:"s", o:["Immediate","Within a month","Flexible timeline"]},
+  ]},
+  { id:"goals", title:"Expectations & Goals", fields:[
+    {k:"objective", l:"Primary business objective", t:"s", o:["More leads","More bookings/sales","Brand awareness","Rank in AI search (AEO/GEO)","Fix technical SEO foundation"]},
+    {k:"success90", l:"What does success look like in 90 days?", t:"a", req:1},
+    {k:"audience", l:"Ideal customer / target audience", t:"a"},
+    {k:"competitors", l:"Top 3 competitors to benchmark", t:"a"},
+    {k:"seasonality", l:"Seasonal / timing considerations", t:"a", ph:"launches, peak seasons, events"},
+    {k:"priorities", l:"Priority ranking (Traffic, Rankings, Leads, Conversions, Revenue)", t:"a", ph:"numbered, most important first"},
+  ]},
+  { id:"budget", title:"Budget & Payment", fields:[
+    {k:"budget", l:"Monthly budget range", t:"s", o:["Under $1,000","$1,000–$3,000","$3,000–$7,000","$7,000+"]},
+    {k:"currency", l:"Currency", t:"s", o:["AED","USD","GBP","PKR"]},
+    {k:"engagement", l:"Engagement type", t:"s", o:["Monthly retainer","Project-based","Milestone-based"]},
+    {k:"term", l:"Contract term", t:"s", o:["Month-to-month","3 months","6 months","12 months"]},
+    {k:"notice", l:"Notice period to cancel", t:"s", o:["None","14 days","30 days","60 days"]},
+    {k:"exclusivity", l:"Working with another agency concurrently?", t:"s", o:["Yes","No"]},
+    {k:"payMethod", l:"Preferred payment method", t:"s", o:["Bank transfer","Payoneer","Card"]},
+    {k:"billingContact", l:"Billing contact (if different)", t:"t"},
+    {k:"invoiceReqs", l:"Anything specific required on invoices?", t:"a"},
+  ]},
+  { id:"legal", title:"Legal & Consent", fields:[
+    {k:"tos", l:"Client accepts the Service Agreement / Terms", t:"b", req:1},
+    {k:"privacy", l:"Consent to data processing (UAE PDPL / GDPR)", t:"b", req:1},
+    {k:"nda", l:"NDA / confidentiality required?", t:"s", o:["Yes","No"]},
+    {k:"ipTransfer", l:"IP of deliverables transfers on final payment", t:"b"},
+    {k:"portfolio", l:"Permission to feature in Svype portfolio", t:"s", o:["Yes, freely","Yes, with approval each time","No"]},
+    {k:"signatory", l:"Authorised signatory name & date", t:"t", req:1},
+  ]},
+  { id:"notes", title:"Additional Notes", fields:[
+    {k:"tone", l:"Tone of voice notes", t:"a"},
+    {k:"avoid", l:"Topics or competitors to avoid", t:"a"},
+    {k:"compliance", l:"Industry compliance requirements", t:"a", ph:"e.g. real-estate disclaimers, health claims"},
+    {k:"anythingElse", l:"Anything else we should know", t:"a"},
+  ]},
+  { id:"referral", title:"Referral & Marketing", fields:[
+    {k:"source", l:"How did you hear about Svype?", t:"s", o:["Referral","Google search","Social media","Existing client","Other"]},
+    {k:"referredBy", l:"Referred by (optional)", t:"t"},
+    {k:"testimonial", l:"Consent to be featured as testimonial", t:"s", o:["Yes","No"]},
+    {k:"newsletter", l:"Opt in to Svype updates", t:"s", o:["Yes","No"]},
+  ]},
+  { id:"internal", title:"Internal Use Only", internal:1, fields:[
+    {k:"strategist", l:"Account strategist assigned", t:"t"},
+    {k:"callDate", l:"Onboarding call date", t:"d"},
+    {k:"contractDate", l:"Contract signed date", t:"d"},
+    {k:"tags", l:"CRM tags (service, industry, priority tier)", t:"t"},
+    {k:"capacity", l:"Content production capacity confirmed?", t:"s", o:["Yes","No — flag capacity conflict"]},
+    {k:"riskFlags", l:"Internal risk flags", t:"a", ph:"unclear scope, budget mismatch, difficult stakeholder…"},
+    {k:"reviewDate", l:"Next internal review date", t:"d"},
+    {k:"retainerAmount", l:"Monthly retainer amount (auto-creates the retainer)", t:"n", ph:"leave blank if not a retainer"},
+  ]},
+];
+function ObField({ f, v, set }) {
+  const lbl = f.l + (f.req ? " *" : "");
+  if (f.t==="a") return <Area label={lbl} value={v||""} onChange={e=>set(e.target.value)} placeholder={f.ph}/>;
+  if (f.t==="s") return <Select label={lbl} options={["— select —",...f.o]} value={v||"— select —"} onChange={e=>set(e.target.value==="— select —"?"":e.target.value)}/>;
+  if (f.t==="m") return (<div><span className="text-xs text-slate-500 mb-1 block">{lbl}</span><div className="flex flex-wrap gap-2">{f.o.map(o=>{const on=(v||[]).includes(o);return <button key={o} type="button" onClick={()=>set(on?(v||[]).filter(x=>x!==o):[...(v||[]),o])} className={`px-2.5 py-1.5 rounded-full text-xs border transition ${on?"bg-sky-600 border-sky-600 text-white":"bg-white border-slate-300 text-slate-600 hover:border-sky-400"}`}>{o}</button>;})}</div></div>);
+  if (f.t==="b") return (<label className="flex items-start gap-2 text-sm text-slate-700 cursor-pointer"><input type="checkbox" checked={!!v} onChange={e=>set(e.target.checked)} className="mt-0.5"/><span>{lbl}</span></label>);
+  return <Field label={lbl} type={f.t==="n"?"number":f.t==="d"?"date":"text"} value={v||""} onChange={e=>set(e.target.value)} placeholder={f.ph}/>;
+}
+function obMissing(ob) {
+  const miss=[];
+  OB_STEPS.forEach((st,si)=>st.fields.forEach(f=>{ if(f.req && !(f.t==="b" ? ob[f.k] : (ob[f.k]||"").toString().trim())) miss.push({ step:si, label:f.l }); }));
+  return miss;
+}
+function ClientOnboarding({ data, patch, onDone, onCancel }) {
+  const [step, setStep] = useState(0);
+  const [ob, setOb] = useState({});
+  const [err, setErr] = useState("");
+  const st = OB_STEPS[step];
+  const setF = (k) => (val) => { setOb(o=>({ ...o, [k]:val })); setErr(""); };
+  const finish = () => {
+    const miss = obMissing(ob);
+    if (miss.length) { setStep(miss[0].step); setErr("Required: " + miss.map(m=>m.label).join(" · ")); return; }
+    const name = (ob.tradeName||"").trim() || ob.legalName.trim();
+    const currency = ob.currency || "PKR";
+    const existing = data.clients.find(c=>c.name.toLowerCase()===name.toLowerCase());
+    const base = { name, legalName: ob.legalName, email: ob.contactEmail||"", whatsapp: (ob.contactPhone||"").trim(), currency, status:"Active", onboarding: ob, onboardedOn: today() };
+    const rec = existing ? { ...existing, ...base, id: existing.id, notes: existing.notes } : { id:uid(), notes:"", ...base };
+    const nextClients = existing ? data.clients.map(c=>c.id===existing.id?rec:c) : [...data.clients, rec];
+    let nextRetainers = data.retainers;
+    const amt = +ob.retainerAmount || 0;
+    if (amt > 0) {
+      const r = data.retainers.find(x=>x.client===name);
+      nextRetainers = r
+        ? data.retainers.map(x=>x.id===r.id?{...x,amount:amt,currency,whatsapp:rec.whatsapp||x.whatsapp,status:"Active"}:x)
+        : [...data.retainers, { id:uid(), client:name, whatsapp:rec.whatsapp, amount:amt, currency, billingDay:1, status:"Active", carry:0 }];
+    }
+    patch({ clients: nextClients, retainers: nextRetainers }, `Onboarded client ${name}`);
+    onDone(rec);
+  };
+  return (<>
+    <button onClick={onCancel} className="flex items-center gap-1 text-sm text-slate-500 hover:text-sky-600 mb-4"><ChevronLeft size={16}/>Back to clients</button>
+    <Head title="Onboard new client" sub="Svype Client Intake Ledger · fields marked * are required · everything is stored on the client record"/>
+    <div className="flex gap-1.5 flex-wrap mb-5">{OB_STEPS.map((x,i)=>(<button key={x.id} onClick={()=>setStep(i)} className={`px-2.5 py-1.5 rounded-full text-xs border transition ${i===step?"bg-sky-600 border-sky-600 text-white":obStepDone(x,ob)?"bg-emerald-50 border-emerald-300 text-emerald-700":"bg-white border-slate-300 text-slate-500 hover:border-sky-400"}`}>{i+1}. {x.title}</button>))}</div>
+    <Card><div className="p-6 space-y-4 max-w-2xl">
+      {st.internal ? <div className="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">Internal — not client-facing. Completed by the Svype team.</div> : null}
+      {st.fields.map(f=>(<ObField key={f.k} f={f} v={ob[f.k]} set={setF(f.k)}/>))}
+      {err && <div className="text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{err}</div>}
+      <div className="flex gap-2 pt-2">
+        {step>0 && <Btn variant="ghost" onClick={()=>setStep(step-1)}><ChevronLeft size={15}/>Previous</Btn>}
+        {step<OB_STEPS.length-1 && <Btn onClick={()=>setStep(step+1)}>Next section</Btn>}
+        {step===OB_STEPS.length-1 && <Btn variant="ok" onClick={finish}><Check size={15}/>Complete onboarding</Btn>}
+      </div>
+    </div></Card>
+  </>);
+}
+function obStepDone(st, ob) { return st.fields.some(f=> f.t==="b" ? ob[f.k] : ((ob[f.k]||"").toString().trim() || (Array.isArray(ob[f.k]) && ob[f.k].length))); }
+
 function Clients({ data, update, patch }) {
   const rows = data.clients;
   const [edit, setEdit] = useState(null); const [open, setOpen] = useState(null);
-  const [show, setShow] = useState("active");
+  const [show, setShow] = useState("active"); const [onboard, setOnboard] = useState(false);
   const blank = { name:"", email:"", whatsapp:"", currency:"PKR", notes:"", retainer:"", status:"Active" };
   const openEdit = (c) => { const r = data.retainers.find(x=>x.client===c.name && x.status==="Active"); setEdit({ ...c, status:c.status||"Active", retainer: r ? r.amount : "" }); };
   const save = (c)=>{
@@ -986,12 +1152,13 @@ function Clients({ data, update, patch }) {
     if (status==="Inactive" && existing) nextRetainers = data.retainers.map(r=>r.id===existing.id?{...r,status:"Paused"}:r);
     patch({ clients: nextClients, retainers: nextRetainers }, `${status==="Inactive"?"Deactivated":"Reactivated"} client ${c.name}`);
   };
+  if (onboard) return <ClientOnboarding data={data} patch={patch} onCancel={()=>setOnboard(false)} onDone={(rec)=>{ setOnboard(false); setOpen(rec.id); }}/>;
   if (open) { const c = rows.find(r=>r.id===open); if (c) return <ClientProfile c={c} data={data} onBack={()=>setOpen(null)} onEdit={()=>openEdit(c)}/>; }
   const isActive = (c)=> (c.status||"Active")==="Active";
   const filtered = rows.filter(c=> show==="all" ? true : show==="active" ? isActive(c) : !isActive(c));
   const activeCount = rows.filter(isActive).length;
   return (<>
-    <Head title="Clients" sub={`${activeCount} active · ${rows.length} total · used across retainers, invoices, proposals, quotations`} action={<Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn>}/>
+    <Head title="Clients" sub={`${activeCount} active · ${rows.length} total · used across retainers, invoices, proposals, quotations`} action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>setEdit(blank)}><Plus size={15}/>Quick add</Btn><Btn onClick={()=>setOnboard(true)}><UserPlus size={15}/>Onboard client</Btn></div>}/>
     <div className="flex flex-wrap gap-2 mb-4"><Btn variant={show==="active"?"primary":"ghost"} onClick={()=>setShow("active")}>Active</Btn><Btn variant={show==="inactive"?"primary":"ghost"} onClick={()=>setShow("inactive")}>Inactive</Btn><Btn variant={show==="all"?"primary":"ghost"} onClick={()=>setShow("all")}>All</Btn></div>
     <Card><Table cols={["Client","Status","Currency","Retainer","WhatsApp","Email",""]}>{filtered.length===0?<tr><td colSpan={7}><Empty msg={show==="inactive"?"No inactive clients":"No clients yet"}/></td></tr>:filtered.map(c=>{ const r=data.retainers.find(x=>x.client===c.name && x.status==="Active"); const act=isActive(c); return (
       <Row key={c.id} onClick={()=>setOpen(c.id)}><Td className="font-medium">{c.name}{c.notes&&<div className="text-xs text-slate-400">{c.notes}</div>}</Td><Td><Pill s={act?"Active":"Inactive"}/></Td><Td>{c.currency}</Td><Td className="text-slate-500">{r?fmt(r.amount,r.currency):"—"}</Td><Td className="text-slate-500">{c.whatsapp||"—"}</Td><Td className="text-slate-500">{c.email||"—"}</Td>
@@ -1024,6 +1191,16 @@ function ClientProfile({ c, data, onBack, onEdit }) {
     <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
       {[["Invoices",inv.length],["Retainers",ret.length],["Proposals",prop.length],["Hours logged",hrs]].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-2xl font-bold text-slate-900">{v}</div><div className="text-xs text-slate-500 mt-0.5">{k}</div></div></Card>))}
     </div>
+    {c.onboarding && <Card><div className="p-5">
+      <div className="flex items-center justify-between mb-3"><div className="font-semibold text-sm">Onboarding record</div><span className="text-xs text-slate-400">completed {c.onboardedOn}</span></div>
+      <div className="grid md:grid-cols-2 gap-x-8 gap-y-4">{OB_STEPS.map(st=>{
+        const filled = st.fields.filter(f=>{ const v=c.onboarding[f.k]; return f.t==="b" ? v : Array.isArray(v) ? v.length : (v||"").toString().trim(); });
+        if (!filled.length) return null;
+        return (<div key={st.id}><div className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1.5">{st.title}</div>
+          {filled.map(f=>{ const v=c.onboarding[f.k]; return <div key={f.k} className="text-sm mb-1"><span className="text-slate-500">{f.l}: </span><span className="text-slate-800">{f.t==="b"?"Yes":Array.isArray(v)?v.join(", "):String(v)}</span></div>; })}
+        </div>);
+      })}</div>
+    </div></Card>}
     <div className="text-xs uppercase tracking-wider text-slate-500 mb-2 font-medium">Invoices</div>
     <Card><Table cols={["Number","Amount","Date","Status"]}>{inv.length===0?<tr><td colSpan={4}><Empty msg="No invoices"/></td></tr>:inv.map(i=>(<Row key={i.id}><Td className="font-medium">{i.number}</Td><Td>{fmt(i.amount,i.currency)}</Td><Td className="text-slate-500">{i.date}</Td><Td><Pill s={i.status}/></Td></Row>))}</Table></Card>
     {quo.length>0 && <><div className="text-xs uppercase tracking-wider text-slate-500 mb-2 mt-5 font-medium">Quotations</div><Card><Table cols={["Number","Amount","Date"]}>{quo.map(q=>(<Row key={q.id}><Td className="font-medium">{q.number}</Td><Td>{fmt(q.amount,q.currency)}</Td><Td className="text-slate-500">{q.date}</Td></Row>))}</Table></Card></>}
@@ -1192,9 +1369,9 @@ function EmployeeProfile({ emp, data, onBack, onEdit }) {
   </>);
 }
 
-function Attendance({ data, update }) {
+function Attendance({ data, update, mutateData }) {
   const [view, setView] = useState("attendance");
-  const mark = (emp,status)=>{ const ex=data.attendance.find(a=>a.employee===emp&&a.date===today()); update("attendance", ex?data.attendance.map(a=>a===ex?{...a,status}:a):[...data.attendance,{id:uid(),employee:emp,date:today(),status}]); };
+  const mark = (emp,status)=>{ mutateData((cur)=>{ const list=cur.attendance||[]; const ex=list.find(a=>a.employee===emp&&a.date===today()); return { ...cur, attendance: ex?list.map(a=>a===ex?{...a,status}:a):[...list,{id:uid(),employee:emp,date:today(),status}] }; }, `Marked ${emp} ${status}`); };
   const setStatus=(id,s)=>{ const l=data.leaves.find(x=>x.id===id); update("leaves",data.leaves.map(x=>x.id===id?{...x,status:s}:x), `Leave ${s.toLowerCase()} for ${l?.employee}`); };
   const locLink = (loc) => loc && loc.lat ? `https://www.google.com/maps?q=${loc.lat},${loc.lng}` : null;
   const history = [...data.attendance].sort((a,b)=> (b.date||"").localeCompare(a.date||"") || (b.checkIn||"").localeCompare(a.checkIn||""));
