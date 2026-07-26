@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · save-modal-v1";
+const APP_BUILD = "Build 27 Jul 2026 · login-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -756,29 +756,87 @@ function SaveStatus() {
 }
 function Login({ data, brand, onLogin }) {
   const [u, setU] = useState(""); const [p, setP] = useState(""); const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [now, setNow] = useState(new Date());
+  useEffect(() => { const iv = setInterval(()=>setNow(new Date()), 1000); return ()=>clearInterval(iv); }, []);
   const submit = () => {
+    setBusy(true);
     const user = (data.users||[]).find(x=>x.username.toLowerCase()===u.trim().toLowerCase() && x.password===p);
-    if (!user) { setErr("Incorrect username or password."); return; }
-    if (!user.active) { setErr("This account has been deactivated. Contact HR."); return; }
+    if (!user) { setErr("Incorrect username or password."); setBusy(false); return; }
+    if (!user.active) { setErr("This account has been deactivated. Contact HR."); setBusy(false); return; }
     if (user.role === "employee" && user.empId) {
       const emp = data.employees.find(e=>e.id===user.empId);
-      if (emp && emp.status !== "Active") { setErr("Your employee profile is inactive. Contact HR."); return; }
+      if (emp && emp.status !== "Active") { setErr("Your employee profile is inactive. Contact HR."); setBusy(false); return; }
     }
     onLogin(user);
   };
-  return (<div className="min-h-screen grid place-items-center bg-slate-900 text-white p-4"><div className="text-center max-w-sm w-full">
-    {brand.logo ? <img src={brand.logo} className="w-16 h-16 rounded-2xl object-contain bg-slate-800 mx-auto mb-5"/> : <div className="w-14 h-14 rounded-2xl bg-sky-600 grid place-items-center text-white font-black text-2xl mx-auto mb-5">S</div>}
-    <h1 className="text-2xl font-bold tracking-tight">{brand.company}</h1>
-    <p className="text-slate-400 text-sm mb-8">Sign in to your account.</p>
-    <div className="space-y-3 text-left">
-      <div><span className="text-xs text-slate-400 mb-1 block">Username</span><input value={u} onChange={e=>{setU(e.target.value);setErr("");}} onKeyDown={e=>e.key==="Enter"&&submit()} className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2.5 text-sm outline-none focus:border-sky-500" placeholder="username"/></div>
-      <div><span className="text-xs text-slate-400 mb-1 block">Password</span><input type="password" value={p} onChange={e=>{setP(e.target.value);setErr("");}} onKeyDown={e=>e.key==="Enter"&&submit()} className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2.5 text-sm outline-none focus:border-sky-500" placeholder="••••••••"/></div>
-      {err && <div className="text-sm text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-lg px-3 py-2">{err}</div>}
-      <button onClick={submit} className="w-full py-2.5 rounded-lg bg-sky-600 hover:bg-sky-700 text-white font-medium transition">Sign in</button>
+  const accent = brand.accent || "#0284c7";
+  const readouts = [
+    { icon:MapPin, label:"Geofenced attendance", sub:"Check-in at the Islamabad & Lahore offices" },
+    { icon:Wallet, label:"Payroll & salary slips", sub:"Adjustments, deductions, slips by email" },
+    { icon:Repeat, label:"Clients & retainers", sub:"Invoices, receipts and onboarding in one place" },
+  ];
+  return (<div className="min-h-screen flex flex-col lg:flex-row bg-slate-950 text-white">
+    <style>{`
+      @keyframes svy-rise { from { opacity:0; transform:translateY(10px);} to { opacity:1; transform:none;} }
+      @keyframes svy-pulse { 0%,100% { opacity:.45; transform:scale(1);} 50% { opacity:1; transform:scale(1.25);} }
+      .svy-rise { animation: svy-rise .5s ease both; }
+      .svy-rise-2 { animation: svy-rise .5s .12s ease both; }
+      .svy-dot { animation: svy-pulse 2.4s ease-in-out infinite; }
+      @media (prefers-reduced-motion: reduce) { .svy-rise,.svy-rise-2 { animation:none; } .svy-dot { animation:none; opacity:1; } }
+    `}</style>
+
+    {/* Brand panel */}
+    <div className="relative lg:w-[54%] flex flex-col justify-between px-8 py-10 sm:px-14 sm:py-12 overflow-hidden">
+      <div aria-hidden className="absolute -top-32 -left-32 w-[480px] h-[480px] rounded-full pointer-events-none" style={{background:`radial-gradient(closest-side, ${accent}33, transparent)`}}/>
+      <div aria-hidden className="absolute bottom-0 right-0 w-[360px] h-[360px] rounded-full pointer-events-none" style={{background:`radial-gradient(closest-side, ${accent}1f, transparent)`}}/>
+      <div className="relative svy-rise">
+        <div className="flex items-center gap-3">
+          {brand.logo ? <img src={brand.logo} className="w-11 h-11 rounded-xl object-contain bg-slate-900 border border-slate-800"/> : <div className="w-11 h-11 rounded-xl grid place-items-center text-white font-black text-xl" style={{background:accent}}>S</div>}
+          <div>
+            <div className="text-lg font-bold tracking-tight leading-none">{brand.company}</div>
+            <div className="text-[11px] uppercase tracking-[0.22em] text-slate-400 mt-1">HR & Operations Portal</div>
+          </div>
+        </div>
+        <h1 className="mt-10 lg:mt-16 text-3xl sm:text-4xl font-bold tracking-tight leading-tight max-w-md">The day runs<br/>through here.</h1>
+        <p className="mt-3 text-sm text-slate-400 max-w-sm">{brand.tagline || "Attendance, payroll, clients and requests — one portal for the whole team."}</p>
+        <div className="mt-8 lg:mt-10 space-y-4 max-w-sm hidden sm:block">
+          {readouts.map(r=>{const I=r.icon; return (
+            <div key={r.label} className="flex items-start gap-3">
+              <div className="w-8 h-8 rounded-lg bg-slate-900 border border-slate-800 grid place-items-center shrink-0"><I size={15} style={{color:accent}}/></div>
+              <div><div className="text-sm font-medium text-slate-200">{r.label}</div><div className="text-xs text-slate-500">{r.sub}</div></div>
+            </div>);})}
+        </div>
+      </div>
+      <div className="relative mt-10 flex items-center gap-2.5 text-xs text-slate-500 svy-rise-2">
+        <span className="w-2 h-2 rounded-full svy-dot" style={{background:accent}}/>
+        <span className="tabular-nums text-slate-300">{now.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"})}</span>
+        <span>· {now.toLocaleDateString("en-GB",{weekday:"long", day:"numeric", month:"long"})}</span>
+        <span className="hidden sm:inline">· Islamabad & Lahore offices</span>
+      </div>
     </div>
-    <p className="text-xs text-slate-500 mt-6">Don't have an account? Ask HR to create one for you.</p>
-    <p className="text-[10px] text-slate-600 mt-2">{APP_BUILD}</p>
-  </div></div>);
+
+    {/* Sign-in card */}
+    <div className="flex-1 grid place-items-center px-4 py-10 sm:px-8 lg:bg-slate-900/40">
+      <div className="w-full max-w-sm bg-white text-slate-900 rounded-2xl shadow-2xl p-7 sm:p-8 svy-rise-2">
+        <div className="text-xl font-bold tracking-tight">Welcome back</div>
+        <div className="text-sm text-slate-500 mb-6">Sign in to continue.</div>
+        <div className="space-y-3.5">
+          <div><span className="text-xs font-medium text-slate-500 mb-1 block">Username</span>
+            <input value={u} onChange={e=>{setU(e.target.value);setErr("");}} onKeyDown={e=>e.key==="Enter"&&submit()} autoFocus autoCapitalize="none" autoComplete="username"
+              className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2.5 text-sm outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-100" placeholder="your.username"/></div>
+          <div><span className="text-xs font-medium text-slate-500 mb-1 block">Password</span>
+            <input type="password" value={p} onChange={e=>{setP(e.target.value);setErr("");}} onKeyDown={e=>e.key==="Enter"&&submit()} autoComplete="current-password"
+              className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2.5 text-sm outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-100" placeholder="••••••••"/></div>
+          {err && <div className="text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{err}</div>}
+          <button onClick={submit} disabled={busy} className="w-full py-2.5 rounded-lg text-white font-medium transition hover:opacity-90 disabled:opacity-60 flex items-center justify-center gap-2" style={{background:accent}}>
+            {busy?<Loader2 size={15} className="animate-spin"/>:null}Sign in</button>
+        </div>
+        <p className="text-xs text-slate-400 mt-6">Access is created by HR — ask your manager if you don't have a login.</p>
+        <p className="text-[10px] text-slate-300 mt-3">{APP_BUILD}</p>
+      </div>
+    </div>
+  </div>);
 }
 function BrandSetup({ brand, saveBrand, done }) {
   const [b, setB] = useState(brand);
