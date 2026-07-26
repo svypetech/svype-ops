@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · copy-bank-v1";
+const APP_BUILD = "Build 27 Jul 2026 · billing-type-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -306,6 +306,17 @@ function nextMonthInfo(from){
   return { key, label, issue, due };
 }
 
+function currentMonthInfo(from){
+  // The month just worked (postpaid billing): period = this month, due 5th of next month.
+  const d = from ? new Date(from) : new Date();
+  const y = d.getFullYear(), m = d.getMonth();
+  const key = `${y}-${pad2(m+1)}`;
+  const label = new Date(y, m, 1).toLocaleString("default",{month:"long",year:"numeric"});
+  const nm = m === 11 ? 0 : m+1, ny = m === 11 ? y+1 : y;
+  const due = `${ny}-${pad2(nm+1)}-05`;
+  return { key, label, issue: today(), due };
+}
+
 // Build invoices for the upcoming billing cycle.
 // HARD RULE: invoices are created ONLY when explicitly instructed (the "Generate now"
 // button passes force=true). Any call without force is a no-op — there is no automatic
@@ -313,15 +324,18 @@ function nextMonthInfo(from){
 function generateRetainerInvoices(db, force){
   if (!force) return db;
   const now = new Date();
-  const { key, label, issue, due } = nextMonthInfo(now);
+  const pre = nextMonthInfo(now);      // Prepaid: pays for the UPCOMING month
+  const post = currentMonthInfo(now);  // Postpaid: pays for the month just worked
   const inv = [...(db.retainerInvoices || [])];
   let changed = false;
   const rets = (db.retainers || []).map((r) => {
     if (r.status !== "Active") return r;
+    const cyc = r.billing === "Postpaid" ? post : pre;
+    const { key, label, issue, due } = cyc;
     if (r.lastGenCycle === key) return r;                  // already generated for this cycle
     if (inv.some(i => i.retainerId === r.id && i.monthKey === key)) return { ...r, lastGenCycle:key };
     const base = +r.amount || 0, carry = +r.carry || 0;
-    inv.push({ id: uid(), retainerId: r.id, client: r.client, number: `RET-${key.replace("-", "")}-${inv.length + 1}`, monthKey: key, month: label, base, carry, total: base + carry, currency: r.currency || "PKR", status: "Unpaid", paidAmount: 0, account: "", date: issue, due, paidDate: "" });
+    inv.push({ id: uid(), retainerId: r.id, client: r.client, number: `RET-${key.replace("-", "")}-${inv.length + 1}`, monthKey: key, month: label, billing: r.billing||"Prepaid", base, carry, total: base + carry, currency: r.currency || "PKR", status: "Unpaid", paidAmount: 0, account: "", date: issue, due, paidDate: "" });
     changed = true; return { ...r, carry: 0, lastGenCycle: key };
   });
   return changed ? { ...db, retainerInvoices: inv, retainers: rets } : db;
@@ -2451,7 +2465,7 @@ function Retainers({ data, update, patch, brand, go }) {
       receivables: (data.receivables||[]).filter(r=>!keepRecvIds.has(r.id)),
     }, `Cleared ${unpaid.length} unpaid invoices and ${openRecv.length} open receivables`);
   };
-  const blank = { client:"", whatsapp:"", amount:"", currency:"PKR", billingDay:1, status:"Active", carry:0 };
+  const blank = { client:"", whatsapp:"", amount:"", currency:"PKR", billing:"Prepaid", billingDay:1, status:"Active", carry:0 };
   const onClient=(v)=>{ const c=clients.find(x=>x.name===v); setEdit(e=>({...e,client:v,...(c?{currency:c.currency||"PKR",whatsapp:c.whatsapp||e.whatsapp}:{})})); };
   const saveClient = (c) => {
     const existsInCrm = clients.some(x=>x.name.toLowerCase()===(c.client||"").toLowerCase());
@@ -2459,10 +2473,22 @@ function Retainers({ data, update, patch, brand, go }) {
     const newRets = c.id?rets.map(r=>r.id===c.id?c:r):[...rets,{...c,id:uid(),carry:+c.carry||0}];
     patch({ retainers:newRets, ...extra }, c.id?`Updated retainer ${c.client}`:`Added retainer client ${c.client}`); setEdit(null);
   };
+  const [billAsk, setBillAsk] = useState(null); // { [retainerId]: "Prepaid"|"Postpaid" }
+  const runGeneration = (db) => {
+    const after = generateRetainerInvoices(db, true); // only ever runs when you click
+    if (after !== db) patch({ retainerInvoices: after.retainerInvoices, retainers: after.retainers }, `Generated retainer invoices`);
+    else alert("Invoices for the current cycle have already been generated for every client.");
+  };
   const genDue = () => {
-    const after = generateRetainerInvoices(data, true); // force = generate now regardless of date
-    if (after !== data) patch({ retainerInvoices: after.retainerInvoices, retainers: after.retainers }, `Generated retainer invoices`);
-    else alert("Invoices for the upcoming cycle have already been generated.");
+    const missing = rets.filter(r=>r.status==="Active" && r.billing!=="Prepaid" && r.billing!=="Postpaid");
+    if (missing.length) { setBillAsk(Object.fromEntries(missing.map(r=>[r.id, ""]))); return; }
+    runGeneration(data);
+  };
+  const saveBillingAndGenerate = () => {
+    if (Object.values(billAsk).some(v=>!v)) { alert("Choose Prepaid or Postpaid for every client — this is saved once and remembered."); return; }
+    const newRets = rets.map(r=>billAsk[r.id] ? { ...r, billing: billAsk[r.id] } : r);
+    setBillAsk(null);
+    runGeneration({ ...data, retainers: newRets });
   };
   // manual invoice
   const newManual = () => setManual({ client:"", retainerId:"", month: monthLabel(), base:"", carry:0, currency:"PKR", date: today(), due:"", sendOn:"" });
@@ -2498,13 +2524,14 @@ function Retainers({ data, update, patch, brand, go }) {
         <Row key={r.id}><Td className="font-medium">{r.client}</Td><Td className="text-slate-500">{r.whatsapp||"—"}</Td><Td>{fmt(r.amount,r.currency)}</Td><Td className={+r.carry?"text-amber-600 font-medium":"text-slate-400"}>{r.carry?fmt(r.carry,r.currency):"—"}</Td><Td><Pill s={r.status}/></Td><Td><RowActions onEdit={()=>setEdit(r)} onDelete={()=>update("retainers",rets.filter(x=>x.id!==r.id))}/></Td></Row>))}</Table></Card>
     ) : (
       <Card><Table cols={["Invoice","Client","Period","Due","Total","Status",""]}>{invs.length===0?<tr><td colSpan={7}><Empty msg="No invoices yet — generate this month or create one"/></td></tr>:[...invs].reverse().map(i=>(
-        <Row key={i.id}><Td className="font-medium">{i.number}</Td><Td className="text-slate-500">{i.client}</Td><Td className="text-slate-500">{i.month}</Td><Td className="text-slate-500">{i.due||"—"}{i.dueExtended&&<div className="text-xs text-amber-600">extended</div>}{i.sendOn?<div className="text-xs text-slate-400">send {i.sendOn}</div>:null}</Td><Td>{fmt(i.total,i.currency)}{i.status==="Partial"&&<div className="text-xs text-orange-600">received {fmt(i.paidAmount,i.currency)}</div>}{i.status==="Paid"&&i.account&&<div className="text-xs text-slate-400">{i.account}</div>}</Td><Td><Pill s={i.status}/></Td>
+        <Row key={i.id}><Td className="font-medium">{i.number}</Td><Td className="text-slate-500">{i.client}</Td><Td className="text-slate-500">{i.month}{i.billing&&<div className="text-xs text-slate-400">{i.billing}</div>}</Td><Td className="text-slate-500">{i.due||"—"}{i.dueExtended&&<div className="text-xs text-amber-600">extended</div>}{i.sendOn?<div className="text-xs text-slate-400">send {i.sendOn}</div>:null}</Td><Td>{fmt(i.total,i.currency)}{i.status==="Partial"&&<div className="text-xs text-orange-600">received {fmt(i.paidAmount,i.currency)}</div>}{i.status==="Paid"&&i.account&&<div className="text-xs text-slate-400">{i.account}</div>}</Td><Td><Pill s={i.status}/></Td>
         <Td><RowActions onDelete={()=>{ const parent=rets.find(r=>r.id===i.retainerId); patch({ retainerInvoices:invs.filter(x=>x.id!==i.id), retainers: parent?rets.map(r=>r.id===parent.id?{...r,lastGenCycle: i.monthKey||r.lastGenCycle}:r):rets }, `Deleted invoice ${i.number}`); }}><button onClick={()=>openInvoicePDF(i, brand)} title="Download PDF invoice" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Download size={14}/></button><button onClick={()=>sendWA(i)} title="Send on WhatsApp" className="p-1.5 rounded text-slate-400 hover:text-green-600 hover:bg-slate-100"><Send size={14}/></button>{i.status!=="Paid" && <button onClick={()=>setExtend({ id:i.id, client:i.client, number:i.number, due:i.due||today() })} title="Extend due date" className="p-1.5 rounded text-slate-400 hover:text-amber-600 hover:bg-slate-100"><CalendarClock size={15}/></button>}{i.status!=="Paid" && <button onClick={()=>setPay(i)} title="Mark as paid" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button>}</RowActions></Td></Row>))}</Table></Card>
     )}
     {edit && <Modal title={edit.id?"Edit retainer client":"Add retainer client"} onClose={()=>setEdit(null)}>
       <ClientInput clients={clients} label="Client name" value={edit.client} onChange={e=>onClient(e.target.value)}/>
       <Field label="WhatsApp number (with country code)" value={edit.whatsapp} onChange={e=>setEdit({...edit,whatsapp:e.target.value})} placeholder="923001234567"/>
       <div className="grid grid-cols-2 gap-3"><Field label="Monthly amount" type="number" value={edit.amount} onChange={e=>setEdit({...edit,amount:e.target.value})}/><Select label="Currency" options={CURRENCIES} value={edit.currency} onChange={e=>setEdit({...edit,currency:e.target.value})}/></div>
+      <Select label="Billing type" options={["Prepaid — pays for the upcoming month","Postpaid — pays after the month ends"]} value={edit.billing==="Postpaid"?"Postpaid — pays after the month ends":"Prepaid — pays for the upcoming month"} onChange={e=>setEdit({...edit,billing:e.target.value.startsWith("Postpaid")?"Postpaid":"Prepaid"})}/>
       <div className="grid grid-cols-2 gap-3"><Field label="Billing day" type="number" value={edit.billingDay} onChange={e=>setEdit({...edit,billingDay:e.target.value})}/><Select label="Status" options={["Active","Paused"]} value={edit.status} onChange={e=>setEdit({...edit,status:e.target.value})}/></div>
       <p className="text-xs text-slate-400">A new client name here is also added to your Clients list automatically.</p>
       <Btn onClick={()=>saveClient(edit)}><Check size={15}/>Save</Btn>
@@ -2517,6 +2544,18 @@ function Retainers({ data, update, patch, brand, go }) {
       <Btn onClick={saveManual}><Check size={15}/>Create invoice</Btn>
     </Modal>}
     {pay && <PayModal inv={pay} accounts={accounts} onClose={()=>setPay(null)} onConfirm={confirmPay} onManageAccounts={()=>{setPay(null);go("accounts");}}/>}
+    {billAsk && <Modal title="One-time setup · billing type per client" onClose={()=>setBillAsk(null)}>
+      <p className="text-xs text-slate-500">Choose how each client is billed. <b>Prepaid</b> pays for the upcoming month; <b>Postpaid</b> pays for the month just completed. This is saved on the client's retainer and won't be asked again.</p>
+      <div className="space-y-2">{rets.filter(r=>billAsk[r.id]!==undefined).map(r=>(
+        <div key={r.id} className="flex items-center justify-between gap-3 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+          <div className="text-sm font-medium">{r.client}<div className="text-xs text-slate-400 font-normal">{fmt(r.amount, r.currency)}/mo</div></div>
+          <div className="flex gap-1">{["Prepaid","Postpaid"].map(m=>(
+            <button key={m} onClick={()=>setBillAsk({...billAsk,[r.id]:m})} className={`px-2.5 py-1.5 rounded-lg text-xs border transition ${billAsk[r.id]===m?"bg-sky-600 border-sky-600 text-white":"bg-white border-slate-300 text-slate-600 hover:border-sky-400"}`}>{m}</button>))}
+          </div>
+        </div>))}
+      </div>
+      <Btn onClick={saveBillingAndGenerate}><Check size={15}/>Save & generate invoices</Btn>
+    </Modal>}
     {extend && <Modal title={`Extend due date · ${extend.number}`} onClose={()=>setExtend(null)}>
       <p className="text-xs text-slate-500">Give {extend.client} more time to pay. This updates the invoice's due date.</p>
       <Field label="New due date" type="date" value={extend.due} onChange={e=>setExtend({...extend,due:e.target.value})}/>
