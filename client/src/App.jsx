@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 26 Jul 2026 · processing-v1";
+const APP_BUILD = "Build 27 Jul 2026 · sync-v2";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -106,23 +106,24 @@ async function _drainSaves() {
   if (_saving) return; _saving = true;
   try {
     while (_saveQueue.length) {
-      const item = _saveQueue.shift();
-      const { mutate, onMerged, resolve, reject } = item;
+      // Coalesce everything queued right now into ONE server write — ticking ten
+      // checkboxes quickly becomes one or two PUTs instead of ten (much faster).
+      const batch = _saveQueue.splice(0, _saveQueue.length);
       try {
         let attempts = 0, done = false, hadConflict = false;
         while (!done && attempts < 6) {
           attempts++;
-          const next = mutate(_serverDoc || undefined);
+          let next = _serverDoc || undefined;
+          for (const b of batch) next = b.mutate(next);
           const r = await _putState(next, _rev);
           if (r.conflict) { hadConflict = true; _serverDoc = r.doc; _rev = r.rev; continue; }
           _serverDoc = next; _rev = r.rev; _stateCache.doc = next; done = true;
-          if (hadConflict && onMerged) onMerged(next); // re-sync UI with merged result
+          if (hadConflict) { const om = batch.find(b=>b.onMerged); om && om.onMerged(next); } // re-sync UI with merged result
         }
         if (!done) throw new Error("could not save after several retries");
-        resolve && resolve(true);
+        batch.forEach(b=>b.resolve && b.resolve(true));
       } catch (e) {
-        reject && reject(e);
-        // fail the rest of the queue too so callers aren't left hanging
+        batch.forEach(b=>b.reject && b.reject(e));
         _saveQueue.forEach(q=>q.reject && q.reject(e)); _saveQueue = [];
         _setSaveStatus("error");
         alert("⚠️ Your last change could NOT be saved to the server, so it will be lost on refresh.\n\nPlease sign out and back in, then try again. If it keeps happening, check your internet connection.\n\n(Technical detail: " + (e?.message || "save failed") + ")");
@@ -242,6 +243,7 @@ const SEED = {
   users: [],
   vault: [],
   vaultMeta: null,
+  todos: [],
 };
 const SEED_BRAND = { company: "Svype Tech Limited", tagline: "Digital Marketing & Creative Agency", address: "Islamabad · Lahore, Pakistan", contact: "hello@svype.com · www.svype.com", accent: "#0284c7", logo: null, signatories: [], stamps: [] };
 
@@ -341,6 +343,7 @@ const NAV = [
   { id:"permissions", label:"Permissions", icon:Settings, adminOnly:true },
   { id:"clients", label:"Clients", icon:Contact },
   { id:"attendance", label:"Attendance & Leave", icon:CalendarCheck },
+  { id:"todos", label:"Team To-dos", icon:CalendarCheck },
   { id:"payroll", label:"Payroll & Slips", icon:Wallet },
   { id:"advances", label:"Advances & Loans", icon:HandCoins },
   { id:"vendorbills", label:"Vendor Bills", icon:Receipt },
@@ -369,7 +372,7 @@ const NAV = [
 // Grouped navigation: each top-level section opens to a page with sub-tabs.
 const NAV_GROUPS = [
   { id:"dash", label:"Dashboard", icon:LayoutDashboard, tabs:["dash"] },
-  { id:"people", label:"People", icon:Users, tabs:["employees","attendance","payroll","advances","recruit","cvbank"] },
+  { id:"people", label:"People", icon:Users, tabs:["employees","attendance","todos","payroll","advances","recruit","cvbank"] },
   { id:"sales", label:"Clients & Sales", icon:Contact, tabs:["clients","proposals","quotations","retainers","invoices","receipts"] },
   { id:"finance", label:"Finance", icon:Wallet, tabs:["payables","receivables","vendorbills","accounts"] },
   { id:"documents", label:"Documents", icon:FileSignature, tabs:["offers","letters","meetings"] },
@@ -379,7 +382,7 @@ const NAV_GROUPS = [
 // Friendly labels for sub-tabs (override the long sidebar labels inside a section)
 const TAB_LABELS = {
   dash:"Dashboard", chat:"Team Chat",
-  employees:"Employees", attendance:"Attendance & Leave", payroll:"Payroll & Slips", advances:"Advances & Loans", recruit:"Recruitment", cvbank:"CV Bank",
+  employees:"Employees", attendance:"Attendance & Leave", todos:"Team To-dos", payroll:"Payroll & Slips", advances:"Advances & Loans", recruit:"Recruitment", cvbank:"CV Bank",
   clients:"Clients", proposals:"Proposals", quotations:"Quotations", retainers:"Retainers", invoices:"Invoices", receipts:"Receipts",
   payables:"Payables", receivables:"Receivables", vendorbills:"Vendor Bills", accounts:"Bank Accounts",
   offers:"Offer Letters", letters:"Letters & Certificates", meetings:"Meeting Notes",
@@ -391,6 +394,7 @@ const EMP_NAV = [
   { id:"dash", label:"Home", icon:LayoutDashboard },
   { id:"profile", label:"My Profile", icon:UserCircle },
   { id:"attendance", label:"Attendance & Leave", icon:CalendarCheck },
+  { id:"todos", label:"Team To-dos", icon:CalendarCheck },
   { id:"payslips", label:"Payslips", icon:Wallet },
   { id:"timesheet", label:"Daily Work Log", icon:Clock },
   { id:"meetings", label:"Meeting Notes", icon:FileText },
@@ -445,6 +449,12 @@ export default function App() {
       if (_saving || _saveQueue.length) return; // never interrupt our own pending saves
       try {
         const st = await apiReq("GET", "/state");
+        if (st && st.build && st.build !== APP_BUILD) {
+          // A newer version is deployed. Reload once so this device can't keep running
+          // old code (stale builds were overwriting fresh data with old lists).
+          const k = "svype_reload_" + st.build;
+          if (!sessionStorage.getItem(k)) { sessionStorage.setItem(k, "1"); _setSaveStatus("updating"); setTimeout(()=>window.location.reload(), 1200); return; }
+        }
         if (st && st.doc && +st.rev > _rev) { initSaveState(st.doc, +st.rev); setData({ ...SEED, ...st.doc }); }
       } catch {}
     };
@@ -548,12 +558,12 @@ export default function App() {
         </div>
       </aside>
 
+      <SaveStatus/>
       <main className="flex-1 min-w-0 overflow-y-auto">
         <div className="sticky top-0 z-30 flex items-center gap-3 px-4 py-2.5 bg-white border-b border-slate-200">
           <button onClick={()=>setNavOpen(true)} className="lg:hidden text-slate-600"><Menu size={22}/></button>
           {!isEmp ? <GlobalSearch data={data} go={setTab}/> : <div className="font-semibold text-sm text-slate-700">Team Portal</div>}
           <div className="flex-1"/>
-          <SaveStatus/>
           <NotifBell items={notes} go={setTab}/>
         </div>
         {/* sub-tab bar for grouped admin sections with more than one tab */}
@@ -584,6 +594,7 @@ export default function App() {
             {active==="expenses" && <EmpExpenses {...props}/>}
           </>)) : (<>
             {active==="dash" && <Dashboard {...props}/>}
+            {active==="todos" && <TeamTodos {...props}/>}
             {active==="chat" && <TeamChat session={session}/>}
             {active==="employees" && <Employees {...props}/>}
             {active==="users" && <UsersAccess {...props}/>}
@@ -693,11 +704,25 @@ function FirstRunSetup({ data, brand, onCreate }) {
 
 /* ---------------- login (username + password) ---------------- */
 function SaveStatus() {
-  const [st, setSt] = useState("saved");
-  useEffect(() => { onSaveStatus(setSt); return () => onSaveStatus(null); }, []);
-  if (st === "saving") return <span className="text-xs text-slate-400 flex items-center gap-1"><Loader2 size={12} className="animate-spin"/>Saving…</span>;
-  if (st === "error") return <span className="text-xs text-rose-600 font-medium flex items-center gap-1">⚠️ Not saved</span>;
-  return <span className="text-xs text-emerald-600 flex items-center gap-1"><Check size={12}/>Saved</span>;
+  // Floating toast: appears while saving, flashes "Saved", auto-hides. Errors stay until seen.
+  const [st, setSt] = useState(null);
+  const [show, setShow] = useState(false);
+  useEffect(() => {
+    let hideT;
+    onSaveStatus((v) => {
+      setSt(v); setShow(true);
+      clearTimeout(hideT);
+      if (v === "saved") hideT = setTimeout(()=>setShow(false), 1200);
+      if (v === "updating") {} // stays until reload
+    });
+    return () => onSaveStatus(null);
+  }, []);
+  if (!show || !st) return null;
+  const box = "fixed bottom-5 left-1/2 -translate-x-1/2 z-[100] px-4 py-2.5 rounded-full shadow-lg text-sm flex items-center gap-2 border";
+  if (st === "saving") return <div className={box+" bg-white border-slate-200 text-slate-600"}><Loader2 size={14} className="animate-spin text-sky-600"/>Saving…</div>;
+  if (st === "updating") return <div className={box+" bg-white border-sky-200 text-sky-700"}><Loader2 size={14} className="animate-spin"/>Updating to the latest version…</div>;
+  if (st === "error") return <div className={box+" bg-rose-600 border-rose-600 text-white"}>⚠️ Not saved — check connection</div>;
+  return <div className={box+" bg-emerald-600 border-emerald-600 text-white"}><Check size={14}/>Saved</div>;
 }
 function Login({ data, brand, onLogin }) {
   const [u, setU] = useState(""); const [p, setP] = useState(""); const [err, setErr] = useState("");
@@ -890,12 +915,13 @@ function CheckInCard({ data, mutateData, me }) {
     <div className="mt-3 text-xs text-slate-400">Check-in and check-out require being within {GEOFENCE_RADIUS_M}m of a Svype office.</div>
   </div></Card>);
 }
-function EmpDashboard({ data, update, mutateData, me }) {
+function EmpDashboard({ data, update, mutateData, session, me }) {
   const myClaims = data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===me.name && p.status!=="Paid").length;
   return (<>
     <Head title={`Hi, ${me.name.split(" ")[0]}`} sub={`${me.role} · ${me.dept}`}/>
     <div className="space-y-5">
       <CheckInCard data={data} mutateData={mutateData} me={me}/>
+      <TodoCard data={data} mutateData={mutateData} session={session} me={me}/>
       <div><div className="text-xs uppercase tracking-wider text-slate-500 mb-2 font-medium">Leave balance</div><LeaveBalances data={data} name={me.name}/></div>
       <Card><div className="px-5 py-4 border-b border-slate-200 font-semibold text-sm flex items-center gap-2"><Megaphone size={15} className="text-sky-600"/>Announcements</div>
         {data.announcements.length===0?<Empty msg="No announcements"/>:<div className="divide-y divide-slate-100">{data.announcements.map(an=>(<div key={an.id} className="px-5 py-3"><div className="font-medium text-sm">{an.title}</div><div className="text-sm text-slate-600 mt-0.5">{an.body}</div><div className="text-xs text-slate-400 mt-1">{an.date}</div></div>))}</div>}
@@ -1067,48 +1093,212 @@ function SlipModal({ slip, brand, onClose }) {
 }
 
 /* ================= ADMIN / HR ================= */
-function Dashboard({ data, role, go }) {
+
+// ===== Daily To-Do list =====
+// Each person plans their day; unfinished tasks carry to the next day automatically,
+// but a reason must be given for every missed task. HR & CEO track it in Team To-dos.
+function todoOwner(session, me) { return (me && me.name) || session?.name || session?.username || "User"; }
+function TodoCard({ data, mutateData, session, me }) {
+  const owner = todoOwner(session, me);
   const t = today();
+  const mine = (data.todos||[]).filter(x=>x.owner===owner);
+  const overdue = mine.filter(x=>!x.done && x.date < t);
+  const open = mine.filter(x=>!x.done && x.date === t);
+  const doneToday = mine.filter(x=>x.completedOn === t);
+  const [text, setText] = useState("");
+  const [reasons, setReasons] = useState({});
+  const [rErr, setRErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const add = async () => {
+    const v = text.trim(); if (!v) return;
+    setText("");
+    await mutateData((cur)=>({ ...cur, todos:[...(cur.todos||[]), { id:uid(), owner, text:v, date:t, createdOn:t, done:false, carry:0, reasons:[] }] }), null);
+  };
+  const toggle = (task) => mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).map(x=>x.id===task.id ? (x.done ? { ...x, done:false, completedOn:null, date:t } : { ...x, done:true, completedOn:t }) : x) }), task.done?null:`${owner} completed: ${task.text}`);
+  const del = (task) => mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).filter(x=>x.id!==task.id) }), null);
+  const carryAll = async () => {
+    if (overdue.some(x=>!(reasons[x.id]||"").trim())) { setRErr("Please give a reason for every task that wasn't completed."); return; }
+    setBusy(true); setRErr("");
+    await mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).map(x=>{
+      if (x.done || x.date >= t || x.owner!==owner) return x;
+      return { ...x, date:t, carry:(x.carry||0)+1, reasons:[...(x.reasons||[]), { missedOn:x.date, reason:(reasons[x.id]||"").trim(), givenOn:t }] };
+    }) }), `${owner} carried ${overdue.length} unfinished task(s) to today`);
+    setReasons({}); setBusy(false);
+  };
+  return (<Card><div className="p-5">
+    <div className="flex items-center justify-between mb-3"><div className="font-semibold text-sm flex items-center gap-2"><CalendarCheck size={16} className="text-sky-600"/>My tasks · today</div><div className="text-xs text-slate-400">{doneToday.length} done · {open.length} open</div></div>
+    <div className="flex gap-2 mb-3">
+      <input value={text} onChange={e=>setText(e.target.value)} onKeyDown={e=>e.key==="Enter"&&add()} placeholder="Write today's task and press Enter…" className={inputCls+" flex-1"}/>
+      <Btn onClick={add}><Plus size={15}/>Add</Btn>
+    </div>
+    {open.length===0 && doneToday.length===0 && <div className="text-sm text-slate-400 py-2">No tasks yet — plan your day above.</div>}
+    <div className="space-y-1">{open.map(x=>(
+      <div key={x.id} className="flex items-start gap-2 py-1.5 group">
+        <button onClick={()=>toggle(x)} className="mt-0.5 w-4 h-4 rounded border border-slate-300 hover:border-sky-500 shrink-0" title="Mark completed"/>
+        <div className="flex-1 text-sm text-slate-700">{x.text}
+          {x.carry>0 && <span className="ml-2 text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">carried {x.carry}d</span>}
+          {(x.reasons||[]).length>0 && <div className="text-xs text-slate-400 mt-0.5">last reason: {x.reasons[x.reasons.length-1].reason}</div>}
+        </div>
+        <button onClick={()=>del(x)} className="opacity-0 group-hover:opacity-100 text-slate-300 hover:text-rose-500"><X size={14}/></button>
+      </div>))}
+    </div>
+    {doneToday.length>0 && <div className="mt-3 pt-3 border-t border-slate-100">
+      <div className="text-xs uppercase tracking-wider text-slate-400 mb-1">Completed today</div>
+      {doneToday.map(x=>(<div key={x.id} className="flex items-start gap-2 py-1"><button onClick={()=>toggle(x)} className="mt-0.5 w-4 h-4 rounded bg-emerald-500 text-white grid place-items-center shrink-0" title="Undo"><Check size={11}/></button><div className="flex-1 text-sm text-slate-400 line-through">{x.text}</div></div>))}
+    </div>}
+    {overdue.length>0 && <Modal title={`${overdue.length} task(s) from earlier days not completed`} onClose={()=>{}}>
+      <p className="text-xs text-slate-500">These will be moved to today's list. Per policy, please give a reason each one wasn't completed — HR and management can see these reasons.</p>
+      <div className="space-y-3">{overdue.map(x=>(<div key={x.id} className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+        <div className="text-sm font-medium text-slate-800">{x.text}</div>
+        <div className="text-xs text-slate-400 mb-2">planned for {x.date}{x.carry>0?` · already carried ${x.carry}d`:""}</div>
+        <input value={reasons[x.id]||""} onChange={e=>{setReasons({...reasons,[x.id]:e.target.value});setRErr("");}} placeholder="Why wasn't this completed?" className={inputCls}/>
+      </div>))}</div>
+      {rErr && <div className="text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{rErr}</div>}
+      <Btn onClick={carryAll} disabled={busy}>{busy?<Loader2 size={15} className="animate-spin"/>:<Check size={15}/>}Save reasons & move to today</Btn>
+    </Modal>}
+  </div></Card>);
+}
+function TeamTodos({ data, go }) {
+  const [openP, setOpenP] = useState(null);
+  const [day, setDay] = useState("");
+  const t = today();
+  const todos = data.todos||[];
+  const owners = [...new Set([...data.employees.filter(e=>e.status==="Active").map(e=>e.name), ...todos.map(x=>x.owner)])];
+  const of = (n)=>todos.filter(x=>x.owner===n);
+  if (openP) {
+    const mine = of(openP);
+    const pending = mine.filter(x=>!x.done).sort((a,b)=>(b.date||"").localeCompare(a.date||""));
+    const completed = mine.filter(x=>x.done && (!day || x.completedOn===day)).sort((a,b)=>(b.completedOn||"").localeCompare(a.completedOn||""));
+    const plannedThatDay = day ? mine.filter(x=>x.createdOn<=day && (!x.done || (x.completedOn||"")>=day)) : [];
+    return (<>
+      <button onClick={()=>{setOpenP(null);setDay("");}} className="flex items-center gap-1 text-sm text-slate-500 hover:text-sky-600 mb-4"><ChevronLeft size={16}/>All team members</button>
+      <Head title={`${openP} · to-dos`} sub={`${pending.length} pending · ${mine.filter(x=>x.done).length} completed all-time`}/>
+      <div className="flex flex-wrap gap-3 mb-4 items-end"><div className="min-w-40"><Field label="Check a specific day" type="date" value={day} onChange={e=>setDay(e.target.value)}/></div>{day&&<Btn variant="ghost" onClick={()=>setDay("")}><X size={14}/>Clear</Btn>}</div>
+      {day && <Card><div className="p-4 text-sm text-slate-600">{plannedThatDay.length} task(s) on their list on {day} · {mine.filter(x=>x.completedOn===day).length} completed that day</div></Card>}
+      <div className="text-xs uppercase tracking-wider text-slate-500 font-medium mt-4 mb-2">Pending (carrying forward)</div>
+      <Card>{pending.length===0?<Empty msg="Nothing pending — all clear"/>:<div className="divide-y divide-slate-100">{pending.map(x=>(
+        <div key={x.id} className="px-5 py-3"><div className="flex items-center justify-between"><div className="text-sm font-medium text-slate-800">{x.text}</div><div className="text-xs text-slate-400">since {x.createdOn}{x.carry>0?` · carried ${x.carry}d`:""}</div></div>
+        {(x.reasons||[]).length>0 && <div className="mt-1.5 space-y-0.5">{x.reasons.map((r,i)=>(<div key={i} className="text-xs text-slate-500">• {r.missedOn}: <span className="text-slate-600">{r.reason}</span></div>))}</div>}
+        </div>))}</div>}</Card>
+      <div className="text-xs uppercase tracking-wider text-slate-500 font-medium mt-5 mb-2">Completed {day?`on ${day}`:""}</div>
+      <Card>{completed.length===0?<Empty msg={day?`Nothing completed on ${day}`:"Nothing completed yet"}/>:<Table cols={["Task","Planned on","Completed","Carried"]}>{completed.map(x=>(
+        <Row key={x.id}><Td className="text-slate-700">{x.text}{(x.reasons||[]).length>0&&<div className="text-xs text-slate-400 mt-0.5">{x.reasons.length} delay reason(s) on record</div>}</Td><Td className="text-slate-500">{x.createdOn}</Td><Td className="text-slate-500">{x.completedOn}</Td><Td>{x.carry>0?<span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">{x.carry}d late</span>:<span className="text-xs text-emerald-600">on time</span>}</Td></Row>))}</Table>}</Card>
+    </>);
+  }
+  return (<>
+    <Head title="Team To-dos" sub="Everyone's daily task lists · tap a person to see their plan, what's done, and reasons for delays"/>
+    <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">{owners.length===0?<Card><Empty msg="No team members yet"/></Card>:owners.map(n=>{
+      const mine=of(n); const openN=mine.filter(x=>!x.done&&x.date===t).length; const doneN=mine.filter(x=>x.completedOn===t).length;
+      const carrying=mine.filter(x=>!x.done&&(x.carry>0||x.date<t)).length; const planned=mine.some(x=>x.createdOn===t||x.date===t);
+      return (<Card key={n}><button onClick={()=>setOpenP(n)} className="p-5 text-left w-full hover:bg-slate-50 rounded-xl transition">
+        <div className="flex items-center justify-between"><div className="font-semibold">{n}</div>{planned?<span className="text-xs px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">planned today</span>:<span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">no plan yet</span>}</div>
+        <div className="text-xs text-slate-500 mt-2">{doneN} done · {openN} open today</div>
+        <div className={`text-xs mt-0.5 ${carrying?"text-amber-600":"text-slate-400"}`}>{carrying?`${carrying} task(s) carrying forward`:"nothing carrying over"}</div>
+      </button></Card>);
+    })}</div>
+  </>);
+}
+
+function Dashboard({ data, role, go, mutateData, session, me }) {
+  const t = today(); const mk = monthKey(); const ml = monthLabel();
   const activeEmp = data.employees.filter(e=>e.status==="Active");
+  // --- attendance today ---
   const att = data.attendance.filter(a=>a.date===t);
   const present = att.filter(a=>a.status==="Present").length;
   const onLeave = att.filter(a=>a.status==="Leave").length;
+  const absent = att.filter(a=>a.status==="Absent").length;
+  const notMarked = Math.max(0, activeEmp.length - att.length);
+  // --- requests: left vs handled ---
   const pendLeaves = data.leaves.filter(l=>l.status==="Pending").length;
+  const decidedMonth = data.leaves.filter(l=>l.status!=="Pending" && (l.decidedOn||"").startsWith(mk)).length;
   const pendCerts = (data.requests||[]).filter(r=>r.status!=="Done"&&r.status!=="Declined").length;
+  const certsDoneMonth = (data.requests||[]).filter(r=>r.status==="Done" && (r.decidedOn||"").startsWith(mk)).length;
   const pendClaims = data.payables.filter(p=>p.kind==="reimbursement"&&p.status==="Pending").length;
+  const claimsSettledMonth = data.payables.filter(p=>p.kind==="reimbursement"&&p.settled&&(p.due||"").startsWith(mk)).length;
   const pendReqs = pendLeaves + pendCerts + pendClaims;
+  // --- work today / this week ---
+  const weekAgo = new Date(Date.now()-6*86400000).toISOString().slice(0,10);
+  const workToday = (data.timesheets||[]).filter(w=>w.date===t);
+  const loggedTodayPeople = new Set(workToday.map(w=>w.employee)).size;
+  const hoursToday = workToday.reduce((s2,w)=>s2+(+w.hours||0),0);
+  const hoursWeek = (data.timesheets||[]).filter(w=>w.date>=weekAgo).reduce((s2,w)=>s2+(+w.hours||0),0);
+  const openWork = (data.timesheets||[]).filter(w=>w.status&&w.status!=="Completed").length;
+  // --- payroll this month ---
+  const slips = data.payroll.filter(p=>p.month===ml);
+  const slipsPaid = slips.filter(p=>p.paid).length;
+  // --- money ---
   const unpaidRet = data.retainerInvoices.filter(i=>i.status!=="Paid").length;
   const unpaidInv = data.invoices.filter(i=>i.status!=="Paid"&&i.status!=="Draft").length;
-  const overdueRecv = data.receivables.filter(r=>r.status==="Overdue").length;
-  const vbPending = (data.vendorBills||[]).filter(b=>b.status!=="Approved"&&b.status!=="Paid").length;
+  const unpaidAll = unpaidRet + unpaidInv;
+  const paidThisMonth = (data.receipts||[]).filter(r=>(r.date||"").startsWith(mk)).length;
+  const recvOverdue = data.receivables.filter(r=>r.status==="Overdue").length;
   const openPayables = data.payables.filter(p=>p.status!=="Paid");
+  const vbPending = (data.vendorBills||[]).filter(b=>b.status!=="Approved"&&b.status!=="Paid").length;
+  // --- compliance ---
   const expiring = data.employees.reduce((n,e)=>n+(e.docs||[]).filter(d=>d.expiry&&daysUntil(d.expiry)<=30).length,0);
-  const openWork = (data.timesheets||[]).filter(w=>w.status&&w.status!=="Completed").length;
+  const isAdmin = role === "admin";
   const mrr = data.retainers.filter(r=>r.status==="Active").reduce((s2,r)=>s2+ +r.amount,0);
   const stats = [
-    { label:"Team (active)", value:activeEmp.length, sub:`${present} present · ${onLeave} on leave today`, icon:Users, tab:"attendance" },
+    { label:"Team (active)", value:activeEmp.length, sub:`${present} present · ${onLeave} on leave · ${notMarked} not marked`, icon:Users, tab:"attendance" },
     { label:"Requests awaiting HR", value:pendReqs, sub:`${pendLeaves} leave · ${pendCerts} certificates · ${pendClaims} claims`, icon:Inbox, tab:"requests" },
-    { label:"Unpaid invoices", value:unpaidRet+unpaidInv, sub:`${unpaidRet} retainer · ${unpaidInv} one-off`, icon:FolderOpen, tab:"retainers" },
-    { label:"Retainer MRR (PKR)", value:fmt(mrr), sub:`${data.retainers.filter(r=>r.status==="Active").length} active retainers`, icon:Repeat, tab:"retainers" },
+    { label:"Unpaid invoices", value:unpaidAll, sub:`${paidThisMonth} paid so far in ${ml.split(" ")[0]}`, icon:FolderOpen, tab:"retainers" },
+    isAdmin
+      ? { label:"Retainer MRR (PKR)", value:fmt(mrr), sub:`${data.retainers.filter(r=>r.status==="Active").length} active retainers`, icon:Repeat, tab:"retainers" }
+      : { label:"Work logged today", value:`${loggedTodayPeople}/${activeEmp.length}`, sub:`${hoursToday}h today · ${hoursWeek}h this week`, icon:Clock, tab:"timesheets" },
   ];
-  const lines = [
-    pendLeaves && { text:`${pendLeaves} leave request${pendLeaves>1?"s":""} awaiting approval`, tab:"requests" },
-    pendCerts && { text:`${pendCerts} certificate request${pendCerts>1?"s":""} open`, tab:"requests" },
-    pendClaims && { text:`${pendClaims} expense claim${pendClaims>1?"s":""} to review`, tab:"payables" },
-    (unpaidRet+unpaidInv) && { text:`${unpaidRet+unpaidInv} invoice${unpaidRet+unpaidInv>1?"s":""} unpaid`, tab:"retainers" },
-    overdueRecv && { text:`${overdueRecv} receivable${overdueRecv>1?"s":""} overdue`, tab:"receivables" },
-    vbPending && { text:`${vbPending} vendor bill${vbPending>1?"s":""} awaiting approval`, tab:"vendorbills" },
-    openPayables.length && { text:`${openPayables.length} payable${openPayables.length>1?"s":""} open (${fmt(openPayables.reduce((s2,p)=>s2+ +p.amount,0))})`, tab:"payables" },
-    openWork && { text:`${openWork} work item${openWork>1?"s":""} in progress`, tab:"timesheets" },
-    expiring && { text:`${expiring} employee document${expiring>1?"s":""} expiring within 30 days`, tab:"employees" },
-    (activeEmp.length-att.length)>0 && { text:`${activeEmp.length-att.length} team member${activeEmp.length-att.length>1?"s":""} not marked today`, tab:"attendance" },
-  ].filter(Boolean);
+  const ok = (v) => v===0;
+  const Line = ({label, value, good, tab}) => (
+    <button onClick={()=>tab&&go(tab)} className="w-full flex items-center justify-between py-1.5 text-sm hover:bg-slate-50 rounded px-1 text-left">
+      <span className="text-slate-600">{label}</span>
+      <span className={`font-semibold ${good?"text-emerald-600":"text-slate-900"}`}>{good?"✓ clear":value}</span>
+    </button>);
+  const Panel = ({title, tab, children}) => (
+    <Card><div className="p-5">
+      <div className="flex items-center justify-between mb-2"><div className="font-semibold text-sm">{title}</div><button onClick={()=>go(tab)} className="text-xs text-sky-600 hover:underline">open →</button></div>
+      <div className="divide-y divide-slate-100">{children}</div>
+    </div></Card>);
   return (<>
     <Head title="Dashboard" sub={`Welcome back · ${ROLES[role]} · ${new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long"})}`}/>
+    <div className="mb-6"><TodoCard data={data} mutateData={mutateData} session={session} me={me}/></div>
     <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">{stats.map(s2=>{const I=s2.icon;return(<Card key={s2.label}><button onClick={()=>go(s2.tab)} className="p-5 text-left w-full hover:bg-slate-50 rounded-xl transition"><I className="text-sky-600 mb-3" size={20}/><div className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900 break-words">{s2.value}</div><div className="text-xs text-slate-500 mt-1">{s2.label}</div><div className="text-xs text-slate-400 mt-0.5">{s2.sub}</div></button></Card>);})}</div>
-    <Card><div className="px-5 py-4 border-b border-slate-200 font-semibold text-sm">The bigger picture</div>
-      {lines.length===0?<Empty msg="Nothing pending — you're all caught up"/>:<div className="divide-y divide-slate-100">{lines.map((n,i)=>(<button key={i} onClick={()=>go(n.tab)} className="w-full text-left px-5 py-3 text-sm hover:bg-slate-50 flex items-center justify-between"><span>{n.text}</span><span className="text-xs text-sky-600">open →</span></button>))}</div>}
-    </Card></>);
+    <div className="grid md:grid-cols-2 xl:grid-cols-3 gap-4">
+      <Panel title="Attendance · today" tab="attendance">
+        <Line label="Present" value={present} tab="attendance"/>
+        <Line label="On leave" value={onLeave} good={ok(onLeave)} tab="attendance"/>
+        <Line label="Absent" value={absent} good={ok(absent)} tab="attendance"/>
+        <Line label="Not marked yet" value={notMarked} good={ok(notMarked)} tab="attendance"/>
+      </Panel>
+      <Panel title="HR requests · pending vs handled" tab="requests">
+        <Line label="Leave awaiting approval" value={pendLeaves} good={ok(pendLeaves)} tab="requests"/>
+        <Line label="Certificates open" value={pendCerts} good={ok(pendCerts)} tab="requests"/>
+        <Line label="Expense claims to review" value={pendClaims} good={ok(pendClaims)} tab="payables"/>
+        <Line label={`Handled in ${ml.split(" ")[0]}`} value={decidedMonth+certsDoneMonth+claimsSettledMonth} tab="requests"/>
+      </Panel>
+      <Panel title="Work & timesheets" tab="timesheets">
+        <Line label="Logged work today" value={`${loggedTodayPeople} of ${activeEmp.length}`} tab="timesheets"/>
+        <Line label="Hours today" value={`${hoursToday}h`} tab="timesheets"/>
+        <Line label="Hours this week" value={`${hoursWeek}h`} tab="timesheets"/>
+        <Line label="Work items in progress" value={openWork} good={ok(openWork)} tab="timesheets"/>
+      </Panel>
+      <Panel title={`Payroll · ${ml}`} tab="payroll">
+        <Line label="Salary slips prepared" value={`${slips.length} of ${activeEmp.length}`} tab="payroll"/>
+        <Line label="Paid" value={slipsPaid} tab="payroll"/>
+        <Line label="Awaiting payment" value={slips.length-slipsPaid} good={slips.length>0&&slips.length-slipsPaid===0} tab="payroll"/>
+      </Panel>
+      <Panel title="Billing & money" tab="retainers">
+        <Line label="Invoices unpaid (retainer + one-off)" value={unpaidAll} good={ok(unpaidAll)} tab="retainers"/>
+        <Line label={`Payments received in ${ml.split(" ")[0]}`} value={paidThisMonth} tab="receipts"/>
+        <Line label="Receivables overdue" value={recvOverdue} good={ok(recvOverdue)} tab="receivables"/>
+        <Line label="Payables open" value={`${openPayables.length}${openPayables.length?` · ${fmt(openPayables.reduce((s2,p)=>s2+ +p.amount,0))}`:""}`} good={ok(openPayables.length)} tab="payables"/>
+        <Line label="Vendor bills awaiting approval" value={vbPending} good={ok(vbPending)} tab="vendorbills"/>
+      </Panel>
+      <Panel title="Compliance & documents" tab="employees">
+        <Line label="Employee documents expiring ≤30 days" value={expiring} good={ok(expiring)} tab="employees"/>
+        <Line label="Announcements posted" value={(data.announcements||[]).length} tab="announce"/>
+        <Line label="Clients on record" value={data.clients.length} tab="clients"/>
+      </Panel>
+    </div>
+  </>);
 }
 
 

@@ -9,10 +9,12 @@ const router = express.Router();
 // every PUT must state the rev it based its changes on; if the server has moved
 // on, the write is rejected (409) and the client re-applies its change on the
 // latest doc and retries.
+// NOTE: keep SERVER_BUILD in sync with APP_BUILD in client/src/App.jsx on every release.
+const SERVER_BUILD = "Build 27 Jul 2026 · sync-v2";
 router.get("/", auth, async (req, res) => {
   const r = await pool.query("SELECT doc, brand, rev FROM app_state WHERE id=1");
-  if (!r.rowCount) return res.json({ doc: null, brand: null, rev: 0 });
-  res.json({ doc: r.rows[0].doc, brand: r.rows[0].brand, rev: +r.rows[0].rev });
+  if (!r.rowCount) return res.json({ doc: null, brand: null, rev: 0, build: SERVER_BUILD });
+  res.json({ doc: r.rows[0].doc, brand: r.rows[0].brand, rev: +r.rows[0].rev, build: SERVER_BUILD });
 });
 
 router.put("/", auth, async (req, res) => {

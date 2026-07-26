@@ -52,8 +52,16 @@ app.use("/api/requests", crud("requests", ["employee","type","note","status","da
 
 // serve built frontend
 const clientDist = path.join(__dirname, "..", "..", "client", "dist");
-app.use(express.static(clientDist));
-app.get(/^(?!\/api).*/, (req, res) => res.sendFile(path.join(clientDist, "index.html")));
+// Hashed assets (js/css) may be cached forever; the app shell (index.html) must NEVER be
+// cached, so every visit picks up the newest build. Stale cached builds on employee phones
+// were overwriting fresh data with old lists.
+app.use(express.static(clientDist, {
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith(".html")) res.setHeader("Cache-Control", "no-store, must-revalidate");
+    else res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  },
+}));
+app.get(/^(?!\/api).*/, (req, res) => { res.setHeader("Cache-Control", "no-store, must-revalidate"); res.sendFile(path.join(clientDist, "index.html")); });
 
 // ---- HTTP + WebSocket ----
 const server = http.createServer(app);
