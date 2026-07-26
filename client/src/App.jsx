@@ -41,13 +41,37 @@ const DB = {
   },
 };
 
+
+// 3-way merge for list saves. A module hands us the list as ITS tab last saw it (before)
+// and the list it wants (next). We derive exactly what was added / edited / deleted and
+// apply ONLY those changes to the freshest list (current). Rows added meanwhile by anyone
+// else always survive — a slightly-stale tab can no longer wipe other people's entries.
+function mergeRows(current, before, next) {
+  if (!Array.isArray(current) || !Array.isArray(before) || !Array.isArray(next)) return next;
+  if (next.some(r=>!r || r.id==null) || before.some(r=>!r || r.id==null) || current.some(r=>!r || r.id==null)) return next;
+  const beforeIds = new Map(before.map(r=>[r.id, r]));
+  const nextIds = new Map(next.map(r=>[r.id, r]));
+  // deletions this tab explicitly made: present before, absent in next
+  let out = current.filter(r=> !(beforeIds.has(r.id) && !nextIds.has(r.id)) );
+  // edits: rows this tab still lists — take its version
+  const outIds = new Set(out.map(r=>r.id));
+  out = out.map(r=> nextIds.has(r.id) ? nextIds.get(r.id) : r);
+  // additions: rows this tab has that the fresh list doesn't
+  const additions = next.filter(r=>!outIds.has(r.id));
+  if (additions.length) {
+    const firstIsNew = next.length && !outIds.has(next[0].id);
+    out = firstIsNew ? [...additions, ...out] : [...out, ...additions];
+  }
+  return out;
+}
+
 // ===== Conflict-safe save queue =====
 // Every save states which server revision it was based on. If another tab/user saved
 // in the meantime, the server rejects (409) and returns the latest doc; we re-apply
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 26 Jul 2026 · leave-v1";
+const APP_BUILD = "Build 26 Jul 2026 · processing-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -69,28 +93,43 @@ async function _putState(doc, baseRev) {
   if (!res.ok) throw new Error(data.error || "Save failed");
   return { conflict: false, rev: +data.rev || 0 };
 }
-function enqueueSave(mutate, onMerged) { _saveQueue.push({ mutate, onMerged }); _setSaveStatus("saving"); _drainSaves(); }
+function enqueueSave(mutate, onMerged) {
+  // Returns a promise that resolves only when the SERVER has confirmed this save —
+  // so buttons can show "Processing…" until the change is truly persisted.
+  return new Promise((resolve, reject) => {
+    _saveQueue.push({ mutate, onMerged, resolve, reject });
+    _setSaveStatus("saving");
+    _drainSaves();
+  });
+}
 async function _drainSaves() {
   if (_saving) return; _saving = true;
   try {
     while (_saveQueue.length) {
-      const { mutate, onMerged } = _saveQueue.shift();
-      let attempts = 0, done = false, hadConflict = false;
-      while (!done && attempts < 6) {
-        attempts++;
-        const next = mutate(_serverDoc || undefined);
-        const r = await _putState(next, _rev);
-        if (r.conflict) { hadConflict = true; _serverDoc = r.doc; _rev = r.rev; continue; }
-        _serverDoc = next; _rev = r.rev; _stateCache.doc = next; done = true;
-        if (hadConflict && onMerged) onMerged(next); // re-sync UI with merged result
+      const item = _saveQueue.shift();
+      const { mutate, onMerged, resolve, reject } = item;
+      try {
+        let attempts = 0, done = false, hadConflict = false;
+        while (!done && attempts < 6) {
+          attempts++;
+          const next = mutate(_serverDoc || undefined);
+          const r = await _putState(next, _rev);
+          if (r.conflict) { hadConflict = true; _serverDoc = r.doc; _rev = r.rev; continue; }
+          _serverDoc = next; _rev = r.rev; _stateCache.doc = next; done = true;
+          if (hadConflict && onMerged) onMerged(next); // re-sync UI with merged result
+        }
+        if (!done) throw new Error("could not save after several retries");
+        resolve && resolve(true);
+      } catch (e) {
+        reject && reject(e);
+        // fail the rest of the queue too so callers aren't left hanging
+        _saveQueue.forEach(q=>q.reject && q.reject(e)); _saveQueue = [];
+        _setSaveStatus("error");
+        alert("⚠️ Your last change could NOT be saved to the server, so it will be lost on refresh.\n\nPlease sign out and back in, then try again. If it keeps happening, check your internet connection.\n\n(Technical detail: " + (e?.message || "save failed") + ")");
+        return;
       }
-      if (!done) throw new Error("could not save after several retries");
     }
     _setSaveStatus("saved");
-  } catch (e) {
-    _saveQueue = [];
-    _setSaveStatus("error");
-    alert("⚠️ Your last change could NOT be saved to the server, so it will be lost on refresh.\n\nPlease sign out and back in, then try again. If it keeps happening, check your internet connection.\n\n(Technical detail: " + (e?.message || "save failed") + ")");
   } finally { _saving = false; }
 }
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -270,13 +309,14 @@ function adminNotes(data) {
   data.retainerInvoices.filter(i=>i.status!=="Paid").forEach(i=>out.push({ text:`${i.client}: retainer ${fmt(i.total,i.currency)} unpaid`, tab:"retainers" }));
   data.receivables.filter(r=>r.status==="Overdue").forEach(r=>out.push({ text:`${r.client}: receivable overdue`, tab:"receivables" }));
   data.payables.filter(p=>p.kind==="reimbursement" && p.status==="Pending").forEach(p=>out.push({ text:`${p.vendor}: reimbursement to approve`, tab:"payables" }));
-  data.leaves.filter(l=>l.status==="Pending").forEach(l=>out.push({ text:`${l.employee}: ${l.type||""} leave ${l.from} → ${l.to} (${dayCount(l.from,l.to)}d) awaiting approval`, tab:"attendance" }));
+  data.leaves.filter(l=>l.status==="Pending").forEach(l=>out.push({ text:`${l.employee}: ${l.type||""} leave ${l.from} → ${l.to} (${dayCount(l.from,l.to)}d) awaiting approval`, tab:"requests" }));
   data.requests.filter(r=>r.status!=="Done").forEach(r=>out.push({ text:`${r.employee}: ${r.type}`, tab:"requests" }));
   data.employees.forEach(e=>(e.docs||[]).forEach(d=>{ if(d.expiry){ const dd=daysUntil(d.expiry); if(dd<=30) out.push({ text:`${e.name}: ${d.name} ${dd<0?"expired":"expires in "+dd+"d"}`, tab:"employees" }); }}));
   return out;
 }
 function empNotes(data, me) {
   const out = [];
+  (data.requests||[]).filter(r=>r.employee===me.name && r.status==="Done").slice(0,3).forEach(r=>out.push({ text:`Your ${r.type} is ready — collect it from HR`, tab:"payslips" }));
   [...data.leaves].filter(l=>l.employee===me.name && l.status!=="Pending").sort((a,b)=>(b.decidedOn||"").localeCompare(a.decidedOn||"")).slice(0,5).forEach(l=>out.push({ text:`Your ${l.type||""} leave (${l.from} → ${l.to}) was ${l.status==="Approved"?"approved ✓":"declined"}`, tab:"attendance" }));
   data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===me.name && p.status!=="Pending").slice(0,5).forEach(p=>out.push({ text:`Expense claim: ${p.status}`, tab:"expenses" }));
   return out;
@@ -310,7 +350,7 @@ const NAV = [
   { id:"cvbank", label:"CV Bank", icon:FolderOpen },
   { id:"offers", label:"Offer Letters", icon:FileSignature },
   { id:"letters", label:"Letters & Certificates", icon:ScrollText },
-  { id:"requests", label:"Requests", icon:Inbox },
+  { id:"requests", label:"HR Requests", icon:Inbox },
   { id:"announce", label:"Announcements", icon:Megaphone },
   { id:"proposals", label:"Proposals", icon:FileText },
   { id:"quotations", label:"Quotations", icon:Receipt },
@@ -343,7 +383,7 @@ const TAB_LABELS = {
   clients:"Clients", proposals:"Proposals", quotations:"Quotations", retainers:"Retainers", invoices:"Invoices", receipts:"Receipts",
   payables:"Payables", receivables:"Receivables", vendorbills:"Vendor Bills", accounts:"Bank Accounts",
   offers:"Offer Letters", letters:"Letters & Certificates", meetings:"Meeting Notes",
-  requests:"Requests", announce:"Announcements", timesheets:"Work & Timesheets",
+  requests:"HR Requests", announce:"Announcements", timesheets:"Work & Timesheets",
   users:"Users & Access", permissions:"Permissions", vault:"Vault", brand:"Brand & Signatures", audit:"Activity Log", backup:"Backup & Data",
 };
 const groupOfTab = (tabId) => NAV_GROUPS.find(g => g.tabs.includes(tabId)) || NAV_GROUPS[0];
@@ -369,6 +409,7 @@ export default function App() {
   const [tab, setTab] = useState("dash");
   const [navOpen, setNavOpen] = useState(false);
   const [data, setData] = useState(SEED);
+  const dataRef = useRef(SEED); dataRef.current = data;
   const [brand, setBrand] = useState(SEED_BRAND);
   const [needsSetup, setNeedsSetup] = useState(false);
   const [serverHasFounders, setServerHasFounders] = useState(null); // null = unknown yet
@@ -408,8 +449,10 @@ export default function App() {
       } catch {}
     };
     const iv = setInterval(tick, 60000);
+    const onVis = () => { if (document.visibilityState === "visible") tick(); };
     window.addEventListener("focus", tick);
-    return () => { clearInterval(iv); window.removeEventListener("focus", tick); };
+    document.addEventListener("visibilitychange", onVis); // phones fire this when you return to the app
+    return () => { clearInterval(iv); window.removeEventListener("focus", tick); document.removeEventListener("visibilitychange", onVis); };
   }, []);
 
   const role = session?.role || null;
@@ -425,11 +468,16 @@ export default function App() {
       return next;
     };
     setData((cur) => fullMutate(cur));                       // instant UI update
-    enqueueSave(fullMutate, (merged) => setData({ ...SEED, ...merged })); // conflict-safe persist
+    return enqueueSave(fullMutate, (merged) => setData({ ...SEED, ...merged })); // resolves when server confirms
   };
   const persist = (n) => commit(() => n);
-  const update = (k, rows, audit) => commit((cur) => ({ ...cur, [k]: rows }), audit);
-  const patch = (obj, audit) => commit((cur) => ({ ...cur, ...obj }), audit);
+  const update = (k, rows, audit) => {
+    // Capture what this tab believed the list was at the moment of saving, so mergeRows can
+    // compute the tab's actual adds/edits/deletes and apply only those to the freshest data.
+    const before = (dataRef.current && dataRef.current[k]) || [];
+    return commit((cur) => ({ ...cur, [k]: mergeRows(cur[k] || [], before, rows) }), audit);
+  };
+  const patch = (obj, audit) => { return commit((cur) => ({ ...cur, ...obj }), audit); };
   const saveBrand = (b) => { setBrand(b); DB.set("svype_brand", b); };
   const restore = (db, br) => { if (db) commit(() => ({ ...SEED, ...db })); if (br) saveBrand(br); };
   const wipe = () => { const fresh = JSON.parse(JSON.stringify(SEED)); DB.set("svype_db", fresh); DB.set("svype_brand", SEED_BRAND); setData(fresh); setBrand(SEED_BRAND); setSession(null); setTab("dash"); };
@@ -880,7 +928,9 @@ function EmpAttendance({ data, update, mutateData, me }) {
   const myLeaves = data.leaves.filter(l=>l.employee===me.name);
   const myAtt = data.attendance.filter(a=>a.employee===me.name).slice().reverse().slice(0,10);
   const [lerr, setLerr] = useState("");
-  const save = (l)=>{
+  const [submitting, setSubmitting] = useState(false);
+  const [sentMsg, setSentMsg] = useState("");
+  const save = async (l)=>{
     const days = dayCount(l.from, l.to);
     if (!days || days < 1) { setLerr("Pick a valid date range."); return; }
     if (l.type==="Bereavement" && days > 3) { setLerr("Bereavement leave is 3 days per qualifying event. For more time, please speak to HR."); return; }
@@ -888,13 +938,19 @@ function EmpAttendance({ data, update, mutateData, me }) {
       const left = leaveLeft(data, me.name, l.type);
       if (days > left) { setLerr(`You have ${Math.max(0,left)} ${l.type.toLowerCase()} day(s) left this year — this request is ${days} day(s).`); return; }
     }
-    mutateData((cur)=>({ ...cur, leaves: [...(cur.leaves||[]), { ...l, days, id:uid(), requestedOn: today() }] }), `${me.name} requested ${l.type} leave (${l.from} → ${l.to})`);
-    setLf(null); setLerr("");
+    setSubmitting(true);
+    try {
+      await mutateData((cur)=>({ ...cur, leaves: [...(cur.leaves||[]), { ...l, days, id:uid(), requestedOn: today() }] }), `${me.name} requested ${l.type} leave (${l.from} → ${l.to})`);
+      setLf(null); setLerr(""); setSentMsg("Leave request sent to HR — you'll be notified once it's approved or declined.");
+      setTimeout(()=>setSentMsg(""), 7000);
+    } catch { setLerr("Couldn't reach the server — please try again."); }
+    setSubmitting(false);
   };
   return (<>
     <Head title="Attendance & Leave" sub="Check in, track your days, request leave"/>
     <div className="space-y-5">
       <CheckInCard data={data} mutateData={mutateData} me={me}/>
+      {sentMsg && <div className="text-sm text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 flex items-center gap-2"><Check size={15}/>{sentMsg}</div>}
       <LeaveBalances data={data} name={me.name}/>
       <div className="flex justify-between items-center"><div className="text-xs uppercase tracking-wider text-slate-500 font-medium">My leave requests</div><Btn onClick={()=>setLf(blank)}><Plus size={15}/>Request leave</Btn></div>
       <Card><Table cols={["Type","From","To","Days","Status"]}>{myLeaves.length===0?<tr><td colSpan={5}><Empty msg="No leave requests yet"/></td></tr>:myLeaves.map(l=>(<Row key={l.id}><Td>{l.type}{l.reason&&<div className="text-xs text-slate-400 max-w-[180px] truncate">{l.reason}</div>}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td><Pill s={l.status}/>{l.decidedOn&&l.status!=="Pending"&&<div className="text-xs text-slate-400 mt-0.5">{l.status.toLowerCase()} {l.decidedOn}</div>}</Td></Row>))}</Table></Card>
@@ -908,7 +964,7 @@ function EmpAttendance({ data, update, mutateData, me }) {
       {lf.type==="Sick" && dayCount(lf.from,lf.to)>2 && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">Per policy: more than 2 consecutive sick days requires a medical report to HR.</div>}
       <Area label="Reason" value={lf.reason} onChange={e=>setLf({...lf,reason:e.target.value})}/>
       {lerr && <div className="text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{lerr}</div>}
-      <Btn onClick={()=>save(lf)}><Check size={15}/>Submit request</Btn>
+      <Btn onClick={()=>save(lf)} disabled={submitting}>{submitting?<Loader2 size={15} className="animate-spin"/>:<Check size={15}/>}{submitting?"Submitting…":"Submit request"}</Btn>
       <p className="text-xs text-slate-400">Your request goes to HR. You'll be notified here (bell icon) once it's approved or declined.</p>
     </Modal>}
   </>);
@@ -916,10 +972,24 @@ function EmpAttendance({ data, update, mutateData, me }) {
 function EmpPayslips({ data, update, mutateData, brand, me }) {
   const [slip, setSlip] = useState(null);
   const slips = data.payroll.filter(p=>p.employee===me.name);
-  const requestCert = (type) => mutateData((cur)=>({ ...cur, requests:[{ id:uid(), employee:me.name, type, status:"Requested", date:today() }, ...(cur.requests||[])] }), `${me.name} requested ${type}`);
+  const [sent, setSent] = useState("");
+  const myReqs = (data.requests||[]).filter(r=>r.employee===me.name);
+  const [sending, setSending] = useState(false);
+  const requestCert = async (type) => {
+    setSending(true);
+    try {
+      await mutateData((cur)=>({ ...cur, requests:[{ id:uid(), employee:me.name, type, status:"Requested", date:today() }, ...(cur.requests||[])] }), `${me.name} requested ${type}`);
+      setSent(`${type} request sent to HR — you'll be notified when it's ready.`);
+      setTimeout(()=>setSent(""), 6000);
+    } catch { setSent(""); alert("Couldn't reach the server — please try again."); }
+    setSending(false);
+  };
   return (<>
     <Head title="Payslips" sub="Download your slips or request a certificate"/>
-    <div className="flex flex-wrap gap-2 mb-4"><Btn variant="ghost" onClick={()=>requestCert("Salary Certificate")}><FileSignature size={15}/>Request salary certificate</Btn><Btn variant="ghost" onClick={()=>requestCert("Experience Certificate")}><ScrollText size={15}/>Request experience certificate</Btn></div>
+    <div className="flex flex-wrap gap-2 mb-2"><Btn variant="ghost" disabled={sending} onClick={()=>requestCert("Salary Certificate")}>{sending?<Loader2 size={15} className="animate-spin"/>:<FileSignature size={15}/>}Request salary certificate</Btn><Btn variant="ghost" disabled={sending} onClick={()=>requestCert("Experience Certificate")}>{sending?<Loader2 size={15} className="animate-spin"/>:<ScrollText size={15}/>}Request experience certificate</Btn></div>
+    {sent && <div className="mb-3 text-sm text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 flex items-center gap-2"><Check size={15}/>{sent}</div>}
+    {myReqs.length>0 && <div className="mb-4"><div className="text-xs uppercase tracking-wider text-slate-500 font-medium mb-2">My certificate requests</div>
+      <Card><Table cols={["Request","Sent","Status"]}>{myReqs.map(r=>(<Row key={r.id}><Td className="font-medium">{r.type}</Td><Td className="text-slate-500">{r.date}</Td><Td><Pill s={r.status}/>{r.decidedOn&&r.status==="Done"&&<div className="text-xs text-slate-400 mt-0.5">done {r.decidedOn}</div>}</Td></Row>))}</Table></Card></div>}
     <Card><Table cols={["Month","Net pay","Status",""]}>{slips.length===0?<tr><td colSpan={4}><Empty msg="No payslips yet"/></td></tr>:slips.map(p=>(<Row key={p.id}><Td className="font-medium">{p.month}</Td><Td>{fmt(netPay(p))}</Td><Td><Pill s={p.paid?"Paid":"Pending"}/></Td><Td><button onClick={()=>setSlip(p)} className="text-sky-600 text-xs font-medium hover:underline">View / download</button></Td></Row>))}</Table></Card>
     {slip && <SlipModal slip={slip} brand={brand} onClose={()=>setSlip(null)}/>}
   </>);
@@ -951,11 +1021,11 @@ function EmpExpenses({ data, update, me }) {
   const [f, setF] = useState({ desc:"", amount:"", receipt:null });
   const [err, setErr] = useState("");
   const mine = data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===me.name);
-  const onReceipt = async (file) => { if (file) { setF({ ...f, receipt: await readImage(file, 900) }); setErr(""); } };
+  const onReceipt = async (file) => { if (file) { const isImg=file.type.startsWith("image/"); setF({ ...f, receipt: isImg ? await readImage(file, 1400, true, 0.8) : await readFile(file), receiptName:file.name, receiptIsImg:isImg }); setErr(""); } };
   const submit = () => {
     if (!f.desc || !f.amount) { setErr("Please add a description and amount."); return; }
     if (!f.receipt) { setErr("A photo of the bill/receipt is required to submit a claim."); return; }
-    update("payables", [{ id:uid(), vendor:me.name, desc:"Reimbursement: "+f.desc, amount:+f.amount, due:today(), status:"Pending", kind:"reimbursement", settled:false, receipt:f.receipt }, ...data.payables], `${me.name} submitted an expense claim`);
+    update("payables", [{ id:uid(), vendor:me.name, desc:"Reimbursement: "+f.desc, amount:+f.amount, due:today(), status:"Pending", kind:"reimbursement", settled:false, receipt:f.receipt, receiptName:f.receiptName }, ...data.payables], `${me.name} submitted an expense claim`);
     setF({ desc:"", amount:"", receipt:null }); setErr("");
   };
   return (<>
@@ -965,13 +1035,13 @@ function EmpExpenses({ data, update, me }) {
         <Field label="What was it for?" value={f.desc} onChange={e=>setF({...f,desc:e.target.value})} placeholder="e.g. Client meeting fuel, props for shoot"/>
         <Field label="Amount (PKR)" type="number" value={f.amount} onChange={e=>setF({...f,amount:e.target.value})}/>
         <div><span className="text-xs text-slate-500 mb-1 block">Receipt / bill photo <span className="text-rose-500">*required</span></span>
-          <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500"><Paperclip size={15}/>{f.receipt?"Receipt attached":"Attach receipt / bill"}<input type="file" accept="image/*" className="hidden" onChange={e=>onReceipt(e.target.files[0])}/></label>
-          {f.receipt && <img src={f.receipt} className="mt-2 h-28 rounded-lg border border-slate-200 object-cover"/>}
+          <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500"><Paperclip size={15}/>{f.receipt?"Receipt attached":"Attach receipt / bill"}<input type="file" accept="image/*,application/pdf" className="hidden" onChange={e=>onReceipt(e.target.files[0])}/></label>
+          {f.receipt && (f.receiptIsImg!==false ? <button onClick={()=>openDataUrl(f.receipt, f.receiptName)} className="block mt-2"><img src={f.receipt} className="h-28 rounded-lg border border-slate-200 object-cover"/></button> : <button onClick={()=>openDataUrl(f.receipt, f.receiptName)} className="mt-2 flex items-center gap-2 text-sm text-sky-600 hover:underline"><FileText size={15}/>{f.receiptName||"Attached file"} ↗</button>)}
         </div>
         {err && <div className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{err}</div>}
         <Btn onClick={submit}><Check size={15}/>Submit claim</Btn>
       </div></Card>
-      <Card><Table cols={["Description","Amount","Status"]}>{mine.length===0?<tr><td colSpan={3}><Empty msg="No claims submitted"/></td></tr>:mine.map(p=>(<Row key={p.id}><Td className="font-medium">{p.desc.replace("Reimbursement: ","")}</Td><Td>{fmt(p.amount)}</Td><Td><Pill s={p.status}/></Td></Row>))}</Table></Card>
+      <Card><Table cols={["Description","Amount","Status"]}>{mine.length===0?<tr><td colSpan={3}><Empty msg="No claims submitted"/></td></tr>:mine.map(p=>(<Row key={p.id}><Td className="font-medium"><div className="flex items-center gap-2">{p.receipt&&<button onClick={()=>openDataUrl(p.receipt, p.receiptName||"receipt")} title="Open receipt"><img src={p.receipt} className="w-8 h-8 rounded object-cover border border-slate-200 hover:ring-2 hover:ring-sky-400"/></button>}{p.desc.replace("Reimbursement: ","")}</div></Td><Td>{fmt(p.amount)}</Td><Td><Pill s={p.status}/></Td></Row>))}</Table></Card>
     </div></>);
 }
 
@@ -998,19 +1068,46 @@ function SlipModal({ slip, brand, onClose }) {
 
 /* ================= ADMIN / HR ================= */
 function Dashboard({ data, role, go }) {
-  const mrr = data.retainers.filter(r=>r.status==="Active").reduce((s,r)=>s+ +r.amount,0);
+  const t = today();
+  const activeEmp = data.employees.filter(e=>e.status==="Active");
+  const att = data.attendance.filter(a=>a.date===t);
+  const present = att.filter(a=>a.status==="Present").length;
+  const onLeave = att.filter(a=>a.status==="Leave").length;
+  const pendLeaves = data.leaves.filter(l=>l.status==="Pending").length;
+  const pendCerts = (data.requests||[]).filter(r=>r.status!=="Done"&&r.status!=="Declined").length;
+  const pendClaims = data.payables.filter(p=>p.kind==="reimbursement"&&p.status==="Pending").length;
+  const pendReqs = pendLeaves + pendCerts + pendClaims;
+  const unpaidRet = data.retainerInvoices.filter(i=>i.status!=="Paid").length;
+  const unpaidInv = data.invoices.filter(i=>i.status!=="Paid"&&i.status!=="Draft").length;
+  const overdueRecv = data.receivables.filter(r=>r.status==="Overdue").length;
+  const vbPending = (data.vendorBills||[]).filter(b=>b.status!=="Approved"&&b.status!=="Paid").length;
+  const openPayables = data.payables.filter(p=>p.status!=="Paid");
+  const expiring = data.employees.reduce((n,e)=>n+(e.docs||[]).filter(d=>d.expiry&&daysUntil(d.expiry)<=30).length,0);
+  const openWork = (data.timesheets||[]).filter(w=>w.status&&w.status!=="Completed").length;
+  const mrr = data.retainers.filter(r=>r.status==="Active").reduce((s2,r)=>s2+ +r.amount,0);
   const stats = [
-    { label:"Active employees", value:data.employees.filter(e=>e.status==="Active").length, icon:Users },
-    { label:"Clients", value:data.clients.length, icon:Contact },
-    { label:"Retainer MRR (PKR)", value:fmt(mrr), icon:Repeat },
-    { label:"Payables", value:fmt(data.payables.filter(p=>p.status!=="Paid").reduce((s,p)=>s+ +p.amount,0)), icon:ArrowUpCircle },
+    { label:"Team (active)", value:activeEmp.length, sub:`${present} present · ${onLeave} on leave today`, icon:Users, tab:"attendance" },
+    { label:"Requests awaiting HR", value:pendReqs, sub:`${pendLeaves} leave · ${pendCerts} certificates · ${pendClaims} claims`, icon:Inbox, tab:"requests" },
+    { label:"Unpaid invoices", value:unpaidRet+unpaidInv, sub:`${unpaidRet} retainer · ${unpaidInv} one-off`, icon:FolderOpen, tab:"retainers" },
+    { label:"Retainer MRR (PKR)", value:fmt(mrr), sub:`${data.retainers.filter(r=>r.status==="Active").length} active retainers`, icon:Repeat, tab:"retainers" },
   ];
-  const notes = adminNotes(data);
+  const lines = [
+    pendLeaves && { text:`${pendLeaves} leave request${pendLeaves>1?"s":""} awaiting approval`, tab:"requests" },
+    pendCerts && { text:`${pendCerts} certificate request${pendCerts>1?"s":""} open`, tab:"requests" },
+    pendClaims && { text:`${pendClaims} expense claim${pendClaims>1?"s":""} to review`, tab:"payables" },
+    (unpaidRet+unpaidInv) && { text:`${unpaidRet+unpaidInv} invoice${unpaidRet+unpaidInv>1?"s":""} unpaid`, tab:"retainers" },
+    overdueRecv && { text:`${overdueRecv} receivable${overdueRecv>1?"s":""} overdue`, tab:"receivables" },
+    vbPending && { text:`${vbPending} vendor bill${vbPending>1?"s":""} awaiting approval`, tab:"vendorbills" },
+    openPayables.length && { text:`${openPayables.length} payable${openPayables.length>1?"s":""} open (${fmt(openPayables.reduce((s2,p)=>s2+ +p.amount,0))})`, tab:"payables" },
+    openWork && { text:`${openWork} work item${openWork>1?"s":""} in progress`, tab:"timesheets" },
+    expiring && { text:`${expiring} employee document${expiring>1?"s":""} expiring within 30 days`, tab:"employees" },
+    (activeEmp.length-att.length)>0 && { text:`${activeEmp.length-att.length} team member${activeEmp.length-att.length>1?"s":""} not marked today`, tab:"attendance" },
+  ].filter(Boolean);
   return (<>
-    <Head title="Dashboard" sub={`Welcome back · ${ROLES[role]}`}/>
-    <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">{stats.map(s=>{const I=s.icon;return(<Card key={s.label}><div className="p-5"><I className="text-sky-600 mb-3" size={20}/><div className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900 break-words">{s.value}</div><div className="text-xs text-slate-500 mt-1">{s.label}</div></div></Card>);})}</div>
-    <Card><div className="px-5 py-4 border-b border-slate-200 font-semibold text-sm">Needs attention</div>
-      {notes.length===0?<Empty msg="Nothing pending — you're all caught up"/>:<div className="divide-y divide-slate-100">{notes.map((n,i)=>(<button key={i} onClick={()=>go(n.tab)} className="w-full text-left px-5 py-3 text-sm hover:bg-slate-50">{n.text}</button>))}</div>}
+    <Head title="Dashboard" sub={`Welcome back · ${ROLES[role]} · ${new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long"})}`}/>
+    <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">{stats.map(s2=>{const I=s2.icon;return(<Card key={s2.label}><button onClick={()=>go(s2.tab)} className="p-5 text-left w-full hover:bg-slate-50 rounded-xl transition"><I className="text-sky-600 mb-3" size={20}/><div className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900 break-words">{s2.value}</div><div className="text-xs text-slate-500 mt-1">{s2.label}</div><div className="text-xs text-slate-400 mt-0.5">{s2.sub}</div></button></Card>);})}</div>
+    <Card><div className="px-5 py-4 border-b border-slate-200 font-semibold text-sm">The bigger picture</div>
+      {lines.length===0?<Empty msg="Nothing pending — you're all caught up"/>:<div className="divide-y divide-slate-100">{lines.map((n,i)=>(<button key={i} onClick={()=>go(n.tab)} className="w-full text-left px-5 py-3 text-sm hover:bg-slate-50 flex items-center justify-between"><span>{n.text}</span><span className="text-xs text-sky-600">open →</span></button>))}</div>}
     </Card></>);
 }
 
@@ -1436,7 +1533,8 @@ function EmployeeProfile({ emp, data, onBack, onEdit }) {
 function Attendance({ data, update, mutateData }) {
   const [view, setView] = useState("attendance");
   const mark = (emp,status)=>{ mutateData((cur)=>{ const list=cur.attendance||[]; const ex=list.find(a=>a.employee===emp&&a.date===today()); return { ...cur, attendance: ex?list.map(a=>a===ex?{...a,status}:a):[...list,{id:uid(),employee:emp,date:today(),status}] }; }, `Marked ${emp} ${status}`); };
-  const setStatus=(id,s)=>{ const l=data.leaves.find(x=>x.id===id); mutateData((cur)=>({ ...cur, leaves:(cur.leaves||[]).map(x=>x.id===id?{...x,status:s,decidedOn:today()}:x) }), `Leave ${s.toLowerCase()} for ${l?.employee} — they have been notified`); };
+  const [busyLeave,setBusyLeave]=useState(null);
+  const setStatus=async (id,s)=>{ const l=data.leaves.find(x=>x.id===id); setBusyLeave(id); try { await mutateData((cur)=>({ ...cur, leaves:(cur.leaves||[]).map(x=>x.id===id?{...x,status:s,decidedOn:today()}:x) }), `Leave ${s.toLowerCase()} for ${l?.employee} — they have been notified`); } finally { setBusyLeave(null); } };
   const locLink = (loc) => loc && loc.lat ? `https://www.google.com/maps?q=${loc.lat},${loc.lng}` : null;
   const history = [...data.attendance].sort((a,b)=> (b.date||"").localeCompare(a.date||"") || (b.checkIn||"").localeCompare(a.checkIn||""));
   return (<>
@@ -1452,7 +1550,7 @@ function Attendance({ data, update, mutateData }) {
     ):(
       <Card><Table cols={["Employee","Type & reason","From","To","Days","Balance left","Status",""]}>{data.leaves.length===0?<tr><td colSpan={8}><Empty msg="No leave requests"/></td></tr>:data.leaves.map(l=>(
         <Row key={l.id}><Td className="font-medium">{l.employee}</Td><Td className="text-slate-500">{l.type}{l.reason&&<div className="text-xs text-slate-400 max-w-[200px] truncate">{l.reason}</div>}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td className="text-xs text-slate-500">{LEAVE_POLICY[l.type]?`${Math.max(0,leaveLeft(data,l.employee,l.type))} left`:"—"}</Td><Td><Pill s={l.status}/></Td>
-        <Td>{l.status==="Pending"?<div className="flex gap-1 justify-end"><button onClick={()=>setStatus(l.id,"Approved")} className="p-1.5 rounded text-emerald-600 hover:bg-slate-100"><Check size={14}/></button><button onClick={()=>setStatus(l.id,"Rejected")} className="p-1.5 rounded text-rose-500 hover:bg-slate-100"><X size={14}/></button></div>:<span className="text-xs text-slate-400">—</span>}</Td></Row>))}</Table></Card>
+        <Td>{busyLeave===l.id?<span className="flex items-center gap-1.5 justify-end text-xs text-slate-500"><Loader2 size={13} className="animate-spin"/>Processing…</span>:l.status==="Pending"?<div className="flex gap-1 justify-end"><button disabled={!!busyLeave} onClick={()=>setStatus(l.id,"Approved")} className="p-1.5 rounded text-emerald-600 hover:bg-slate-100 disabled:opacity-40"><Check size={14}/></button><button disabled={!!busyLeave} onClick={()=>setStatus(l.id,"Rejected")} className="p-1.5 rounded text-rose-500 hover:bg-slate-100 disabled:opacity-40"><X size={14}/></button></div>:<span className="text-xs text-slate-400">—</span>}</Td></Row>))}</Table></Card>
     )}
   </>);
 }
@@ -1680,22 +1778,40 @@ function Advances({ data, update }) {
 }
 
 function Timesheets({ data }) {
-  const [client, setClient] = useState(""); const [emp, setEmp] = useState(""); const [day, setDay] = useState("");
-  const all = data.timesheets;
-  const clients = [...new Set(all.map(t=>t.client).filter(Boolean))];
-  const emps = [...new Set(all.map(t=>t.employee).filter(Boolean))];
-  const rows = all.filter(t=>(!client||t.client===client)&&(!emp||t.employee===emp)&&(!day||t.date===day)).slice().sort((a,b)=>b.date.localeCompare(a.date));
-  const byClient = {}; all.forEach(t=>{ if(t.hours) byClient[t.client]=(byClient[t.client]||0)+ +t.hours; });
+  const [openEmp, setOpenEmp] = useState(null);
+  const [day, setDay] = useState(""); const [client, setClient] = useState("");
+  const all = data.timesheets || [];
+  const names = [...new Set([...data.employees.filter(e=>e.status==="Active").map(e=>e.name), ...all.map(t=>t.employee).filter(Boolean)])];
+  const byEmp = (n) => all.filter(t=>t.employee===n);
+  if (openEmp) {
+    const mine = byEmp(openEmp).filter(t=>(!day||t.date===day)&&(!client||t.client===client)).slice().sort((a,b)=>(b.date||"").localeCompare(a.date||""));
+    const myClients = [...new Set(byEmp(openEmp).map(t=>t.client).filter(Boolean))];
+    const totalH = mine.reduce((s2,t)=>s2+ (+t.hours||0),0);
+    return (<>
+      <button onClick={()=>{setOpenEmp(null);setDay("");setClient("");}} className="flex items-center gap-1 text-sm text-slate-500 hover:text-sky-600 mb-4"><ChevronLeft size={16}/>All team members</button>
+      <Head title={openEmp} sub={`Work log · ${mine.length} entr${mine.length===1?"y":"ies"} ${day?`on ${day}`:""} ${client?`· ${client}`:""} · ${totalH}h total`}/>
+      <div className="flex flex-wrap gap-3 mb-4 items-end">
+        <div className="min-w-40"><Field label="Filter by date" type="date" value={day} onChange={e=>setDay(e.target.value)}/></div>
+        <div className="min-w-40"><Select label="Client" options={["",...myClients]} value={client} onChange={e=>setClient(e.target.value)}/></div>
+        {(day||client) && <Btn variant="ghost" onClick={()=>{setDay("");setClient("");}}><X size={14}/>Clear filters</Btn>}
+      </div>
+      <Card><Table cols={["Date","Client","Work done","Hours","Status"]}>{mine.length===0?<tr><td colSpan={5}><Empty msg={day?`No work logged on ${day}`:"No work logged yet"}/></td></tr>:mine.map(t=>(
+        <Row key={t.id}><Td className="text-slate-500 whitespace-nowrap">{t.date}</Td><Td className="font-medium">{t.client||"—"}</Td><Td className="text-slate-600 text-sm max-w-[340px]">{t.work||"—"}</Td><Td>{t.hours?`${t.hours}h`:"—"}</Td><Td><Pill s={t.status||"Logged"}/></Td></Row>))}</Table></Card>
+    </>);
+  }
   const todayCount = all.filter(t=>t.date===today()).length;
   return (<>
-    <Head title="Work & Timesheets" sub={`Daily work logged by the team · ${todayCount} update(s) today`}/>
-    {Object.keys(byClient).length>0 && <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-5">{Object.entries(byClient).map(([c,h])=>(<Card key={c}><div className="p-4"><div className="text-2xl font-bold text-slate-900">{h}h</div><div className="text-xs text-slate-500 mt-0.5">{c}</div></div></Card>))}</div>}
-    <div className="flex flex-wrap gap-3 mb-4">
-      <div className="max-w-xs flex-1 min-w-36"><Select label="Employee" options={["",...emps]} value={emp} onChange={e=>setEmp(e.target.value)}/></div>
-      <div className="max-w-xs flex-1 min-w-36"><Select label="Client" options={["",...clients]} value={client} onChange={e=>setClient(e.target.value)}/></div>
-      <div className="max-w-xs flex-1 min-w-36"><Field label="Date" type="date" value={day} onChange={e=>setDay(e.target.value)}/></div>
-    </div>
-    <Card><Table cols={["Date","Employee","Client","Work done","Status","Hrs"]}>{rows.length===0?<tr><td colSpan={6}><Empty msg="No work logged for this filter"/></td></tr>:rows.map(t=>(<Row key={t.id}><Td className="text-slate-500 whitespace-nowrap">{t.date}</Td><Td className="font-medium">{t.employee}</Td><Td>{t.client}</Td><Td className="text-slate-600">{t.work||t.note}{t.edited?<span className="text-slate-400 text-xs"> · edited</span>:null}</Td><Td><Pill s={t.status==="Completed"?"Done":t.status||"Done"}/></Td><Td className="text-slate-500">{t.hours||"—"}</Td></Row>))}</Table></Card>
+    <Head title="Work & Timesheets" sub={`Tap a team member to see their full work log · ${todayCount} update(s) today`}/>
+    <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">{names.length===0?<Card><Empty msg="No team members yet"/></Card>:names.map(n=>{
+      const mine = byEmp(n); const hrs = mine.reduce((s2,t)=>s2+(+t.hours||0),0);
+      const last = mine.length ? mine.slice().sort((a,b)=>(b.date||"").localeCompare(a.date||""))[0] : null;
+      const loggedToday = mine.some(t=>t.date===today());
+      return (<Card key={n}><button onClick={()=>setOpenEmp(n)} className="p-5 text-left w-full hover:bg-slate-50 rounded-xl transition">
+        <div className="flex items-center justify-between"><div className="font-semibold">{n}</div>{loggedToday?<span className="text-xs px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">logged today</span>:<span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">not yet today</span>}</div>
+        <div className="text-xs text-slate-500 mt-2">{mine.length} entries · {hrs}h total</div>
+        <div className="text-xs text-slate-400 mt-0.5">{last?`Last: ${last.date} · ${last.client||"—"}`:"No work logged yet"}</div>
+      </button></Card>);
+    })}</div>
   </>);
 }
 
@@ -2218,11 +2334,13 @@ function Payables({ data, update, patch, brand }) {
     <Ledger title="Payables" sub={`Owed · ${fmt(rows.filter(r=>r.status!=="Paid").reduce((s,r)=>s+ +r.amount,0))} · approved vendor bills land here as unpaid until you mark them paid`} rows={rows} setRows={setRows}
       blank={()=>({vendor:"",desc:"",amount:"",due:today(),status:"Pending"})}
       cols={["Vendor","Description","Amount","Due","Status"]}
-      render={r=>(<><Td className="font-medium">{r.vendor}</Td><Td className="text-slate-500"><div className="flex items-center gap-2">{r.receipt&&<img src={r.receipt} className="w-8 h-8 rounded object-cover border border-slate-200"/>}{r.desc}{r.payVia==="salary"&&<span className="text-xs text-sky-600">→ {r.payMonth} salary</span>}{r.kind==="vendorbill"&&<span className="text-xs text-slate-400">vendor bill</span>}</div></Td><Td>{fmt(r.amount)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
+      render={r=>(<><Td className="font-medium">{r.vendor}</Td><Td className="text-slate-500"><div className="flex items-center gap-2">{r.receipt&&<button onClick={(e)=>{e.stopPropagation();openDataUrl(r.receipt, (r.desc||"receipt").replace(/[^a-z0-9]+/gi,"-"));}} title="Open receipt" className="shrink-0"><img src={r.receipt} className="w-8 h-8 rounded object-cover border border-slate-200 hover:ring-2 hover:ring-sky-400"/></button>}{r.desc}{r.payVia==="salary"&&<span className="text-xs text-sky-600">→ {r.payMonth} salary</span>}{r.kind==="vendorbill"&&<span className="text-xs text-slate-400">vendor bill</span>}</div></Td><Td>{fmt(r.amount)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
       extraActions={r=> r.kind==="reimbursement" && r.status!=="Approved" && r.status!=="Paid" ? <button onClick={()=>openApprove(r)} title="Approve reimbursement" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button> : (r.kind==="vendorbill" && r.status!=="Paid" ? <button onClick={()=>markVendorPaid(r)} title="Mark vendor bill as paid" className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Mark paid</button> : null)}
       fields={(e,s)=>(<><Field label="Vendor" value={e.vendor} onChange={ev=>s({...e,vendor:ev.target.value})}/><Field label="Description" value={e.desc} onChange={ev=>s({...e,desc:ev.target.value})}/><Field label="Amount (PKR)" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Field label="Due" type="date" value={e.due} onChange={ev=>s({...e,due:ev.target.value})}/><Select label="Status" options={["Pending","Approved","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>
     {appr && <Modal title={`Approve reimbursement · ${appr.vendor}`} onClose={()=>setAppr(null)}>
       <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm flex justify-between"><span className="text-slate-500">Amount</span><b>{fmt(appr.amount)}</b></div>
+      {appr.receipt && <div><span className="text-xs text-slate-500 mb-1 block">Attached receipt / invoice — tap to open full size</span>
+        <button onClick={()=>openDataUrl(appr.receipt, appr.receiptName||"receipt")} className="block">{appr.receipt.startsWith("data:image")?<img src={appr.receipt} className="h-40 rounded-lg border border-slate-200 object-cover hover:ring-2 hover:ring-sky-400"/>:<span className="flex items-center gap-2 text-sm text-sky-600 hover:underline"><FileText size={15}/>{appr.receiptName||"Attached file"} ↗</span>}</button></div>}
       <Select label="How should this be paid?" options={["salary","direct"]} value={appr.mode} onChange={e=>setAppr({...appr,mode:e.target.value})}/>
       {appr.mode==="salary"
         ? <Select label="Add to which month's salary?" options={months} value={appr.month} onChange={e=>setAppr({...appr,month:e.target.value})}/>
@@ -2241,13 +2359,45 @@ function Receivables({ data, update }) {
     fields={(e,s)=>(<><ClientInput clients={clients} value={e.client} onChange={ev=>s({...e,client:ev.target.value})}/><Field label="Description" value={e.desc} onChange={ev=>s({...e,desc:ev.target.value})}/><Field label="Amount (PKR)" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Field label="Due" type="date" value={e.due} onChange={ev=>s({...e,due:ev.target.value})}/><Select label="Status" options={["Outstanding","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>;
 }
 
-function Requests({ data, update, mutateData }) {
-  const rows = data.requests;
-  const setStatus = (id,s)=>mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).map(r=>r.id===id?{...r,status:s}:r) }), `Request marked ${s}`);
+function Requests({ data, update, mutateData, go }) {
+  const [kind, setKind] = useState("all");     // all | leave | cert | reimb
+  const [st, setSt] = useState("open");        // open | decided | all
+  const [busyId, setBusyId] = useState(null);
+  const setReqStatus = async (id,sv)=>{ setBusyId("R"+id); try { await mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).map(r=>r.id===id?{...r,status:sv,decidedOn:today()}:r) }), `Request marked ${sv}`); } finally { setBusyId(null); } };
+  const setLeave = async (id,sv)=>{ const l=data.leaves.find(x=>x.id===id); setBusyId("L"+id); try { await mutateData((cur)=>({ ...cur, leaves:(cur.leaves||[]).map(x=>x.id===id?{...x,status:sv,decidedOn:today()}:x) }), `Leave ${sv.toLowerCase()} for ${l?.employee} — they have been notified`); } finally { setBusyId(null); } };
+  const delReq = (id)=>mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).filter(x=>x.id!==id) }));
+  // Merge the three request streams into one tracked list
+  const rows = [
+    ...(data.leaves||[]).map(l=>({ key:"L"+l.id, id:l.id, kind:"leave", employee:l.employee, title:`${l.type||"Leave"} leave`, details:`${l.from} → ${l.to} · ${dayCount(l.from,l.to)}d${l.reason?` · ${l.reason}`:""}`, date:l.requestedOn||l.from, status:l.status, decidedOn:l.decidedOn })),
+    ...(data.requests||[]).map(r=>({ key:"R"+r.id, id:r.id, kind:"cert", employee:r.employee, title:r.type, details:r.note||"", date:r.date, status:r.status, decidedOn:r.decidedOn })),
+    ...(data.payables||[]).filter(p=>p.kind==="reimbursement").map(p=>({ key:"P"+p.id, id:p.id, kind:"reimb", employee:p.vendor, title:"Expense claim", details:`${fmt(p.amount)}${p.note?` · ${p.note}`:""}`, date:p.date, status:p.status, decidedOn:p.decidedOn })),
+  ].sort((a,b)=>(b.date||"").localeCompare(a.date||""));
+  const isOpen = (r)=> r.kind==="leave" ? r.status==="Pending" : r.kind==="cert" ? (r.status!=="Done"&&r.status!=="Declined") : r.status==="Pending";
+  const filtered = rows.filter(r=>(kind==="all"||r.kind===kind) && (st==="all" ? true : st==="open" ? isOpen(r) : !isOpen(r)));
+  const openCount = rows.filter(isOpen).length;
+  const KINDS = [["all","All"],["leave","Leave"],["cert","Certificates"],["reimb","Expense claims"]];
+  const kindPill = (k)=> k==="leave"?"bg-sky-100 text-sky-700":k==="cert"?"bg-violet-100 text-violet-700":"bg-amber-100 text-amber-700";
   return (<>
-    <Head title="Requests" sub="Certificate and profile-edit requests from your team"/>
-    <Card><Table cols={["Employee","Type","Note","Date","Status",""]}>{rows.length===0?<tr><td colSpan={6}><Empty msg="No requests"/></td></tr>:rows.map(r=>(
-      <Row key={r.id}><Td className="font-medium">{r.employee}</Td><Td className="text-slate-500">{r.type}</Td><Td className="text-slate-500">{r.note||"—"}</Td><Td className="text-slate-500">{r.date}</Td><Td><Pill s={r.status}/></Td><Td><RowActions onDelete={()=>mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).filter(x=>x.id!==r.id) }))}>{r.status!=="Done"&&<button onClick={()=>setStatus(r.id,"Done")} className="p-1.5 rounded text-emerald-600 hover:bg-slate-100" title="Mark done"><Check size={15}/></button>}</RowActions></Td></Row>))}</Table></Card>
+    <Head title="HR Requests" sub={`Every request your team sends — leave, certificates, expense claims · ${openCount} awaiting action`}/>
+    <div className="flex flex-wrap gap-2 mb-4">
+      {KINDS.map(([k,l])=>{ const n=rows.filter(r=>(k==="all"||r.kind===k)&&isOpen(r)).length; return <Btn key={k} variant={kind===k?"primary":"ghost"} onClick={()=>setKind(k)}>{l}{n?` · ${n}`:""}</Btn>; })}
+      <div className="flex-1"/>
+      {[["open","Awaiting"],["decided","Handled"],["all","All"]].map(([k,l])=><Btn key={k} variant={st===k?"primary":"ghost"} onClick={()=>setSt(k)}>{l}</Btn>)}
+    </div>
+    <Card><Table cols={["Employee","Request","Details","Date","Status",""]}>{filtered.length===0?<tr><td colSpan={6}><Empty msg={st==="open"?"Nothing awaiting action — all caught up":"No requests here yet"}/></td></tr>:filtered.map(r=>(
+      <Row key={r.key}>
+        <Td className="font-medium">{r.employee}</Td>
+        <Td><span className={`text-xs px-2 py-0.5 rounded-full ${kindPill(r.kind)}`}>{r.title}</span></Td>
+        <Td className="text-slate-500 text-xs max-w-[260px]">{r.details||"—"}</Td>
+        <Td className="text-slate-500 whitespace-nowrap">{r.date}</Td>
+        <Td><Pill s={r.status}/>{r.decidedOn&&<div className="text-xs text-slate-400 mt-0.5">{r.decidedOn}</div>}</Td>
+        <Td>{busyId===r.key ? <span className="flex items-center gap-1.5 justify-end text-xs text-slate-500"><Loader2 size={13} className="animate-spin"/>Processing…</span>
+          : r.kind==="leave" && r.status==="Pending" ? <div className="flex gap-1 justify-end"><button disabled={!!busyId} onClick={()=>setLeave(r.id,"Approved")} title="Approve" className="p-1.5 rounded text-emerald-600 hover:bg-slate-100 disabled:opacity-40"><Check size={15}/></button><button disabled={!!busyId} onClick={()=>setLeave(r.id,"Rejected")} title="Decline" className="p-1.5 rounded text-rose-500 hover:bg-slate-100 disabled:opacity-40"><X size={15}/></button></div>
+          : r.kind==="cert" ? <RowActions onDelete={()=>delReq(r.id)}>{r.status!=="Done"&&<button disabled={!!busyId} onClick={()=>setReqStatus(r.id,"Done")} title="Mark done" className="p-1.5 rounded text-emerald-600 hover:bg-slate-100 disabled:opacity-40"><Check size={15}/></button>}</RowActions>
+          : r.kind==="reimb" && r.status==="Pending" ? <button onClick={()=>go("payables")} className="text-xs text-sky-600 hover:underline whitespace-nowrap">Review in Payables</button>
+          : <span className="text-xs text-slate-400">—</span>}</Td>
+      </Row>))}</Table></Card>
+    <p className="text-xs text-slate-400 mt-3">Leave decisions notify the employee automatically. Expense claims are approved in Payables (where you choose salary or direct payment) — this list tracks their status.</p>
   </>);
 }
 function Announcements({ data, update }) {
