@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · sync-v2";
+const APP_BUILD = "Build 27 Jul 2026 · fast-saves-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -82,12 +82,32 @@ let _serverDoc = null;   // the doc as the server has it after our last confirme
 let _saveQueue = [];
 let _saving = false;
 function initSaveState(doc, rev) { _serverDoc = doc; _rev = rev || 0; }
-async function _putState(doc, baseRev) {
-  const res = await fetch("/api/state", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json", ...(getChatToken() ? { Authorization: "Bearer " + getChatToken() } : {}) },
-    body: JSON.stringify({ doc, baseRev }),
-  });
+async function _gzipBody(str) {
+  try {
+    if (typeof CompressionStream === "undefined") return null;
+    const stream = new Blob([str]).stream().pipeThrough(new CompressionStream("gzip"));
+    return await new Response(stream).blob();
+  } catch { return null; }
+}
+async function _putState(doc, baseRev, base) {
+  // Send ONLY the top-level keys that actually changed (our mutations keep unchanged
+  // keys referentially identical), so ticking a task uploads kilobytes, not the whole
+  // database with every photo in it. Falls back to the full document when needed.
+  let payload;
+  if (base && typeof base === "object") {
+    const patchDoc = {};
+    for (const k of Object.keys(doc)) if (doc[k] !== base[k]) patchDoc[k] = doc[k];
+    if (Object.keys(patchDoc).length === 0) return { conflict: false, rev: baseRev }; // nothing changed
+    payload = { patchDoc, baseRev };
+  } else {
+    payload = { doc, baseRev };
+  }
+  const json = JSON.stringify(payload);
+  const headers = { "Content-Type": "application/json", ...(getChatToken() ? { Authorization: "Bearer " + getChatToken() } : {}) };
+  let body = json;
+  const gz = await _gzipBody(json);          // typically 2–4× smaller → 2–4× faster upload
+  if (gz) { headers["Content-Encoding"] = "gzip"; body = gz; }
+  const res = await fetch("/api/state", { method: "PUT", headers, body });
   const data = await res.json().catch(() => ({}));
   if (res.status === 409) return { conflict: true, doc: data.doc, rev: +data.rev || 0 };
   if (!res.ok) throw new Error(data.error || "Save failed");
@@ -113,9 +133,10 @@ async function _drainSaves() {
         let attempts = 0, done = false, hadConflict = false;
         while (!done && attempts < 6) {
           attempts++;
-          let next = _serverDoc || undefined;
+          const base = _serverDoc;
+          let next = base || undefined;
           for (const b of batch) next = b.mutate(next);
-          const r = await _putState(next, _rev);
+          const r = await _putState(next, _rev, base);
           if (r.conflict) { hadConflict = true; _serverDoc = r.doc; _rev = r.rev; continue; }
           _serverDoc = next; _rev = r.rev; _stateCache.doc = next; done = true;
           if (hadConflict) { const om = batch.find(b=>b.onMerged); om && om.onMerged(next); } // re-sync UI with merged result
@@ -448,7 +469,11 @@ export default function App() {
     const tick = async () => {
       if (_saving || _saveQueue.length) return; // never interrupt our own pending saves
       try {
-        const st = await apiReq("GET", "/state");
+        const st = await apiReq("GET", "/state?knownRev=" + _rev);
+        if (st && st.unchanged) {
+          if (st.build && st.build !== APP_BUILD) { const k = "svype_reload_" + st.build; if (!sessionStorage.getItem(k)) { sessionStorage.setItem(k, "1"); _setSaveStatus("updating"); setTimeout(()=>window.location.reload(), 1200); } }
+          return;
+        }
         if (st && st.build && st.build !== APP_BUILD) {
           // A newer version is deployed. Reload once so this device can't keep running
           // old code (stale builds were overwriting fresh data with old lists).
