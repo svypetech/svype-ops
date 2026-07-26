@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · billing-type-v1";
+const APP_BUILD = "Build 27 Jul 2026 · responsive-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -681,7 +681,7 @@ function GlobalSearch({ data, go }) {
       <input value={q} onChange={e=>{setQ(e.target.value);setOpen(true);}} onFocus={()=>setOpen(true)} placeholder="Search anything…" className="w-full bg-slate-100 border border-transparent rounded-lg pl-9 pr-3 py-1.5 text-sm outline-none focus:bg-white focus:border-sky-500"/>
       {open && q && <>
         <div className="fixed inset-0 z-20" onClick={()=>setOpen(false)}/>
-        <div className="absolute z-30 mt-1 w-72 bg-white border border-slate-200 rounded-xl shadow-lg overflow-hidden">
+        <div className="absolute z-30 mt-1 w-72 max-w-[calc(100vw-4.5rem)] bg-white border border-slate-200 rounded-xl shadow-lg overflow-hidden">
           {results.length===0?<div className="px-4 py-3 text-sm text-slate-400">No matches</div>:results.map((r,i)=>(
             <button key={i} onClick={()=>{go(r.tab);setOpen(false);setQ("");}} className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center justify-between">
               <span className="text-sm">{r.label}</span><span className="text-xs text-slate-400">{r.sub}</span></button>))}
@@ -697,7 +697,7 @@ function NotifBell({ items, go }) {
         {items.length>0 && <span className="absolute -top-0.5 -right-0.5 min-w-4 h-4 px-1 rounded-full bg-rose-500 text-white text-xs grid place-items-center">{items.length}</span>}</button>
       {open && <>
         <div className="fixed inset-0 z-20" onClick={()=>setOpen(false)}/>
-        <div className="absolute right-0 z-30 mt-1 w-72 bg-white border border-slate-200 rounded-xl shadow-lg overflow-hidden">
+        <div className="absolute right-0 z-30 mt-1 w-72 max-w-[calc(100vw-2rem)] bg-white border border-slate-200 rounded-xl shadow-lg overflow-hidden">
           <div className="px-4 py-2.5 border-b border-slate-200 font-semibold text-sm">Notifications</div>
           {items.length===0?<div className="px-4 py-6 text-sm text-slate-400 text-center">You're all caught up</div>:
             <div className="max-h-80 overflow-y-auto">{items.map((n,i)=>(
@@ -875,7 +875,7 @@ const Card = ({ children }) => <div className="bg-white border border-slate-200 
 const Pill = ({ s }) => { const m={Active:"bg-emerald-100 text-emerald-700",Paid:"bg-emerald-100 text-emerald-700",Sent:"bg-sky-100 text-sky-700",Accepted:"bg-emerald-100 text-emerald-700",Done:"bg-emerald-100 text-emerald-700",Cleared:"bg-emerald-100 text-emerald-700",Pending:"bg-amber-100 text-amber-700",Unpaid:"bg-amber-100 text-amber-700",Open:"bg-amber-100 text-amber-700",Requested:"bg-amber-100 text-amber-700","Pending HR":"bg-amber-100 text-amber-700","Pending Founder":"bg-sky-100 text-sky-700",Partial:"bg-orange-100 text-orange-700",Outstanding:"bg-amber-100 text-amber-700",Overdue:"bg-rose-100 text-rose-700",Approved:"bg-emerald-100 text-emerald-700",Rejected:"bg-rose-100 text-rose-700",Draft:"bg-slate-100 text-slate-600",Inactive:"bg-slate-100 text-slate-600",Paused:"bg-slate-100 text-slate-600"}; return <span className={`px-2 py-0.5 rounded-md text-xs font-medium ${m[s]||"bg-slate-100 text-slate-600"}`}>{s}</span>; };
 function Modal({ title, onClose, children }) {
   return <div className="fixed inset-0 grid place-items-center z-50 p-4" style={{background:"rgba(15,23,42,.5)"}} onClick={onClose}>
-    <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-md overflow-y-auto shadow-xl" style={{maxHeight:"85vh"}} onClick={e=>e.stopPropagation()}>
+    <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-md overflow-y-auto shadow-xl" style={{maxHeight:"90vh", paddingBottom:"env(safe-area-inset-bottom)"}} onClick={e=>e.stopPropagation()}>
       <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200"><h3 className="font-semibold text-slate-900">{title}</h3><button onClick={onClose} className="text-slate-400 hover:text-slate-700"><X size={18}/></button></div>
       <div className="p-5 space-y-3">{children}</div></div></div>;
 }
@@ -883,7 +883,7 @@ const inputCls = "w-full bg-white border border-slate-300 rounded-lg px-3 py-2 t
 const Field = ({ label, ...p }) => (<label className="block"><span className="text-xs text-slate-500 mb-1 block">{label}</span><input {...p} className={inputCls}/></label>);
 const Area = ({ label, ...p }) => (<label className="block"><span className="text-xs text-slate-500 mb-1 block">{label}</span><textarea {...p} rows={3} className={inputCls+" resize-y"}/></label>);
 const Select = ({ label, options, ...p }) => (<label className="block"><span className="text-xs text-slate-500 mb-1 block">{label}</span><select {...p} className={inputCls}>{options.map(o=><option key={o} value={o}>{o||"—"}</option>)}</select></label>);
-const Table = ({ cols, children }) => (<div className="overflow-x-auto"><table className="w-full text-sm" style={{minWidth:480}}><thead><tr className="text-left text-slate-500 text-xs uppercase tracking-wider border-b border-slate-200 bg-slate-50">{cols.map(c=><th key={c} className="px-4 py-3 font-medium">{c}</th>)}</tr></thead><tbody>{children}</tbody></table></div>);
+const Table = ({ cols, children }) => (<div className="overflow-x-auto"><table className="w-full text-sm" style={{minWidth: Math.max(480, cols.length*110)}}><thead><tr className="text-left text-slate-500 text-xs uppercase tracking-wider border-b border-slate-200 bg-slate-50">{cols.map(c=><th key={c} className="px-4 py-3 font-medium">{c}</th>)}</tr></thead><tbody>{children}</tbody></table></div>);
 const Row = ({ children, onClick }) => <tr onClick={onClick} className={`border-b border-slate-100 last:border-0 hover:bg-slate-50 ${onClick?"cursor-pointer":""}`}>{children}</tr>;
 const Td = ({ children, className="" }) => <td className={`px-4 py-3 ${className}`}>{children}</td>;
 const RowActions = ({ onEdit, onDelete, children }) => {
@@ -1645,7 +1645,7 @@ function ClientProfile({ c, data, onBack, onEdit }) {
   const hrs = data.timesheets.filter(t=>t.client===c.name).reduce((s,t)=>s+ +t.hours,0);
   return (<>
     <button onClick={onBack} className="flex items-center gap-1 text-sm text-slate-500 hover:text-sky-600 mb-4"><ChevronLeft size={16}/>Back to clients</button>
-    <div className="flex items-start justify-between mb-6"><div><h2 className="text-xl font-bold tracking-tight text-slate-900">{c.name}</h2><p className="text-sm text-slate-500">{c.currency} · {c.whatsapp||"no WhatsApp"} · {c.email||"no email"}</p></div><Btn variant="ghost" onClick={onEdit}><Edit3 size={15}/>Edit</Btn></div>
+    <div className="flex flex-wrap items-start justify-between gap-3 mb-6"><div><h2 className="text-xl font-bold tracking-tight text-slate-900">{c.name}</h2><p className="text-sm text-slate-500">{c.currency} · {c.whatsapp||"no WhatsApp"} · {c.email||"no email"}</p></div><Btn variant="ghost" onClick={onEdit}><Edit3 size={15}/>Edit</Btn></div>
     <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
       {[["Invoices",inv.length],["Retainers",ret.length],["Proposals",prop.length],["Hours logged",hrs]].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-2xl font-bold text-slate-900">{v}</div><div className="text-xs text-slate-500 mt-0.5">{k}</div></div></Card>))}
     </div>
@@ -1823,7 +1823,7 @@ function EmployeeProfile({ emp, data, onBack, onEdit }) {
   const tabs = [["overview","Overview"],["docs","Documents"],["payroll","Payroll"],["advances","Advances"],["letters","Letters"]];
   return (<>
     <button onClick={onBack} className="flex items-center gap-1 text-sm text-slate-500 hover:text-sky-600 mb-4"><ChevronLeft size={16}/>Back to employees</button>
-    <div className="flex items-start justify-between mb-6"><div className="flex items-center gap-4"><div className="w-14 h-14 rounded-2xl bg-sky-100 text-sky-700 grid place-items-center font-bold text-xl">{emp.name[0]}</div><div><h2 className="text-xl font-bold tracking-tight text-slate-900">{emp.name}</h2><p className="text-sm text-slate-500">{emp.role} · {emp.dept}</p></div></div><Btn variant="ghost" onClick={onEdit}><Edit3 size={15}/>Edit</Btn></div>
+    <div className="flex flex-wrap items-start justify-between gap-3 mb-6"><div className="flex items-center gap-4"><div className="w-14 h-14 rounded-2xl bg-sky-100 text-sky-700 grid place-items-center font-bold text-xl shrink-0">{emp.name[0]}</div><div><h2 className="text-xl font-bold tracking-tight text-slate-900">{emp.name}</h2><p className="text-sm text-slate-500">{emp.role} · {emp.dept}</p></div></div><Btn variant="ghost" onClick={onEdit}><Edit3 size={15}/>Edit</Btn></div>
     <div className="flex gap-1 mb-5 border-b border-slate-200 overflow-x-auto">{tabs.map(([k,l])=>(<button key={k} onClick={()=>setT(k)} className={`px-4 py-2 text-sm border-b-2 -mb-px whitespace-nowrap ${t===k?"border-sky-600 text-sky-700 font-medium":"border-transparent text-slate-500 hover:text-slate-800"}`}>{l}</button>))}</div>
     {t==="overview" && <div className="grid sm:grid-cols-2 gap-4">{[["Email",emp.email],["Phone",emp.phone],["CNIC",emp.cnic],["Salary",fmt(emp.salary)],["Provident fund",(emp.pf||0)+"%"],["Joined",emp.joined],["Bank",emp.bankName],["Account / IBAN",emp.account]].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-xs text-slate-500">{k}</div><div className="font-medium mt-0.5">{v||"—"}</div></div></Card>))}</div>}
     {t==="docs" && <Card><div className="p-4">{(!emp.docs||emp.docs.length===0)?<Empty msg="No documents on file."/>:<div className="grid sm:grid-cols-3 gap-3">{emp.docs.map(d=>{const dd=d.expiry?daysUntil(d.expiry):null;return(<button key={d.id} onClick={()=>openDataUrl(d.file||d.img, d.name)} className="text-left bg-slate-50 border border-slate-200 rounded-lg overflow-hidden hover:border-sky-400 hover:shadow-sm transition">{d.img?<img src={d.img} className="w-full h-32 object-cover"/>:<div className="h-32 grid place-items-center text-slate-400"><FileText/></div>}<div className="p-2 text-xs"><div className="truncate flex items-center gap-1"><span className="text-sky-600">↗</span>{d.name}</div>{d.expiry&&<div className={dd<=30?"text-rose-600":"text-slate-400"}>exp {d.expiry}{dd<=30?` · ${dd<0?"expired":dd+"d"}`:""}</div>}</div></button>);})}</div>}</div></Card>}

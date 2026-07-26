@@ -1,3 +1,12 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* ===== Mobile responsiveness polish ===== */
+/* iOS zooms the page when focusing inputs below 16px — keep fields 16px on phones. */
+@media (max-width: 640px) {
+  input, select, textarea { font-size: 16px !important; }
+}
+* { -webkit-tap-highlight-color: transparent; }
+html, body { overscroll-behavior-y: none; }
+.overflow-x-auto, .overflow-y-auto { -webkit-overflow-scrolling: touch; }
