@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · fast-saves-v1";
+const APP_BUILD = "Build 27 Jul 2026 · save-modal-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -729,7 +729,8 @@ function FirstRunSetup({ data, brand, onCreate }) {
 
 /* ---------------- login (username + password) ---------------- */
 function SaveStatus() {
-  // Floating toast: appears while saving, flashes "Saved", auto-hides. Errors stay until seen.
+  // BLOCKING save dialog: while a save is in flight the whole screen is locked —
+  // nothing else can be done until the server confirms. Brief green tick on success.
   const [st, setSt] = useState(null);
   const [show, setShow] = useState(false);
   useEffect(() => {
@@ -737,17 +738,21 @@ function SaveStatus() {
     onSaveStatus((v) => {
       setSt(v); setShow(true);
       clearTimeout(hideT);
-      if (v === "saved") hideT = setTimeout(()=>setShow(false), 1200);
-      if (v === "updating") {} // stays until reload
+      if (v === "saved") hideT = setTimeout(()=>setShow(false), 700);
     });
     return () => onSaveStatus(null);
   }, []);
   if (!show || !st) return null;
-  const box = "fixed bottom-5 left-1/2 -translate-x-1/2 z-[100] px-4 py-2.5 rounded-full shadow-lg text-sm flex items-center gap-2 border";
-  if (st === "saving") return <div className={box+" bg-white border-slate-200 text-slate-600"}><Loader2 size={14} className="animate-spin text-sky-600"/>Saving…</div>;
-  if (st === "updating") return <div className={box+" bg-white border-sky-200 text-sky-700"}><Loader2 size={14} className="animate-spin"/>Updating to the latest version…</div>;
-  if (st === "error") return <div className={box+" bg-rose-600 border-rose-600 text-white"}>⚠️ Not saved — check connection</div>;
-  return <div className={box+" bg-emerald-600 border-emerald-600 text-white"}><Check size={14}/>Saved</div>;
+  const wrap = "fixed inset-0 z-[200] grid place-items-center";
+  const card = "bg-white rounded-2xl shadow-2xl px-8 py-6 flex flex-col items-center gap-3 min-w-[260px] text-center";
+  if (st === "saving") return (<div className={wrap} style={{background:"rgba(15,23,42,.45)"}}>
+    <div className={card}><Loader2 size={30} className="animate-spin text-sky-600"/><div className="font-semibold text-slate-900">Saving…</div><div className="text-xs text-slate-500">Please wait — don't close this tab.</div></div></div>);
+  if (st === "updating") return (<div className={wrap} style={{background:"rgba(15,23,42,.45)"}}>
+    <div className={card}><Loader2 size={30} className="animate-spin text-sky-600"/><div className="font-semibold text-slate-900">Updating to the latest version…</div><div className="text-xs text-slate-500">The app will reload in a moment.</div></div></div>);
+  if (st === "error") return (<div className={wrap} style={{background:"rgba(15,23,42,.45)"}}>
+    <div className={card}><div className="w-10 h-10 rounded-full bg-rose-100 text-rose-600 grid place-items-center text-xl font-bold">!</div><div className="font-semibold text-rose-600">Could not save</div><div className="text-xs text-slate-500 max-w-[240px]">Your last change didn't reach the server. Check your connection, then try again.</div><Btn onClick={()=>setShow(false)}>Close</Btn></div></div>);
+  return (<div className={wrap} style={{background:"rgba(15,23,42,.25)"}}>
+    <div className={card}><div className="w-10 h-10 rounded-full bg-emerald-500 text-white grid place-items-center"><Check size={22}/></div><div className="font-semibold text-emerald-600">Saved</div></div></div>);
 }
 function Login({ data, brand, onLogin }) {
   const [u, setU] = useState(""); const [p, setP] = useState(""); const [err, setErr] = useState("");
