@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · login-v1";
+const APP_BUILD = "Build 27 Jul 2026 · copy-bank-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -306,12 +306,13 @@ function nextMonthInfo(from){
   return { key, label, issue, due };
 }
 
-// Build invoices for the upcoming billing cycle. `force` ignores the date gate (manual button).
+// Build invoices for the upcoming billing cycle.
+// HARD RULE: invoices are created ONLY when explicitly instructed (the "Generate now"
+// button passes force=true). Any call without force is a no-op — there is no automatic
+// path, on any date, ever.
 function generateRetainerInvoices(db, force){
+  if (!force) return db;
   const now = new Date();
-  const lastDay = new Date(now.getFullYear(), now.getMonth()+1, 0).getDate();
-  const onOrAfter30th = now.getDate() >= Math.min(30, lastDay); // Feb-safe (28/29-day months)
-  if (!force && !onOrAfter30th) return db;       // auto path: only on/after the 30th
   const { key, label, issue, due } = nextMonthInfo(now);
   const inv = [...(db.retainerInvoices || [])];
   let changed = false;
@@ -949,19 +950,26 @@ function DocSheet({ brand, body, signed, setSigned }) {
 }
 
 /* ================= EMPLOYEE PORTAL ================= */
-function checkInOut(mutateData, name, which, onResult) {
+function checkInOut(mutateData, name, which, onResult, remoteAllowed = false) {
   const apply = (loc) => {
     const near = loc ? nearestOffice(loc.lat, loc.lng) : null;
-    if (!loc) { onResult && onResult({ ok:false, msg:"Couldn't get your location. Please enable location access and try again — check-in requires being at a Svype office." }); return; }
-    if (!near || near.distance > GEOFENCE_RADIUS_M) {
-      onResult && onResult({ ok:false, msg:`You're not at a Svype office. You must be within ${GEOFENCE_RADIUS_M}m of the Lahore or Islamabad office to check ${which}. ${near?`(You're about ${Math.round(near.distance)}m from the ${near.office}.)`:""}` });
-      return;
+    const atOffice = !!(near && near.distance <= GEOFENCE_RADIUS_M);
+    if (!remoteAllowed) {
+      // Office-only employees: the geofence stands.
+      if (!loc) { onResult && onResult({ ok:false, msg:"Couldn't get your location. Please enable location access and try again — check-in requires being at a Svype office." }); return; }
+      if (!atOffice) {
+        onResult && onResult({ ok:false, msg:`You're not at a Svype office. You must be within ${GEOFENCE_RADIUS_M}m of the Lahore or Islamabad office to check ${which}. ${near?`(You're about ${Math.round(near.distance)}m from the ${near.office}.)`:""}` });
+        return;
+      }
     }
-    const stampedLoc = { ...loc, office: near.office, distance: Math.round(near.distance) };
+    // WFH employees are never blocked: tag the office if they happen to be at one,
+    // otherwise tag "Remote". Location is still recorded when available.
+    const officeName = atOffice ? near.office : "Remote";
+    const stampedLoc = loc ? { ...loc, office: officeName, ...(near ? { distance: Math.round(near.distance) } : {}) } : null;
     const now = new Date().toISOString();
     const stamp = which==="in"
-      ? { checkIn:now, location:stampedLoc, office:near.office }
-      : { checkOut:now, checkOutLocation:stampedLoc, checkOutOffice:near.office };
+      ? { checkIn:now, location:stampedLoc, office:officeName }
+      : { checkOut:now, checkOutLocation:stampedLoc, checkOutOffice:officeName };
     // FUNCTIONAL mutation: recomputed against the freshest data on every save retry, so
     // simultaneous check-ins from many employees merge instead of overwriting each other.
     mutateData((cur) => {
@@ -971,15 +979,17 @@ function checkInOut(mutateData, name, which, onResult) {
         ? list.map(a=>a===ex ? { ...a, status:"Present", ...stamp } : a)
         : [...list, { id:uid(), employee:name, date:today(), status:"Present", checkIn:null, checkOut:null, location:null, office:null, checkOutLocation:null, checkOutOffice:null, ...stamp }];
       return { ...cur, attendance };
-    }, `${name} checked ${which} · ${near.office}`);
-    onResult && onResult({ ok:true, msg:`Checked ${which} · ${near.office}`, office:near.office });
+    }, `${name} checked ${which} · ${officeName}`);
+    onResult && onResult({ ok:true, msg:`Checked ${which} · ${officeName}`, office:officeName });
   };
   if (navigator.geolocation) {
     navigator.geolocation.getCurrentPosition(
       p=>apply({lat:p.coords.latitude,lng:p.coords.longitude}),
-      ()=>apply(null),
+      ()=>apply(null), // office staff get the location error; WFH proceeds as Remote
       { enableHighAccuracy:true, timeout:8000, maximumAge:0 }
     );
+  } else if (remoteAllowed) {
+    apply(null); // WFH: no location available — check in as Remote
   } else {
     onResult && onResult({ ok:false, msg:"This device can't share location, so check-in isn't available here." });
   }
@@ -990,7 +1000,7 @@ function CheckInCard({ data, mutateData, me }) {
   const [msg, setMsg] = useState(null);
   const doAction = (which) => {
     setBusy(true); setMsg(null);
-    checkInOut(mutateData, me.name, which, (res)=>{ setBusy(false); setMsg(res); });
+    checkInOut(mutateData, me.name, which, (res)=>{ setBusy(false); setMsg(res); }, !!me.remoteAllowed);
   };
   return (<Card><div className="p-5">
     <div className="flex items-center gap-2 text-sm font-semibold mb-3"><Clock size={16} className="text-sky-600"/>Today · {new Date().toLocaleDateString()}</div>
@@ -1000,7 +1010,7 @@ function CheckInCard({ data, mutateData, me }) {
       {a?.office && <span className="text-xs text-slate-500 flex items-center gap-1"><MapPin size={12}/>{a.office}</span>}
     </div>
     {msg && <div className={`mt-3 text-xs rounded-lg px-3 py-2 ${msg.ok?"bg-emerald-50 border border-emerald-200 text-emerald-700":"bg-rose-50 border border-rose-200 text-rose-700"}`}>{msg.msg}</div>}
-    <div className="mt-3 text-xs text-slate-400">Check-in and check-out require being within {GEOFENCE_RADIUS_M}m of a Svype office.</div>
+    <div className="mt-3 text-xs text-slate-400">{me.remoteAllowed ? "You\u2019re approved for work from home — you can check in from anywhere. Your location is recorded when available." : `Check-in and check-out require being within ${GEOFENCE_RADIUS_M}m of a Svype office.`}</div>
   </div></Card>);
 }
 function EmpDashboard({ data, update, mutateData, session, me }) {
@@ -1025,7 +1035,7 @@ function EmpProfile({ data, update, me }) {
   return (<>
     <Head title="My Profile" sub="Your records on file" action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>setCert({ type:"Salary Certificate", note:"" })}><FileSignature size={15}/>Request certificate</Btn><Btn variant="ghost" onClick={()=>setReq("")}><Edit3 size={15}/>Request edit</Btn></div>}/>
     <div className="flex items-center gap-4 mb-6"><div className="w-14 h-14 rounded-2xl bg-sky-100 text-sky-700 grid place-items-center font-bold text-xl">{me.name[0]}</div><div><div className="text-lg font-bold text-slate-900">{me.name}</div><div className="text-sm text-slate-500">{me.role} · {me.dept}</div></div></div>
-    <div className="grid sm:grid-cols-2 gap-4 mb-6">{[["Email",me.email],["Phone",me.phone],["CNIC",me.cnic],["Salary",fmt(me.salary)],["Joined",me.joined],["Status",me.status]].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-xs text-slate-500">{k}</div><div className="font-medium mt-0.5">{v||"—"}</div></div></Card>))}</div>
+    <div className="grid sm:grid-cols-2 gap-4 mb-6">{[["Email",me.email],["Phone",me.phone],["CNIC",me.cnic],["Salary",fmt(me.salary)],["Joined",me.joined],["Status",me.status],["Check-in policy", me.remoteAllowed?"Anywhere (WFH)":"Office only"]].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-xs text-slate-500">{k}</div><div className="font-medium mt-0.5">{v||"—"}</div></div></Card>))}</div>
     <div className="text-xs uppercase tracking-wider text-slate-500 mb-2 font-medium">My documents</div>
     <Card><div className="p-4">{(!me.docs||me.docs.length===0)?<Empty msg="No documents on file"/>:<div className="grid sm:grid-cols-3 gap-3">{me.docs.map(d=>(<button key={d.id} onClick={()=>openDataUrl(d.file||d.img, d.name)} className="text-left bg-slate-50 border border-slate-200 rounded-lg overflow-hidden hover:border-sky-400 hover:shadow-sm transition">{d.img?<img src={d.img} className="w-full h-32 object-cover"/>:<div className="h-32 grid place-items-center text-slate-400"><FileText/></div>}<div className="p-2 text-xs truncate flex items-center gap-1"><span className="text-sky-600">↗</span>{d.name}{d.expiry&&<span className="block text-slate-400">exp {d.expiry}</span>}</div></button>))}</div>}</div></Card>
     {req!==null && <Modal title="Request a profile change" onClose={()=>setReq(null)}><Area label="What needs updating?" value={req} onChange={e=>setReq(e.target.value)} placeholder="e.g. New phone number, updated CNIC scan"/><Btn onClick={submit}><Check size={15}/>Send to HR</Btn></Modal>}
@@ -1743,7 +1753,7 @@ function Employees({ data, update, mutateData }) {
   const rows = data.employees, setRows = (r)=>update("employees",r);
   const [edit, setEdit] = useState(null); const [open, setOpen] = useState(null); const [q, setQ] = useState("");
   const [lookup, setLookup] = useState("");
-  const blank = { name:"",role:"",dept:"",email:"",phone:"",cnic:"",salary:"",pf:0,joined:today(),status:"Active",bankName:"",account:"",docs:[] };
+  const blank = { name:"",role:"",dept:"",email:"",phone:"",cnic:"",salary:"",pf:0,joined:today(),status:"Active",remoteAllowed:false,bankName:"",account:"",docs:[] };
   const save = (e)=>{
     const isNew = !e.id;
     const rec = isNew ? { ...e, id: uid() } : e;
@@ -1781,6 +1791,7 @@ function EmployeeForm({ edit, setEdit, save }) {
     <div className="grid grid-cols-2 gap-3"><Field label="Email" value={edit.email} onChange={e=>setEdit({...edit,email:e.target.value})}/><Field label="Phone" value={edit.phone} onChange={e=>setEdit({...edit,phone:e.target.value})}/></div>
     <div className="grid grid-cols-2 gap-3"><Field label="CNIC number" value={edit.cnic} onChange={e=>setEdit({...edit,cnic:e.target.value})} placeholder="00000-0000000-0"/><Field label="Monthly salary (PKR)" type="number" value={edit.salary} onChange={e=>setEdit({...edit,salary:e.target.value})}/></div>
     <div className="grid grid-cols-2 gap-3"><Field label="Provident fund (% of basic)" type="number" value={edit.pf} onChange={e=>setEdit({...edit,pf:e.target.value})}/><Field label="Joined" type="date" value={edit.joined} onChange={e=>setEdit({...edit,joined:e.target.value})}/></div>
+    <Select label="Check-in policy" options={["Office only (geofenced)","Anywhere (work from home)"]} value={edit.remoteAllowed?"Anywhere (work from home)":"Office only (geofenced)"} onChange={e=>setEdit({...edit,remoteAllowed:e.target.value.startsWith("Anywhere")})}/>
     <Select label="Status" options={["Active","Inactive"]} value={edit.status} onChange={e=>setEdit({...edit,status:e.target.value})}/>
     <div className="grid grid-cols-2 gap-3"><Field label="Bank name" value={edit.bankName||""} onChange={e=>setEdit({...edit,bankName:e.target.value})} placeholder="e.g. Meezan Bank"/><Field label="Account number / IBAN" value={edit.account||""} onChange={e=>setEdit({...edit,account:e.target.value})}/></div>
     <div><span className="text-xs text-slate-500 mb-1 block">Documents (set an expiry to get reminders)</span>
@@ -2427,12 +2438,18 @@ function Retainers({ data, update, patch, brand, go }) {
   const saveExtend = () => { patch({ retainerInvoices: invs.map(i=>i.id===extend.id?{...i, due: extend.due, dueExtended:true}:i) }, `Extended due date for ${extend.client} (${extend.number})`); setExtend(null); };
   const clearUnpaid = () => {
     const unpaid = invs.filter(i=>i.status!=="Paid" && i.status!=="Partial");
-    if (!unpaid.length) { alert("No unpaid invoices to clear."); return; }
-    if (!confirm(`Delete ${unpaid.length} unpaid invoice(s)? Paid and partially-paid invoices are kept. This is for clearing invoices that were generated automatically.`)) return;
+    const openRecv = (data.receivables||[]).filter(r=>r.status!=="Paid");
+    if (!unpaid.length && !openRecv.length) { alert("Nothing to clear — no unpaid invoices and no open receivables."); return; }
+    if (!confirm(`This will delete:\n\n• ${unpaid.length} unpaid retainer invoice(s)\n• ${openRecv.length} open receivable entr(ies)\n\nPaid and partially-paid records are kept (they are your record of money received). Nothing will regenerate afterwards. Continue?`)) return;
     const keepIds = new Set(invs.filter(i=>i.status==="Paid"||i.status==="Partial").map(i=>i.id));
-    // stamp each affected retainer's cycle marker so they don't regenerate this cycle
+    // stamp each affected retainer's cycle marker so nothing regenerates for that cycle
     const cycles = {}; unpaid.forEach(i=>{ if(i.retainerId) cycles[i.retainerId]=i.monthKey; });
-    patch({ retainerInvoices: invs.filter(i=>keepIds.has(i.id)), retainers: rets.map(r=>cycles[r.id]?{...r,lastGenCycle:cycles[r.id]}:r) }, `Cleared ${unpaid.length} unpaid retainer invoices`);
+    const keepRecvIds = new Set(openRecv.map(r=>r.id));
+    patch({
+      retainerInvoices: invs.filter(i=>keepIds.has(i.id)),
+      retainers: rets.map(r=>cycles[r.id]?{...r,lastGenCycle:cycles[r.id]}:r),
+      receivables: (data.receivables||[]).filter(r=>!keepRecvIds.has(r.id)),
+    }, `Cleared ${unpaid.length} unpaid invoices and ${openRecv.length} open receivables`);
   };
   const blank = { client:"", whatsapp:"", amount:"", currency:"PKR", billingDay:1, status:"Active", carry:0 };
   const onClient=(v)=>{ const c=clients.find(x=>x.name===v); setEdit(e=>({...e,client:v,...(c?{currency:c.currency||"PKR",whatsapp:c.whatsapp||e.whatsapp}:{})})); };
@@ -2475,7 +2492,7 @@ function Retainers({ data, update, patch, brand, go }) {
   };
   return (<>
     <Head title="Retainers" sub="Invoices are created only when you click Generate now (never on refresh). Issued 1st, due 5th of next month." action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>go("accounts")}><Landmark size={15}/>Accounts</Btn><Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn></div>}/>
-    <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="invoices"?"primary":"ghost"} onClick={()=>setView("invoices")}>Invoices</Btn><Btn variant={view==="clients"?"primary":"ghost"} onClick={()=>setView("clients")}>Clients</Btn>{view==="invoices" && <><Btn variant="ghost" onClick={genDue}><Repeat size={15}/>Generate now</Btn><Btn variant="ghost" onClick={newManual}><Plus size={15}/>Create invoice</Btn><Btn variant="ghost" onClick={clearUnpaid}><X size={15}/>Clear unpaid</Btn></>}</div>
+    <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="invoices"?"primary":"ghost"} onClick={()=>setView("invoices")}>Invoices</Btn><Btn variant={view==="clients"?"primary":"ghost"} onClick={()=>setView("clients")}>Clients</Btn>{view==="invoices" && <><Btn variant="ghost" onClick={genDue}><Repeat size={15}/>Generate now</Btn><Btn variant="ghost" onClick={newManual}><Plus size={15}/>Create invoice</Btn><Btn variant="ghost" onClick={clearUnpaid}><X size={15}/>Clear unpaid & receivables</Btn></>}</div>
     {view==="clients" ? (
       <Card><Table cols={["Client","WhatsApp","Monthly","Carried fwd","Status",""]}>{rets.length===0?<tr><td colSpan={6}><Empty msg="No retainer clients yet"/></td></tr>:rets.map(r=>(
         <Row key={r.id}><Td className="font-medium">{r.client}</Td><Td className="text-slate-500">{r.whatsapp||"—"}</Td><Td>{fmt(r.amount,r.currency)}</Td><Td className={+r.carry?"text-amber-600 font-medium":"text-slate-400"}>{r.carry?fmt(r.carry,r.currency):"—"}</Td><Td><Pill s={r.status}/></Td><Td><RowActions onEdit={()=>setEdit(r)} onDelete={()=>update("retainers",rets.filter(x=>x.id!==r.id))}/></Td></Row>))}</Table></Card>
@@ -2823,6 +2840,23 @@ function Backup({ data, brand, restore, wipe }) {
 function BankAccounts({ data, update }) {
   const rows = data.bankAccounts || [];
   const [edit, setEdit] = useState(null); const [tab, setTab] = useState("Company");
+  const [copiedId, setCopiedId] = useState(null);
+  const acctText = (a) => [
+    a.title && `Account Title: ${a.title}`,
+    a.bank && `Bank: ${a.bank}`,
+    `Account Number: ${a.number}`,
+    a.iban && `IBAN: ${a.iban}`,
+  ].filter(Boolean).join("\n");
+  const copyAcct = async (a) => {
+    const text = acctText(a);
+    try { await navigator.clipboard.writeText(text); }
+    catch {
+      // fallback for browsers where the clipboard API is blocked
+      const ta = document.createElement("textarea"); ta.value = text; document.body.appendChild(ta);
+      ta.select(); try { document.execCommand("copy"); } catch {} ta.remove();
+    }
+    setCopiedId(a.id); setTimeout(()=>setCopiedId(c=>c===a.id?null:c), 1800);
+  };
   const blank = { type:"Company", label:"", title:"", number:"", iban:"", bank:"", notes:"" };
   const save = (a) => {
     if (!a.label || !a.number) return;
@@ -2844,6 +2878,9 @@ function BankAccounts({ data, update }) {
           {a.iban && <div><span className="text-slate-500">IBAN: </span><b>{a.iban}</b></div>}
           {a.notes && <div className="text-slate-500 text-xs mt-1">{a.notes}</div>}
         </div>
+        <button onClick={()=>copyAcct(a)} className={`mt-3 w-full flex items-center justify-center gap-1.5 py-2 rounded-lg text-sm font-medium border transition ${copiedId===a.id?"bg-emerald-50 border-emerald-300 text-emerald-700":"bg-white border-slate-300 text-slate-700 hover:border-sky-400 hover:text-sky-700"}`}>
+          {copiedId===a.id ? <><Check size={15}/>Copied — ready to paste</> : <><Copy size={15}/>Copy bank details</>}
+        </button>
       </div></Card>))}</div>}
     {edit && <Modal title={edit.id?"Edit account":"Add account"} onClose={()=>setEdit(null)}>
       <Select label="Type" options={["Company","Founder personal"]} value={edit.type} onChange={e=>setEdit({...edit,type:e.target.value})}/>
