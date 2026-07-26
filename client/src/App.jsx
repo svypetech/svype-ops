@@ -47,7 +47,7 @@ const DB = {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 24 Jul 2026 · onboarding-v1";
+const APP_BUILD = "Build 26 Jul 2026 · leave-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -102,7 +102,19 @@ const timeOf = (iso) => iso ? new Date(iso).toLocaleTimeString([], { hour: "2-di
 const dtOf = (iso) => iso ? new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
 const dayCount = (from, to) => { const a = new Date(from), b = new Date(to); return Math.max(1, Math.round((b - a) / 86400000) + 1); };
 const daysUntil = (d) => Math.round((new Date(d) - new Date()) / 86400000);
-const ENTITLEMENT = { Annual: 14, Sick: 8, Casual: 10 };
+// Svype Leave Policy (see Leave Policy doc). 2026 figures are the prorated Aug-Dec entitlement;
+// from 2027 onward the full annual entitlement applies. Bereavement is per qualifying event.
+const LEAVE_POLICY = {
+  Casual:      { full: 6,  y2026: 3 },
+  Sick:        { full: 8,  y2026: 3 },
+  Annual:      { full: 12, y2026: 5 },
+  Bereavement: { full: 3,  y2026: 3, perEvent: true },
+};
+const LEAVE_TYPES = ["Casual","Sick","Annual","Bereavement","Unpaid"];
+const entitlementFor = (type, year = new Date().getFullYear()) => {
+  const p = LEAVE_POLICY[type]; if (!p) return null;
+  return year === 2026 ? p.y2026 : p.full;
+};
 const CURRENCIES = ["PKR", "SAR", "AED", "GBP", "USD", "CAD"];
 
 /* Pakistan salaried income-tax slabs (FY 2025–26, annual) — estimate */
@@ -137,18 +149,20 @@ function readFile(file) {
 }
 // Open a stored data URL (PDF/image/etc.) in a new tab.
 function openDataUrl(dataUrl, name) {
-  if (!dataUrl) return;
+  if (!dataUrl) { alert("This document has no stored file — it was uploaded before an earlier fix and only its name was saved. Please ask HR to re-upload it."); return; }
   try {
     const [meta, b64] = dataUrl.split(",");
     const mime = (meta.match(/data:(.*?);/) || [])[1] || "application/octet-stream";
     const bin = atob(b64); const arr = new Uint8Array(bin.length);
     for (let i=0;i<bin.length;i++) arr[i] = bin.charCodeAt(i);
-    const blob = new Blob([arr], { type: mime });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a"); a.href = url; a.target = "_blank"; a.rel = "noopener";
-    if (name) a.download = name;
-    a.click(); setTimeout(()=>URL.revokeObjectURL(url), 10000);
-  } catch { window.open(dataUrl, "_blank"); }
+    const url = URL.createObjectURL(new Blob([arr], { type: mime }));
+    // window.open must happen synchronously inside the tap for phones; download is the fallback.
+    const w = window.open(url, "_blank");
+    if (!w) { const a = document.createElement("a"); a.href = url; if (name) a.download = name; document.body.appendChild(a); a.click(); a.remove(); }
+    setTimeout(()=>URL.revokeObjectURL(url), 60000);
+  } catch {
+    try { window.open(dataUrl, "_blank"); } catch { alert("Couldn't open this document on this device."); }
+  }
 }
 
 
@@ -256,14 +270,14 @@ function adminNotes(data) {
   data.retainerInvoices.filter(i=>i.status!=="Paid").forEach(i=>out.push({ text:`${i.client}: retainer ${fmt(i.total,i.currency)} unpaid`, tab:"retainers" }));
   data.receivables.filter(r=>r.status==="Overdue").forEach(r=>out.push({ text:`${r.client}: receivable overdue`, tab:"receivables" }));
   data.payables.filter(p=>p.kind==="reimbursement" && p.status==="Pending").forEach(p=>out.push({ text:`${p.vendor}: reimbursement to approve`, tab:"payables" }));
-  data.leaves.filter(l=>l.status==="Pending").forEach(l=>out.push({ text:`${l.employee}: leave pending`, tab:"attendance" }));
+  data.leaves.filter(l=>l.status==="Pending").forEach(l=>out.push({ text:`${l.employee}: ${l.type||""} leave ${l.from} → ${l.to} (${dayCount(l.from,l.to)}d) awaiting approval`, tab:"attendance" }));
   data.requests.filter(r=>r.status!=="Done").forEach(r=>out.push({ text:`${r.employee}: ${r.type}`, tab:"requests" }));
   data.employees.forEach(e=>(e.docs||[]).forEach(d=>{ if(d.expiry){ const dd=daysUntil(d.expiry); if(dd<=30) out.push({ text:`${e.name}: ${d.name} ${dd<0?"expired":"expires in "+dd+"d"}`, tab:"employees" }); }}));
   return out;
 }
 function empNotes(data, me) {
   const out = [];
-  data.leaves.filter(l=>l.employee===me.name && l.status!=="Pending").slice(0,5).forEach(l=>out.push({ text:`Leave ${l.from}: ${l.status}`, tab:"attendance" }));
+  [...data.leaves].filter(l=>l.employee===me.name && l.status!=="Pending").sort((a,b)=>(b.decidedOn||"").localeCompare(a.decidedOn||"")).slice(0,5).forEach(l=>out.push({ text:`Your ${l.type||""} leave (${l.from} → ${l.to}) was ${l.status==="Approved"?"approved ✓":"declined"}`, tab:"attendance" }));
   data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===me.name && p.status!=="Pending").slice(0,5).forEach(p=>out.push({ text:`Expense claim: ${p.status}`, tab:"expenses" }));
   return out;
 }
@@ -282,7 +296,6 @@ function searchAll(data, q) {
 const ROLES = { admin: "Founder (Admin)", hr: "HR / PM", employee: "Employee" };
 const NAV = [
   { id:"dash", label:"Dashboard", icon:LayoutDashboard },
-  { id:"chat", label:"Team Chat", icon:MessageSquare },
   { id:"employees", label:"Employees", icon:Users },
   { id:"users", label:"Users & Access", icon:UserCircle },
   { id:"permissions", label:"Permissions", icon:Settings, adminOnly:true },
@@ -316,7 +329,6 @@ const NAV = [
 // Grouped navigation: each top-level section opens to a page with sub-tabs.
 const NAV_GROUPS = [
   { id:"dash", label:"Dashboard", icon:LayoutDashboard, tabs:["dash"] },
-  { id:"chat", label:"Team Chat", icon:MessageSquare, tabs:["chat"] },
   { id:"people", label:"People", icon:Users, tabs:["employees","attendance","payroll","advances","recruit","cvbank"] },
   { id:"sales", label:"Clients & Sales", icon:Contact, tabs:["clients","proposals","quotations","retainers","invoices","receipts"] },
   { id:"finance", label:"Finance", icon:Wallet, tabs:["payables","receivables","vendorbills","accounts"] },
@@ -337,7 +349,6 @@ const TAB_LABELS = {
 const groupOfTab = (tabId) => NAV_GROUPS.find(g => g.tabs.includes(tabId)) || NAV_GROUPS[0];
 const EMP_NAV = [
   { id:"dash", label:"Home", icon:LayoutDashboard },
-  { id:"chat", label:"Team Chat", icon:MessageSquare },
   { id:"profile", label:"My Profile", icon:UserCircle },
   { id:"attendance", label:"Attendance & Leave", icon:CalendarCheck },
   { id:"payslips", label:"Payslips", icon:Wallet },
@@ -385,6 +396,21 @@ export default function App() {
     } catch {}
     setLoading(false);
   })(); }, []);
+
+  // Anti-staleness: quietly re-fetch the latest data every 60s and whenever the tab regains
+  // focus, so a tab left open all day never saves on top of hours-old data.
+  useEffect(() => {
+    const tick = async () => {
+      if (_saving || _saveQueue.length) return; // never interrupt our own pending saves
+      try {
+        const st = await apiReq("GET", "/state");
+        if (st && st.doc && +st.rev > _rev) { initSaveState(st.doc, +st.rev); setData({ ...SEED, ...st.doc }); }
+      } catch {}
+    };
+    const iv = setInterval(tick, 60000);
+    window.addEventListener("focus", tick);
+    return () => { clearInterval(iv); window.removeEventListener("focus", tick); };
+  }, []);
 
   const role = session?.role || null;
   const meId = session?.empId || null;
@@ -701,11 +727,24 @@ function ClientInput({ label="Client", clients, value, onChange }) {
 }
 
 /* ---------------- leave helpers ---------------- */
-function leaveUsed(data, name) { const used={Annual:0,Sick:0,Casual:0}; data.leaves.filter(l=>l.employee===name&&l.status==="Approved").forEach(l=>{ if(used[l.type]!=null) used[l.type]+=dayCount(l.from,l.to); }); return used; }
+function leaveUsed(data, name, year = new Date().getFullYear()) {
+  const used={Casual:0,Sick:0,Annual:0,Bereavement:0};
+  (data.leaves||[]).filter(l=>l.employee===name && l.status==="Approved" && (l.from||"").startsWith(String(year)))
+    .forEach(l=>{ if(used[l.type]!=null) used[l.type]+=dayCount(l.from,l.to); });
+  return used;
+}
+function leaveLeft(data, name, type, year = new Date().getFullYear()) {
+  const ent = entitlementFor(type, year); if (ent===null) return null;
+  return ent - leaveUsed(data, name, year)[type];
+}
 function LeaveBalances({ data, name }) {
-  const used = leaveUsed(data, name);
-  return (<div className="grid grid-cols-3 gap-3">{Object.keys(ENTITLEMENT).map(t=>{ const left=ENTITLEMENT[t]-used[t]; return (
-    <Card key={t}><div className="p-4 text-center"><div className="text-2xl font-bold text-slate-900">{left}</div><div className="text-xs text-slate-500 mt-0.5">{t} left</div><div className="text-xs text-slate-400">of {ENTITLEMENT[t]}</div></div></Card>); })}</div>);
+  const yr = new Date().getFullYear();
+  const used = leaveUsed(data, name, yr);
+  return (<div>
+    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">{["Casual","Sick","Annual","Bereavement"].map(t=>{ const ent=entitlementFor(t,yr); const left=Math.max(0, ent-used[t]); const perEvent=LEAVE_POLICY[t].perEvent; return (
+      <Card key={t}><div className="p-4 text-center"><div className="text-2xl font-bold text-slate-900">{left}</div><div className="text-xs text-slate-500 mt-0.5">{t} left</div><div className="text-xs text-slate-400">of {ent}{perEvent?" / event":""}{yr===2026?" (2026)":""}</div></div></Card>); })}</div>
+    {yr===2026 && <div className="text-xs text-slate-400 mt-2">2026 entitlements are prorated for Aug–Dec per the leave policy; full entitlement (6 casual · 8 sick · 12 annual) applies from 2027. Public holidays follow the Government of Pakistan calendar.</div>}
+  </div>);
 }
 
 /* ---------------- payroll calc ---------------- */
@@ -837,27 +876,47 @@ function EmpProfile({ data, update, me }) {
 }
 function EmpAttendance({ data, update, mutateData, me }) {
   const [lf, setLf] = useState(null);
-  const blank = { employee:me.name, type:"Annual", from:today(), to:today(), reason:"", status:"Pending" };
+  const blank = { employee:me.name, type:"Casual", from:today(), to:today(), reason:"", status:"Pending" };
   const myLeaves = data.leaves.filter(l=>l.employee===me.name);
   const myAtt = data.attendance.filter(a=>a.employee===me.name).slice().reverse().slice(0,10);
-  const save = (l)=>{ update("leaves", [...data.leaves, { ...l, id:uid() }]); setLf(null); };
+  const [lerr, setLerr] = useState("");
+  const save = (l)=>{
+    const days = dayCount(l.from, l.to);
+    if (!days || days < 1) { setLerr("Pick a valid date range."); return; }
+    if (l.type==="Bereavement" && days > 3) { setLerr("Bereavement leave is 3 days per qualifying event. For more time, please speak to HR."); return; }
+    if (["Casual","Sick","Annual"].includes(l.type)) {
+      const left = leaveLeft(data, me.name, l.type);
+      if (days > left) { setLerr(`You have ${Math.max(0,left)} ${l.type.toLowerCase()} day(s) left this year — this request is ${days} day(s).`); return; }
+    }
+    mutateData((cur)=>({ ...cur, leaves: [...(cur.leaves||[]), { ...l, days, id:uid(), requestedOn: today() }] }), `${me.name} requested ${l.type} leave (${l.from} → ${l.to})`);
+    setLf(null); setLerr("");
+  };
   return (<>
     <Head title="Attendance & Leave" sub="Check in, track your days, request leave"/>
     <div className="space-y-5">
       <CheckInCard data={data} mutateData={mutateData} me={me}/>
       <LeaveBalances data={data} name={me.name}/>
       <div className="flex justify-between items-center"><div className="text-xs uppercase tracking-wider text-slate-500 font-medium">My leave requests</div><Btn onClick={()=>setLf(blank)}><Plus size={15}/>Request leave</Btn></div>
-      <Card><Table cols={["Type","From","To","Days","Status"]}>{myLeaves.length===0?<tr><td colSpan={5}><Empty msg="No leave requests yet"/></td></tr>:myLeaves.map(l=>(<Row key={l.id}><Td>{l.type}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td><Pill s={l.status}/></Td></Row>))}</Table></Card>
+      <Card><Table cols={["Type","From","To","Days","Status"]}>{myLeaves.length===0?<tr><td colSpan={5}><Empty msg="No leave requests yet"/></td></tr>:myLeaves.map(l=>(<Row key={l.id}><Td>{l.type}{l.reason&&<div className="text-xs text-slate-400 max-w-[180px] truncate">{l.reason}</div>}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td><Pill s={l.status}/>{l.decidedOn&&l.status!=="Pending"&&<div className="text-xs text-slate-400 mt-0.5">{l.status.toLowerCase()} {l.decidedOn}</div>}</Td></Row>))}</Table></Card>
       <div className="text-xs uppercase tracking-wider text-slate-500 font-medium">Recent attendance</div>
       <Card><Table cols={["Date","Office","In","Out"]}>{myAtt.length===0?<tr><td colSpan={4}><Empty msg="No attendance recorded"/></td></tr>:myAtt.map(a=>(<Row key={a.id}><Td>{a.date}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td><Td className="text-slate-500">{timeOf(a.checkIn)||"—"}</Td><Td className="text-slate-500">{timeOf(a.checkOut)||"—"}</Td></Row>))}</Table></Card>
     </div>
-    {lf && <Modal title="Request leave" onClose={()=>setLf(null)}><Select label="Type" options={["Annual","Sick","Casual","Unpaid"]} value={lf.type} onChange={e=>setLf({...lf,type:e.target.value})}/><div className="grid grid-cols-2 gap-3"><Field label="From" type="date" value={lf.from} onChange={e=>setLf({...lf,from:e.target.value})}/><Field label="To" type="date" value={lf.to} onChange={e=>setLf({...lf,to:e.target.value})}/></div><Field label="Reason" value={lf.reason} onChange={e=>setLf({...lf,reason:e.target.value})}/><Btn onClick={()=>save(lf)}><Check size={15}/>Submit</Btn></Modal>}
+    {lf && <Modal title="Request leave" onClose={()=>{setLf(null);setLerr("");}}>
+      <Select label="Type" options={LEAVE_TYPES} value={lf.type} onChange={e=>{setLf({...lf,type:e.target.value});setLerr("");}}/>
+      <div className="grid grid-cols-2 gap-3"><Field label="From" type="date" value={lf.from} onChange={e=>{setLf({...lf,from:e.target.value});setLerr("");}}/><Field label="To" type="date" value={lf.to} onChange={e=>{setLf({...lf,to:e.target.value});setLerr("");}}/></div>
+      <div className="text-xs text-slate-500">{dayCount(lf.from,lf.to)||0} day(s){["Casual","Sick","Annual"].includes(lf.type)?` · ${Math.max(0,leaveLeft(data,me.name,lf.type))} ${lf.type.toLowerCase()} left this year`:""}</div>
+      {lf.type==="Sick" && dayCount(lf.from,lf.to)>2 && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">Per policy: more than 2 consecutive sick days requires a medical report to HR.</div>}
+      <Area label="Reason" value={lf.reason} onChange={e=>setLf({...lf,reason:e.target.value})}/>
+      {lerr && <div className="text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{lerr}</div>}
+      <Btn onClick={()=>save(lf)}><Check size={15}/>Submit request</Btn>
+      <p className="text-xs text-slate-400">Your request goes to HR. You'll be notified here (bell icon) once it's approved or declined.</p>
+    </Modal>}
   </>);
 }
-function EmpPayslips({ data, update, brand, me }) {
+function EmpPayslips({ data, update, mutateData, brand, me }) {
   const [slip, setSlip] = useState(null);
   const slips = data.payroll.filter(p=>p.employee===me.name);
-  const requestCert = (type) => update("requests", [{ id:uid(), employee:me.name, type, status:"Requested", date:today() }, ...data.requests], `${me.name} requested ${type}`);
+  const requestCert = (type) => mutateData((cur)=>({ ...cur, requests:[{ id:uid(), employee:me.name, type, status:"Requested", date:today() }, ...(cur.requests||[])] }), `${me.name} requested ${type}`);
   return (<>
     <Head title="Payslips" sub="Download your slips or request a certificate"/>
     <div className="flex flex-wrap gap-2 mb-4"><Btn variant="ghost" onClick={()=>requestCert("Salary Certificate")}><FileSignature size={15}/>Request salary certificate</Btn><Btn variant="ghost" onClick={()=>requestCert("Experience Certificate")}><ScrollText size={15}/>Request experience certificate</Btn></div>
@@ -1305,7 +1364,7 @@ function Permissions({ data, update }) {
   </>);
 }
 
-function Employees({ data, update }) {
+function Employees({ data, update, mutateData }) {
   const rows = data.employees, setRows = (r)=>update("employees",r);
   const [edit, setEdit] = useState(null); const [open, setOpen] = useState(null); const [q, setQ] = useState("");
   const [lookup, setLookup] = useState("");
@@ -1313,8 +1372,13 @@ function Employees({ data, update }) {
   const save = (e)=>{
     const isNew = !e.id;
     const rec = isNew ? { ...e, id: uid() } : e;
-    const next = isNew ? [...rows, rec] : rows.map(r=>r.id===rec.id?rec:r);
-    update("employees", next, isNew ? `Added employee ${rec.name}` : `Updated employee ${rec.name}`);
+    // Functional per-record write: only THIS employee is replaced/added against the freshest
+    // data on every retry, so a long-open stale tab can never wipe other people's changes.
+    mutateData((cur)=>{
+      const list = cur.employees || [];
+      const employees = isNew ? [...list, rec] : list.some(r=>r.id===rec.id) ? list.map(r=>r.id===rec.id?rec:r) : [...list, rec];
+      return { ...cur, employees };
+    }, isNew ? `Added employee ${rec.name}` : `Updated employee ${rec.name}`);
     setEdit(null);
   };
   const filtered = rows.filter(r=>r.name.toLowerCase().includes(q.toLowerCase()));
@@ -1329,7 +1393,7 @@ function Employees({ data, update }) {
     </div></Card>
     <div className="relative my-4 max-w-xs"><Search size={15} className="absolute left-3 top-2.5 text-slate-400"/><input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search name" className={inputCls+" pl-9"}/></div>
     <Card><Table cols={["Name","Role","Account / IBAN","Salary","Status",""]}>{filtered.length===0?<tr><td colSpan={6}><Empty msg="No employees"/></td></tr>:filtered.map(e=>(
-      <Row key={e.id} onClick={()=>setOpen(e.id)}><Td><div className="font-medium">{e.name}</div><div className="text-xs text-slate-400">{e.email}</div></Td><Td className="text-slate-500">{e.role}</Td><Td className="text-slate-500">{e.account||"—"}</Td><Td className="text-slate-500">{fmt(e.salary)}</Td><Td><Pill s={e.status}/></Td><Td><RowActions onEdit={()=>setEdit(e)} onDelete={()=>update("employees",rows.filter(r=>r.id!==e.id), `Removed employee ${e.name}`)}/></Td></Row>))}</Table></Card>
+      <Row key={e.id} onClick={()=>setOpen(e.id)}><Td><div className="font-medium">{e.name}</div><div className="text-xs text-slate-400">{e.email}</div></Td><Td className="text-slate-500">{e.role}</Td><Td className="text-slate-500">{e.account||"—"}</Td><Td className="text-slate-500">{fmt(e.salary)}</Td><Td><Pill s={e.status}/></Td><Td><RowActions onEdit={()=>setEdit(e)} onDelete={()=>mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(r=>r.id!==e.id) }), `Removed employee ${e.name}`)}/></Td></Row>))}</Table></Card>
     {edit && <EmployeeForm edit={edit} setEdit={setEdit} save={save}/>}
   </>);
 }
@@ -1372,7 +1436,7 @@ function EmployeeProfile({ emp, data, onBack, onEdit }) {
 function Attendance({ data, update, mutateData }) {
   const [view, setView] = useState("attendance");
   const mark = (emp,status)=>{ mutateData((cur)=>{ const list=cur.attendance||[]; const ex=list.find(a=>a.employee===emp&&a.date===today()); return { ...cur, attendance: ex?list.map(a=>a===ex?{...a,status}:a):[...list,{id:uid(),employee:emp,date:today(),status}] }; }, `Marked ${emp} ${status}`); };
-  const setStatus=(id,s)=>{ const l=data.leaves.find(x=>x.id===id); update("leaves",data.leaves.map(x=>x.id===id?{...x,status:s}:x), `Leave ${s.toLowerCase()} for ${l?.employee}`); };
+  const setStatus=(id,s)=>{ const l=data.leaves.find(x=>x.id===id); mutateData((cur)=>({ ...cur, leaves:(cur.leaves||[]).map(x=>x.id===id?{...x,status:s,decidedOn:today()}:x) }), `Leave ${s.toLowerCase()} for ${l?.employee} — they have been notified`); };
   const locLink = (loc) => loc && loc.lat ? `https://www.google.com/maps?q=${loc.lat},${loc.lng}` : null;
   const history = [...data.attendance].sort((a,b)=> (b.date||"").localeCompare(a.date||"") || (b.checkIn||"").localeCompare(a.checkIn||""));
   return (<>
@@ -1386,8 +1450,8 @@ function Attendance({ data, update, mutateData }) {
       <Card><Table cols={["Date","Employee","Office","Check-in","Check-out","In loc","Out loc"]}>{history.length===0?<tr><td colSpan={7}><Empty msg="No attendance recorded yet"/></td></tr>:history.map(a=>{const ll=locLink(a.location);const lo=locLink(a.checkOutLocation);return(
         <Row key={a.id}><Td className="text-slate-500 whitespace-nowrap">{a.date}</Td><Td className="font-medium">{a.employee}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td><Td className="text-slate-500">{a.checkIn?timeOf(a.checkIn):"—"}</Td><Td className="text-slate-500">{a.checkOut?timeOf(a.checkOut):"—"}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td><Td className="text-xs">{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td></Row>);})}</Table></Card>
     ):(
-      <Card><Table cols={["Employee","Type","From","To","Days","Status",""]}>{data.leaves.length===0?<tr><td colSpan={7}><Empty msg="No leave requests"/></td></tr>:data.leaves.map(l=>(
-        <Row key={l.id}><Td className="font-medium">{l.employee}</Td><Td className="text-slate-500">{l.type}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td><Pill s={l.status}/></Td>
+      <Card><Table cols={["Employee","Type & reason","From","To","Days","Balance left","Status",""]}>{data.leaves.length===0?<tr><td colSpan={8}><Empty msg="No leave requests"/></td></tr>:data.leaves.map(l=>(
+        <Row key={l.id}><Td className="font-medium">{l.employee}</Td><Td className="text-slate-500">{l.type}{l.reason&&<div className="text-xs text-slate-400 max-w-[200px] truncate">{l.reason}</div>}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td className="text-xs text-slate-500">{LEAVE_POLICY[l.type]?`${Math.max(0,leaveLeft(data,l.employee,l.type))} left`:"—"}</Td><Td><Pill s={l.status}/></Td>
         <Td>{l.status==="Pending"?<div className="flex gap-1 justify-end"><button onClick={()=>setStatus(l.id,"Approved")} className="p-1.5 rounded text-emerald-600 hover:bg-slate-100"><Check size={14}/></button><button onClick={()=>setStatus(l.id,"Rejected")} className="p-1.5 rounded text-rose-500 hover:bg-slate-100"><X size={14}/></button></div>:<span className="text-xs text-slate-400">—</span>}</Td></Row>))}</Table></Card>
     )}
   </>);
@@ -2177,13 +2241,13 @@ function Receivables({ data, update }) {
     fields={(e,s)=>(<><ClientInput clients={clients} value={e.client} onChange={ev=>s({...e,client:ev.target.value})}/><Field label="Description" value={e.desc} onChange={ev=>s({...e,desc:ev.target.value})}/><Field label="Amount (PKR)" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Field label="Due" type="date" value={e.due} onChange={ev=>s({...e,due:ev.target.value})}/><Select label="Status" options={["Outstanding","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>;
 }
 
-function Requests({ data, update }) {
+function Requests({ data, update, mutateData }) {
   const rows = data.requests;
-  const setStatus = (id,s)=>update("requests", rows.map(r=>r.id===id?{...r,status:s}:r));
+  const setStatus = (id,s)=>mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).map(r=>r.id===id?{...r,status:s}:r) }), `Request marked ${s}`);
   return (<>
     <Head title="Requests" sub="Certificate and profile-edit requests from your team"/>
     <Card><Table cols={["Employee","Type","Note","Date","Status",""]}>{rows.length===0?<tr><td colSpan={6}><Empty msg="No requests"/></td></tr>:rows.map(r=>(
-      <Row key={r.id}><Td className="font-medium">{r.employee}</Td><Td className="text-slate-500">{r.type}</Td><Td className="text-slate-500">{r.note||"—"}</Td><Td className="text-slate-500">{r.date}</Td><Td><Pill s={r.status}/></Td><Td><RowActions onDelete={()=>update("requests",rows.filter(x=>x.id!==r.id))}>{r.status!=="Done"&&<button onClick={()=>setStatus(r.id,"Done")} className="p-1.5 rounded text-emerald-600 hover:bg-slate-100" title="Mark done"><Check size={15}/></button>}</RowActions></Td></Row>))}</Table></Card>
+      <Row key={r.id}><Td className="font-medium">{r.employee}</Td><Td className="text-slate-500">{r.type}</Td><Td className="text-slate-500">{r.note||"—"}</Td><Td className="text-slate-500">{r.date}</Td><Td><Pill s={r.status}/></Td><Td><RowActions onDelete={()=>mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).filter(x=>x.id!==r.id) }))}>{r.status!=="Done"&&<button onClick={()=>setStatus(r.id,"Done")} className="p-1.5 rounded text-emerald-600 hover:bg-slate-100" title="Mark done"><Check size={15}/></button>}</RowActions></Td></Row>))}</Table></Card>
   </>);
 }
 function Announcements({ data, update }) {
