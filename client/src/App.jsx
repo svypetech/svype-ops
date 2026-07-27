@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · login-fix-v1";
+const APP_BUILD = "Build 27 Jul 2026 · notice-timefix-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -160,6 +160,9 @@ const monthKey = () => new Date().toISOString().slice(0, 7);
 const monthLabel = () => new Date().toLocaleString("default", { month: "long", year: "numeric" });
 const fmt = (n, cur) => `${cur || "PKR"} ${Number(n || 0).toLocaleString()}`;
 const timeOf = (iso) => iso ? new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+// A corrected check-in time only counts once HR has approved it. Until then (and if
+// declined) the time that stands is the moment the person actually checked in.
+const effIn = (a) => (a && a.timeReq && a.timeReq.status === "Approved") ? a.timeReq.requested : (a ? a.checkIn : null);
 const dtOf = (iso) => iso ? new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
 const dayCount = (from, to) => { const a = new Date(from), b = new Date(to); return Math.max(1, Math.round((b - a) / 86400000) + 1); };
 const daysUntil = (d) => Math.round((new Date(d) - new Date()) / 86400000);
@@ -351,6 +354,7 @@ function adminNotes(data) {
   data.receivables.filter(r=>r.status==="Overdue").forEach(r=>out.push({ text:`${r.client}: receivable overdue`, tab:"receivables" }));
   data.payables.filter(p=>p.kind==="reimbursement" && p.status==="Pending").forEach(p=>out.push({ text:`${p.vendor}: reimbursement to approve`, tab:"payables" }));
   data.leaves.filter(l=>l.status==="Pending").forEach(l=>out.push({ text:`${l.employee}: ${l.type||""} leave ${l.from} → ${l.to} (${dayCount(l.from,l.to)}d) awaiting approval`, tab:"requests" }));
+  (data.attendance||[]).filter(a=>a.timeReq && a.timeReq.status==="Pending").forEach(a=>out.push({ text:`${a.employee}: check-in time correction for ${a.date} awaiting approval`, tab:"requests" }));
   data.requests.filter(r=>r.status!=="Done").forEach(r=>out.push({ text:`${r.employee}: ${r.type}`, tab:"requests" }));
   data.employees.forEach(e=>(e.docs||[]).forEach(d=>{ if(d.expiry){ const dd=daysUntil(d.expiry); if(dd<=30) out.push({ text:`${e.name}: ${d.name} ${dd<0?"expired":"expires in "+dd+"d"}`, tab:"employees" }); }}));
   return out;
@@ -358,6 +362,7 @@ function adminNotes(data) {
 function empNotes(data, me) {
   const out = [];
   (data.requests||[]).filter(r=>r.employee===me.name && r.status==="Done").slice(0,3).forEach(r=>out.push({ text:`Your ${r.type} is ready — collect it from HR`, tab:"payslips" }));
+  (data.attendance||[]).filter(a=>a.employee===me.name && a.timeReq && a.timeReq.status!=="Pending").slice(-3).forEach(a=>out.push({ text:`Your check-in correction for ${a.date} was ${a.timeReq.status==="Approved"?"approved ✓":"declined — the recorded time stands"}`, tab:"attendance" }));
   [...data.leaves].filter(l=>l.employee===me.name && l.status!=="Pending").sort((a,b)=>(b.decidedOn||"").localeCompare(a.decidedOn||"")).slice(0,5).forEach(l=>out.push({ text:`Your ${l.type||""} leave (${l.from} → ${l.to}) was ${l.status==="Approved"?"approved ✓":"declined"}`, tab:"attendance" }));
   data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===me.name && p.status!=="Pending").slice(0,5).forEach(p=>out.push({ text:`Expense claim: ${p.status}`, tab:"expenses" }));
   return out;
@@ -433,7 +438,7 @@ const EMP_NAV = [
   { id:"dash", label:"Home", icon:LayoutDashboard },
   { id:"profile", label:"My Profile", icon:UserCircle },
   { id:"attendance", label:"Attendance & Leave", icon:CalendarCheck },
-  { id:"todos", label:"Team To-dos", icon:CalendarCheck },
+  { id:"todos", label:"My To-dos", icon:CalendarCheck },
   { id:"payslips", label:"Payslips", icon:Wallet },
   { id:"timesheet", label:"Daily Work Log", icon:Clock },
   { id:"meetings", label:"Meeting Notes", icon:FileText },
@@ -561,7 +566,9 @@ export default function App() {
   const me = isEmp ? data.employees.find(e=>e.id===meId) : null;
   const perms = session?.perms || null; // null/undefined = full access
   const canSeeTab = (id) => {
-    if (id === "permissions" && role !== "admin") return false;
+    // HR has the same reach as the founder by default. Per-user permissions still
+    // apply, so the founder can still narrow a specific HR login if they choose.
+    if (id === "permissions" && role !== "admin" && role !== "hr") return false;
     if (role === "admin") return true;
     if (id === "dash") return true;
     if (!perms) return true;
@@ -572,7 +579,7 @@ export default function App() {
   const empVisible = EMP_NAV.filter(canSeeEmp);
   // For admins, filter groups to those with at least one visible tab.
   const groups = NAV_GROUPS
-    .filter(g => !(g.adminOnly && role !== "admin"))
+    .filter(g => !(g.adminOnly && role !== "admin" && role !== "hr"))
     .map(g => ({ ...g, tabs: g.tabs.filter(canSeeTab) }))
     .filter(g => g.tabs.length > 0);
   const allTabs = isEmp ? empVisible.map(n=>n.id) : groups.flatMap(g=>g.tabs);
@@ -641,6 +648,7 @@ export default function App() {
             {active==="chat" && <TeamChat session={session}/>}
             {active==="profile" && <EmpProfile {...props}/>}
             {active==="attendance" && <EmpAttendance {...props}/>}
+            {active==="todos" && <MyTodos {...props}/>}
             {active==="payslips" && <EmpPayslips {...props}/>}
             {active==="timesheet" && <EmpTimesheet {...props}/>}
             {active==="meetings" && <EmpMeetings {...props}/>}
@@ -1120,7 +1128,7 @@ function EmpProfile({ data, update, me }) {
   return (<>
     <Head title="My Profile" sub="Your records on file" action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>setCert({ type:"Salary Certificate", note:"" })}><FileSignature size={15}/>Request certificate</Btn><Btn variant="ghost" onClick={()=>setReq("")}><Edit3 size={15}/>Request edit</Btn></div>}/>
     <div className="flex items-center gap-4 mb-6"><div className="w-14 h-14 rounded-2xl bg-sky-100 text-sky-700 grid place-items-center font-bold text-xl">{me.name[0]}</div><div><div className="text-lg font-bold text-slate-900">{me.name}</div><div className="text-sm text-slate-500">{me.role} · {me.dept}</div></div></div>
-    <div className="grid sm:grid-cols-2 gap-4 mb-6">{[["Email",me.email],["Phone",me.phone],["CNIC",me.cnic],["Salary",fmt(me.salary)],["Joined",me.joined],["Status",me.status],["Check-in policy", me.remoteAllowed?"Anywhere (WFH)":"Office only"]].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-xs text-slate-500">{k}</div><div className="font-medium mt-0.5">{v||"—"}</div></div></Card>))}</div>
+    <div className="grid sm:grid-cols-2 gap-4 mb-6">{[["Email",me.email],["Phone",me.phone],["CNIC",me.cnic],["Salary",fmt(me.salary)],["Joined",me.joined],["Status",me.status],["Check-in policy", me.remoteAllowed?"Anywhere (WFH)":"Office only"], ...(me.onNotice?[["Employment","On notice period"],["Notice given",me.noticeGivenOn||"—"],["Last working day",me.lastWorkingDay||"—"]]:[])].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-xs text-slate-500">{k}</div><div className="font-medium mt-0.5">{v||"—"}</div></div></Card>))}</div>
     <div className="text-xs uppercase tracking-wider text-slate-500 mb-2 font-medium">My documents</div>
     <Card><div className="p-4">{(!me.docs||me.docs.length===0)?<Empty msg="No documents on file"/>:<div className="grid sm:grid-cols-3 gap-3">{me.docs.map(d=>(<button key={d.id} onClick={()=>openDataUrl(d.file||d.img, d.name)} className="text-left bg-slate-50 border border-slate-200 rounded-lg overflow-hidden hover:border-sky-400 hover:shadow-sm transition">{d.img?<img src={d.img} className="w-full h-32 object-cover"/>:<div className="h-32 grid place-items-center text-slate-400"><FileText/></div>}<div className="p-2 text-xs truncate flex items-center gap-1"><span className="text-sky-600">↗</span>{d.name}{d.expiry&&<span className="block text-slate-400">exp {d.expiry}</span>}</div></button>))}</div>}</div></Card>
     {req!==null && <Modal title="Request a profile change" onClose={()=>setReq(null)}><Area label="What needs updating?" value={req} onChange={e=>setReq(e.target.value)} placeholder="e.g. New phone number, updated CNIC scan"/><Btn onClick={submit}><Check size={15}/>Send to HR</Btn></Modal>}
@@ -1139,6 +1147,22 @@ function EmpAttendance({ data, update, mutateData, me }) {
   const [lerr, setLerr] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [sentMsg, setSentMsg] = useState("");
+  const [tf, setTf] = useState(null); const [terr, setTerr] = useState(""); const [tbusy, setTbusy] = useState(false);
+  const submitTime = async () => {
+    if (!tf.time) { setTerr("Enter the time you actually started."); return; }
+    const iso = new Date(`${tf.date}T${tf.time}`).toISOString();
+    if (isNaN(new Date(iso))) { setTerr("That time doesn't look right."); return; }
+    setTbusy(true); setTerr("");
+    try {
+      await mutateData((cur)=>({ ...cur, attendance:(cur.attendance||[]).map(a=>a.id===tf.id
+        ? { ...a, timeReq:{ requested:iso, reason:(tf.reason||"").trim(), status:"Pending", submittedAt:new Date().toISOString() } } : a) }),
+        `${me.name} requested a check-in time correction for ${tf.date}`);
+      setTf(null);
+      setSentMsg("Correction sent to HR. Your check-in stays as recorded until they approve it.");
+      setTimeout(()=>setSentMsg(""), 7000);
+    } catch { setTerr("Couldn't reach the server — please try again."); }
+    setTbusy(false);
+  };
   const save = async (l)=>{
     const days = dayCount(l.from, l.to);
     if (!days || days < 1) { setLerr("Pick a valid date range."); return; }
@@ -1164,8 +1188,24 @@ function EmpAttendance({ data, update, mutateData, me }) {
       <div className="flex justify-between items-center"><div className="text-xs uppercase tracking-wider text-slate-500 font-medium">My leave requests</div><Btn onClick={()=>setLf(blank)}><Plus size={15}/>Request leave</Btn></div>
       <Card><Table cols={["Type","From","To","Days","Status"]}>{myLeaves.length===0?<tr><td colSpan={5}><Empty msg="No leave requests yet"/></td></tr>:myLeaves.map(l=>(<Row key={l.id}><Td>{l.type}{l.reason&&<div className="text-xs text-slate-400 max-w-[180px] truncate">{l.reason}</div>}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td><Pill s={l.status}/>{l.decidedOn&&l.status!=="Pending"&&<div className="text-xs text-slate-400 mt-0.5">{l.status.toLowerCase()} {l.decidedOn}</div>}</Td></Row>))}</Table></Card>
       <div className="text-xs uppercase tracking-wider text-slate-500 font-medium">Recent attendance</div>
-      <Card><Table cols={["Date","Office","In","Out"]}>{myAtt.length===0?<tr><td colSpan={4}><Empty msg="No attendance recorded"/></td></tr>:myAtt.map(a=>(<Row key={a.id}><Td>{a.date}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td><Td className="text-slate-500">{timeOf(a.checkIn)||"—"}</Td><Td className="text-slate-500">{timeOf(a.checkOut)||"—"}</Td></Row>))}</Table></Card>
+      <Card><Table cols={["Date","Office","In","Out",""]}>{myAtt.length===0?<tr><td colSpan={5}><Empty msg="No attendance recorded"/></td></tr>:myAtt.map(a=>(<Row key={a.id}><Td>{a.date}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td>
+        <Td className="text-slate-500">{timeOf(effIn(a))||"—"}
+          {a.timeReq && a.timeReq.status==="Pending" && <div className="text-xs text-amber-600">correction to {timeOf(a.timeReq.requested)} — awaiting HR</div>}
+          {a.timeReq && a.timeReq.status==="Approved" && <div className="text-xs text-emerald-600">corrected ✓ (checked in {timeOf(a.checkIn)})</div>}
+          {a.timeReq && a.timeReq.status==="Rejected" && <div className="text-xs text-rose-500">correction declined</div>}
+        </Td>
+        <Td className="text-slate-500">{timeOf(a.checkOut)||"—"}</Td>
+        <Td>{a.checkIn && (!a.timeReq || a.timeReq.status==="Rejected")
+          ? <button onClick={()=>{setTf({ id:a.id, date:a.date, time:"", reason:"" });setTerr("");}} className="text-xs text-sky-600 hover:underline whitespace-nowrap">Correct time</button>
+          : <span className="text-xs text-slate-300">—</span>}</Td></Row>))}</Table></Card>
     </div>
+    {tf && <Modal title="Correct my check-in time" onClose={()=>{setTf(null);setTerr("");}}>
+      <p className="text-xs text-slate-500">For {tf.date}. Tell HR the time you actually started — this is sent for approval. Until HR approves it, the recorded check-in time stands.</p>
+      <Field label="Time I actually started" type="time" value={tf.time} onChange={e=>{setTf({...tf,time:e.target.value});setTerr("");}}/>
+      <Area label="Why the check-in was late/missed" value={tf.reason} onChange={e=>setTf({...tf,reason:e.target.value})}/>
+      {terr && <div className="text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{terr}</div>}
+      <Btn onClick={submitTime} disabled={tbusy}>{tbusy?<Loader2 size={15} className="animate-spin"/>:<Check size={15}/>}{tbusy?"Sending…":"Send to HR for approval"}</Btn>
+    </Modal>}
     {lf && <Modal title="Request leave" onClose={()=>{setLf(null);setLerr("");}}>
       <Select label="Type" options={LEAVE_TYPES} value={lf.type} onChange={e=>{setLf({...lf,type:e.target.value});setLerr("");}}/>
       <div className="grid grid-cols-2 gap-3"><Field label="From" type="date" value={lf.from} onChange={e=>{setLf({...lf,from:e.target.value});setLerr("");}}/><Field label="To" type="date" value={lf.to} onChange={e=>{setLf({...lf,to:e.target.value});setLerr("");}}/></div>
@@ -1341,6 +1381,37 @@ function TodoCard({ data, mutateData, session, me }) {
     </Modal>}
   </div></Card>);
 }
+function MyTodos({ data, mutateData, session, me }) {
+  const owner = todoOwner(session, me);
+  const mine = (data.todos||[]).filter(x=>x.owner===owner);
+  const [day, setDay] = useState("");
+  const pending = mine.filter(x=>!x.done).slice().sort((a,b)=>(a.createdOn||"").localeCompare(b.createdOn||""));
+  const completed = mine.filter(x=>x.done && (!day || x.completedOn===day)).slice().sort((a,b)=>(b.completedOn||"").localeCompare(a.completedOn||""));
+  return (<>
+    <Head title="My To-dos" sub={`${pending.length} still to do · ${mine.filter(x=>x.done).length} completed so far`}/>
+    <div className="space-y-5">
+      <TodoCard data={data} mutateData={mutateData} session={session} me={me}/>
+      <div>
+        <div className="text-xs uppercase tracking-wider text-slate-500 font-medium mb-2">Everything still pending</div>
+        <Card>{pending.length===0?<Empty msg="Nothing pending — you're all clear"/>:<div className="divide-y divide-slate-100">{pending.map(x=>(
+          <div key={x.id} className="px-5 py-3">
+            <div className="flex items-center justify-between gap-2"><div className="text-sm font-medium text-slate-800">{x.text}</div>
+              <div className="text-xs text-slate-400 whitespace-nowrap">since {x.createdOn}{x.carry>0?` · carried ${x.carry}d`:""}</div></div>
+            {(x.reasons||[]).length>0 && <div className="mt-1.5 space-y-0.5">{x.reasons.map((r,i)=>(<div key={i} className="text-xs text-slate-500">• {r.missedOn}: <span className="text-slate-600">{r.reason}</span></div>))}</div>}
+          </div>))}</div>}</Card>
+      </div>
+      <div>
+        <div className="flex flex-wrap items-end justify-between gap-3 mb-2">
+          <div className="text-xs uppercase tracking-wider text-slate-500 font-medium">Completed {day?`on ${day}`:""}</div>
+          <div className="flex items-end gap-2"><div className="min-w-40"><Field label="Check a specific day" type="date" value={day} onChange={e=>setDay(e.target.value)}/></div>{day&&<Btn variant="ghost" onClick={()=>setDay("")}><X size={14}/>Clear</Btn>}</div>
+        </div>
+        <Card>{completed.length===0?<Empty msg={day?`Nothing completed on ${day}`:"Nothing completed yet"}/>:<Table cols={["Task","Planned on","Completed","On time"]}>{completed.map(x=>(
+          <Row key={x.id}><Td className="text-slate-700">{x.text}</Td><Td className="text-slate-500">{x.createdOn}</Td><Td className="text-slate-500">{x.completedOn}</Td>
+          <Td>{x.carry>0?<span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">{x.carry}d late</span>:<span className="text-xs text-emerald-600">on time</span>}</Td></Row>))}</Table>}</Card>
+      </div>
+    </div>
+  </>);
+}
 function TeamTodos({ data, go }) {
   const [openP, setOpenP] = useState(null);
   const [day, setDay] = useState("");
@@ -1419,6 +1490,8 @@ function Dashboard({ data, role, go, mutateData, session, me }) {
   const vbPending = (data.vendorBills||[]).filter(b=>b.status!=="Approved"&&b.status!=="Paid").length;
   // --- compliance ---
   const expiring = data.employees.reduce((n,e)=>n+(e.docs||[]).filter(d=>d.expiry&&daysUntil(d.expiry)<=30).length,0);
+  const onNotice = data.employees.filter(e=>e.onNotice && e.status==="Active").length;
+  const pastLastDay = data.employees.filter(e=>e.onNotice && e.status==="Active" && e.lastWorkingDay && e.lastWorkingDay < t).length;
   const isAdmin = role === "admin";
   const mrr = data.retainers.filter(r=>r.status==="Active").reduce((s2,r)=>s2+ +r.amount,0);
   const stats = [
@@ -1477,6 +1550,8 @@ function Dashboard({ data, role, go, mutateData, session, me }) {
       </Panel>
       <Panel title="Compliance & documents" tab="employees">
         <Line label="Employee documents expiring ≤30 days" value={expiring} good={ok(expiring)} tab="employees"/>
+        <Line label="On notice period" value={onNotice} good={ok(onNotice)} tab="employees"/>
+        {pastLastDay>0 && <Line label="Past their last working day" value={pastLastDay} tab="employees"/>}
         <Line label="Announcements posted" value={(data.announcements||[]).length} tab="announce"/>
         <Line label="Clients on record" value={data.clients.length} tab="clients"/>
       </Panel>
@@ -1701,6 +1776,15 @@ function Clients({ data, update, patch }) {
       <div className="grid grid-cols-2 gap-3"><Field label="Email" value={edit.email} onChange={e=>setEdit({...edit,email:e.target.value})}/><Field label="WhatsApp" value={edit.whatsapp} onChange={e=>setEdit({...edit,whatsapp:e.target.value})} placeholder="9230..."/></div>
       <div className="grid grid-cols-2 gap-3"><Select label="Default currency" options={CURRENCIES} value={edit.currency} onChange={e=>setEdit({...edit,currency:e.target.value})}/><Field label="Monthly retainer (optional)" type="number" value={edit.retainer} onChange={e=>setEdit({...edit,retainer:e.target.value})} placeholder="leave blank if none"/></div>
       <Select label="Status" options={["Active","Inactive"]} value={edit.status||"Active"} onChange={e=>setEdit({...edit,status:e.target.value})}/>
+      <Select label="Employment" options={["Working normally","On notice period"]} value={edit.onNotice?"On notice period":"Working normally"} onChange={e=>setEdit({...edit,onNotice:e.target.value==="On notice period"})}/>
+      {edit.onNotice && <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-3">
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Notice given on" type="date" value={edit.noticeGivenOn||""} onChange={e=>setEdit({...edit,noticeGivenOn:e.target.value})}/>
+          <Field label="Last working day" type="date" value={edit.lastWorkingDay||""} onChange={e=>setEdit({...edit,lastWorkingDay:e.target.value})}/>
+        </div>
+        <Field label="Note (reason, handover, replacement…)" value={edit.noticeNote||""} onChange={e=>setEdit({...edit,noticeNote:e.target.value})}/>
+        <p className="text-xs text-amber-700">They stay fully active — attendance, payroll and to-dos keep working until you set the status to Inactive.</p>
+      </div>}
       <p className="text-xs text-slate-400">Set a monthly retainer to add this client to the Retainers section automatically. Marking a client inactive pauses their retainer.</p>
       <Area label="Notes" value={edit.notes} onChange={e=>setEdit({...edit,notes:e.target.value})}/>
       <Btn onClick={()=>save(edit)}><Check size={15}/>Save</Btn>
@@ -1902,7 +1986,7 @@ function Employees({ data, update, mutateData }) {
     <div className="relative my-4 max-w-xs"><Search size={15} className="absolute left-3 top-2.5 text-slate-400"/><input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search name" className={inputCls+" pl-9"}/></div>
     <BatchBar count={be.count} noun="employee" onClear={be.clear} onDelete={()=>{ const ids=new Set(be.selected); mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(x=>!ids.has(x.id)) }), `Removed ${ids.size} employee(s)`); be.clear(); }}/>
     <Card><Table cols={[<SelBox key="a" on={be.allOn} onChange={be.toggleAll} title="Select all"/>,"Name","Role","Account / IBAN","Salary","Status",""]}>{filtered.length===0?<tr><td colSpan={7}><Empty msg="No employees"/></td></tr>:filtered.map(e=>(
-      <Row key={e.id} onClick={()=>setOpen(e.id)}><SelTd on={be.has(e.id)} onChange={()=>be.toggle(e.id)}/><Td><div className="font-medium">{e.name}</div><div className="text-xs text-slate-400">{e.email}</div></Td><Td className="text-slate-500">{e.role}</Td><Td className="text-slate-500">{e.account||"—"}</Td><Td className="text-slate-500">{fmt(e.salary)}</Td><Td><Pill s={e.status}/></Td><Td><RowActions onEdit={()=>setEdit(e)} onDelete={()=>mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(r=>r.id!==e.id) }), `Removed employee ${e.name}`)}/></Td></Row>))}</Table></Card>
+      <Row key={e.id} onClick={()=>setOpen(e.id)}><SelTd on={be.has(e.id)} onChange={()=>be.toggle(e.id)}/><Td><div className="font-medium">{e.name}</div><div className="text-xs text-slate-400">{e.email}</div>{e.onNotice&&<div className="text-xs text-amber-600 mt-0.5">On notice{e.lastWorkingDay?` · last day ${e.lastWorkingDay}`:""}</div>}</Td><Td className="text-slate-500">{e.role}</Td><Td className="text-slate-500">{e.account||"—"}</Td><Td className="text-slate-500">{fmt(e.salary)}</Td><Td><Pill s={e.status}/></Td><Td><RowActions onEdit={()=>setEdit(e)} onDelete={()=>mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(r=>r.id!==e.id) }), `Removed employee ${e.name}`)}/></Td></Row>))}</Table></Card>
     {edit && <EmployeeForm edit={edit} setEdit={setEdit} save={save}/>}
   </>);
 }
@@ -1955,11 +2039,11 @@ function Attendance({ data, update, mutateData }) {
     <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="attendance"?"primary":"ghost"} onClick={()=>setView("attendance")}>Today's attendance</Btn><Btn variant={view==="history"?"primary":"ghost"} onClick={()=>setView("history")}>Check-in/out log</Btn><Btn variant={view==="leave"?"primary":"ghost"} onClick={()=>setView("leave")}>Leave requests</Btn></div>
     {view==="attendance"?(
       <Card><Table cols={["Employee","Today","In / Out","Office","Location",""]}>{data.employees.filter(e=>e.status==="Active").map(e=>{const a=data.attendance.find(x=>x.employee===e.name&&x.date===today());const ll=locLink(a?.location);const lo=locLink(a?.checkOutLocation);return(
-        <Row key={e.id}><Td className="font-medium">{e.name}</Td><Td>{a?<span className="text-xs text-slate-600">{a.status}</span>:<span className="text-slate-400 text-xs">Not marked</span>}</Td><Td className="text-xs text-slate-500">{a?.checkIn?timeOf(a.checkIn):"—"} / {a?.checkOut?timeOf(a.checkOut):"—"}</Td><Td className="text-xs text-slate-600">{a?.office||a?.checkOutOffice||"—"}</Td><Td className="text-xs"><div className="flex flex-col gap-0.5">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>in</a>:null}{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>out</a>:null}{!ll&&!lo&&<span className="text-slate-400">—</span>}</div></Td>
+        <Row key={e.id}><Td className="font-medium">{e.name}</Td><Td>{a?<span className="text-xs text-slate-600">{a.status}</span>:<span className="text-slate-400 text-xs">Not marked</span>}</Td><Td className="text-xs text-slate-500">{a?.checkIn?timeOf(effIn(a)):"—"} / {a?.checkOut?timeOf(a.checkOut):"—"}{a?.timeReq?.status==="Pending"&&<div className="text-xs text-amber-600">correction pending</div>}{a?.timeReq?.status==="Approved"&&<div className="text-xs text-emerald-600">corrected</div>}</Td><Td className="text-xs text-slate-600">{a?.office||a?.checkOutOffice||"—"}</Td><Td className="text-xs"><div className="flex flex-col gap-0.5">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>in</a>:null}{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>out</a>:null}{!ll&&!lo&&<span className="text-slate-400">—</span>}</div></Td>
         <Td><div className="flex gap-1 justify-end"><button onClick={()=>mark(e.name,"Present")} className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Present</button><button onClick={()=>mark(e.name,"Absent")} className="px-2 py-1 rounded text-xs bg-rose-100 text-rose-700 hover:bg-rose-200">Absent</button><button onClick={()=>mark(e.name,"Leave")} className="px-2 py-1 rounded text-xs bg-amber-100 text-amber-700 hover:bg-amber-200">Leave</button></div></Td></Row>);})}</Table></Card>
     ):view==="history"?(
       <Card><Table cols={["Date","Employee","Office","Check-in","Check-out","In loc","Out loc"]}>{history.length===0?<tr><td colSpan={7}><Empty msg="No attendance recorded yet"/></td></tr>:history.map(a=>{const ll=locLink(a.location);const lo=locLink(a.checkOutLocation);return(
-        <Row key={a.id}><Td className="text-slate-500 whitespace-nowrap">{a.date}</Td><Td className="font-medium">{a.employee}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td><Td className="text-slate-500">{a.checkIn?timeOf(a.checkIn):"—"}</Td><Td className="text-slate-500">{a.checkOut?timeOf(a.checkOut):"—"}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td><Td className="text-xs">{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td></Row>);})}</Table></Card>
+        <Row key={a.id}><Td className="text-slate-500 whitespace-nowrap">{a.date}</Td><Td className="font-medium">{a.employee}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td><Td className="text-slate-500">{a.checkIn?timeOf(effIn(a)):"—"}{a.timeReq?.status==="Pending"&&<div className="text-xs text-amber-600">correction pending</div>}{a.timeReq?.status==="Approved"&&<div className="text-xs text-emerald-600">corrected · was {timeOf(a.checkIn)}</div>}{a.timeReq?.status==="Rejected"&&<div className="text-xs text-slate-400">correction declined</div>}</Td><Td className="text-slate-500">{a.checkOut?timeOf(a.checkOut):"—"}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td><Td className="text-xs">{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td></Row>);})}</Table></Card>
     ):(
       <Card><Table cols={["Employee","Type & reason","From","To","Days","Balance left","Status",""]}>{data.leaves.length===0?<tr><td colSpan={8}><Empty msg="No leave requests"/></td></tr>:data.leaves.map(l=>(
         <Row key={l.id}><Td className="font-medium">{l.employee}</Td><Td className="text-slate-500">{l.type}{l.reason&&<div className="text-xs text-slate-400 max-w-[200px] truncate">{l.reason}</div>}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td className="text-xs text-slate-500">{LEAVE_POLICY[l.type]?`${Math.max(0,leaveLeft(data,l.employee,l.type))} left`:"—"}</Td><Td><Pill s={l.status}/></Td>
@@ -2823,6 +2907,12 @@ function Requests({ data, update, mutateData, go }) {
   const [st, setSt] = useState("open");        // open | decided | all
   const [busyId, setBusyId] = useState(null);
   const setReqStatus = async (id,sv)=>{ setBusyId("R"+id); try { await mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).map(r=>r.id===id?{...r,status:sv,decidedOn:today()}:r) }), `Request marked ${sv}`); } finally { setBusyId(null); } };
+  const setTimeReq = async (id,sv)=>{
+    const a = (data.attendance||[]).find(x=>x.id===id);
+    setBusyId("T"+id);
+    try { await mutateData((cur)=>({ ...cur, attendance:(cur.attendance||[]).map(x=>x.id===id?{ ...x, timeReq:{ ...x.timeReq, status:sv, decidedOn:today() } }:x) }),
+      `Check-in correction ${sv.toLowerCase()} for ${a?.employee} (${a?.date}) — they have been notified`); } finally { setBusyId(null); }
+  };
   const setLeave = async (id,sv)=>{ const l=data.leaves.find(x=>x.id===id); setBusyId("L"+id); try { await mutateData((cur)=>({ ...cur, leaves:(cur.leaves||[]).map(x=>x.id===id?{...x,status:sv,decidedOn:today()}:x) }), `Leave ${sv.toLowerCase()} for ${l?.employee} — they have been notified`); } finally { setBusyId(null); } };
   const delReq = (id)=>mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).filter(x=>x.id!==id) }));
   // Merge the three request streams into one tracked list
@@ -2830,6 +2920,7 @@ function Requests({ data, update, mutateData, go }) {
     ...(data.leaves||[]).map(l=>({ key:"L"+l.id, id:l.id, kind:"leave", employee:l.employee, title:`${l.type||"Leave"} leave`, details:`${l.from} → ${l.to} · ${dayCount(l.from,l.to)}d${l.reason?` · ${l.reason}`:""}`, date:l.requestedOn||l.from, status:l.status, decidedOn:l.decidedOn })),
     ...(data.requests||[]).map(r=>({ key:"R"+r.id, id:r.id, kind:"cert", employee:r.employee, title:r.type, details:r.note||"", date:r.date, status:r.status, decidedOn:r.decidedOn })),
     ...(data.payables||[]).filter(p=>p.kind==="reimbursement").map(p=>({ key:"P"+p.id, id:p.id, kind:"reimb", employee:p.vendor, title:"Expense claim", details:`${fmt(p.amount)}${p.note?` · ${p.note}`:""}`, date:p.date, status:p.status, decidedOn:p.decidedOn })),
+    ...(data.attendance||[]).filter(a=>a.timeReq).map(a=>({ key:"T"+a.id, id:a.id, kind:"time", employee:a.employee, title:"Check-in time correction", details:`${a.date}: recorded ${timeOf(a.checkIn)||"—"} → asking for ${timeOf(a.timeReq.requested)}${a.timeReq.reason?` · ${a.timeReq.reason}`:""}`, date:a.date, status:a.timeReq.status, decidedOn:a.timeReq.decidedOn })),
   ].sort((a,b)=>(b.date||"").localeCompare(a.date||""));
   const isOpen = (r)=> r.kind==="leave" ? r.status==="Pending" : r.kind==="cert" ? (r.status!=="Done"&&r.status!=="Declined") : r.status==="Pending";
   const filtered = rows.filter(r=>(kind==="all"||r.kind===kind) && (st==="all" ? true : st==="open" ? isOpen(r) : !isOpen(r)));
@@ -2840,8 +2931,8 @@ function Requests({ data, update, mutateData, go }) {
   const bulkDone = async () => { const ids=bqIds(); await mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).map(r=>ids.has(r.id)?{...r,status:"Done",decidedOn:today()}:r) }), `Marked ${ids.size} request(s) done`); bq.clear(); };
   const bulkDelete = async () => { const ids=bqIds(); await mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).filter(r=>!ids.has(r.id)) }), `Deleted ${ids.size} request(s)`); bq.clear(); };
   const openCount = rows.filter(isOpen).length;
-  const KINDS = [["all","All"],["leave","Leave"],["cert","Certificates"],["reimb","Expense claims"]];
-  const kindPill = (k)=> k==="leave"?"bg-sky-100 text-sky-700":k==="cert"?"bg-violet-100 text-violet-700":"bg-amber-100 text-amber-700";
+  const KINDS = [["all","All"],["leave","Leave"],["time","Time corrections"],["cert","Certificates"],["reimb","Expense claims"]];
+  const kindPill = (k)=> k==="leave"?"bg-sky-100 text-sky-700":k==="cert"?"bg-violet-100 text-violet-700":k==="time"?"bg-teal-100 text-teal-700":"bg-amber-100 text-amber-700";
   return (<>
     <Head title="HR Requests" sub={`Every request your team sends — leave, certificates, expense claims · ${openCount} awaiting action`}/>
     <div className="flex flex-wrap gap-2 mb-4">
@@ -2861,6 +2952,7 @@ function Requests({ data, update, mutateData, go }) {
         <Td className="text-slate-500 whitespace-nowrap">{r.date}</Td>
         <Td><Pill s={r.status}/>{r.decidedOn&&<div className="text-xs text-slate-400 mt-0.5">{r.decidedOn}</div>}</Td>
         <Td>{busyId===r.key ? <span className="flex items-center gap-1.5 justify-end text-xs text-slate-500"><Loader2 size={13} className="animate-spin"/>Processing…</span>
+          : r.kind==="time" && r.status==="Pending" ? <div className="flex gap-1 justify-end"><button disabled={!!busyId} onClick={()=>setTimeReq(r.id,"Approved")} title="Approve corrected time" className="p-1.5 rounded text-emerald-600 hover:bg-slate-100 disabled:opacity-40"><Check size={15}/></button><button disabled={!!busyId} onClick={()=>setTimeReq(r.id,"Rejected")} title="Decline — keep the recorded time" className="p-1.5 rounded text-rose-500 hover:bg-slate-100 disabled:opacity-40"><X size={15}/></button></div>
           : r.kind==="leave" && r.status==="Pending" ? <div className="flex gap-1 justify-end"><button disabled={!!busyId} onClick={()=>setLeave(r.id,"Approved")} title="Approve" className="p-1.5 rounded text-emerald-600 hover:bg-slate-100 disabled:opacity-40"><Check size={15}/></button><button disabled={!!busyId} onClick={()=>setLeave(r.id,"Rejected")} title="Decline" className="p-1.5 rounded text-rose-500 hover:bg-slate-100 disabled:opacity-40"><X size={15}/></button></div>
           : r.kind==="cert" ? <RowActions onDelete={()=>delReq(r.id)}>{r.status!=="Done"&&<button disabled={!!busyId} onClick={()=>setReqStatus(r.id,"Done")} title="Mark done" className="p-1.5 rounded text-emerald-600 hover:bg-slate-100 disabled:opacity-40"><Check size={15}/></button>}</RowActions>
           : r.kind==="reimb" && r.status==="Pending" ? <button onClick={()=>go("payables")} className="text-xs text-sky-600 hover:underline whitespace-nowrap">Review in Payables</button>
