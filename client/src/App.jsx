@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · timefix-v2";
+const APP_BUILD = "Build 27 Jul 2026 · batch-approve-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -421,11 +421,11 @@ const NAV_GROUPS = [
   { id:"finance", label:"Finance", icon:Wallet, tabs:["payables","receivables","vendorbills","accounts"] },
   { id:"documents", label:"Documents", icon:FileSignature, tabs:["offers","letters","meetings"] },
   { id:"workspace", label:"Workspace", icon:Inbox, tabs:["requests","announce","timesheets"] },
-  { id:"settings", label:"Settings", icon:Settings, adminOnly:true, bottom:true, tabs:["users","permissions","vault","brand","audit","backup"] },
+  { id:"settings", label:"Settings", icon:Settings, adminOnly:true, bottom:true, tabs:["users","permissions","vault","brand","email","audit","backup"] },
 ];
 // Friendly labels for sub-tabs (override the long sidebar labels inside a section)
 const TAB_LABELS = {
-  dash:"Dashboard", chat:"Team Chat",
+  dash:"Dashboard", chat:"Team Chat", email:"Email (sending)",
   employees:"Employees", attendance:"Attendance & Leave", todos:"Team To-dos", payroll:"Payroll & Slips", advances:"Advances & Loans", recruit:"Recruitment", cvbank:"CV Bank",
   clients:"Clients", proposals:"Proposals", quotations:"Quotations", retainers:"Retainers", invoices:"Invoices", receipts:"Receipts",
   payables:"Payables", receivables:"Receivables", vendorbills:"Vendor Bills", accounts:"Bank Accounts",
@@ -660,6 +660,7 @@ export default function App() {
             {active==="employees" && <Employees {...props}/>}
             {active==="users" && <UsersAccess {...props}/>}
             {active==="permissions" && <Permissions {...props}/>}
+            {active==="email" && <EmailSettings {...props}/>}
             {active==="clients" && <Clients {...props}/>}
             {active==="attendance" && <Attendance {...props}/>}
             {active==="payroll" && <Payroll {...props}/>}
@@ -1279,7 +1280,7 @@ function EmpPayslips({ data, update, mutateData, brand, me }) {
     {myReqs.length>0 && <div className="mb-4"><div className="text-xs uppercase tracking-wider text-slate-500 font-medium mb-2">My certificate requests</div>
       <Card><Table cols={["Request","Sent","Status"]}>{myReqs.map(r=>(<Row key={r.id}><Td className="font-medium">{r.type}</Td><Td className="text-slate-500">{r.date}</Td><Td><Pill s={r.status}/>{r.decidedOn&&r.status==="Done"&&<div className="text-xs text-slate-400 mt-0.5">done {r.decidedOn}</div>}</Td></Row>))}</Table></Card></div>}
     <Card><Table cols={["Month","Net pay","Status",""]}>{slips.length===0?<tr><td colSpan={4}><Empty msg="No payslips yet"/></td></tr>:slips.map(p=>(<Row key={p.id}><Td className="font-medium">{p.month}</Td><Td>{fmt(netPay(p))}</Td><Td><Pill s={p.paid?"Paid":"Pending"}/></Td><Td><button onClick={()=>setSlip(p)} className="text-sky-600 text-xs font-medium hover:underline">View / download</button></Td></Row>))}</Table></Card>
-    {slip && <SlipModal slip={slip} brand={brand} onClose={()=>setSlip(null)}/>}
+    {slip && <SlipModal slip={slip} brand={brand} data={data} onClose={()=>setSlip(null)}/>}
   </>);
 }
 function EmpTimesheet({ data, update, me }) {
@@ -1333,8 +1334,82 @@ function EmpExpenses({ data, update, me }) {
     </div></>);
 }
 
+
+// ===== Payslip delivery =====
+// The PDF is built on the server so it exists as a real file — that is what makes it
+// attachable to an email (a Gmail compose link can never carry an attachment).
+function payslipBreakdown(slip) {
+  const cur = slip.currency || "PKR";
+  const plus = [["Basic salary", +slip.basic || 0]];
+  if (+slip.allowances) plus.push(["Allowances", +slip.allowances]);
+  if (+slip.reimbursements) plus.push(["Reimbursements", +slip.reimbursements]);
+  (slip.adjustments||[]).filter(a=>+a.amount>0).forEach(a=>plus.push([a.reason||"Addition", +a.amount]));
+  const minus = [];
+  [["Income tax",slip.tax],["EOBI",slip.eobi],["Provident fund",slip.pf],["Advance / loan",slip.advance]]
+    .forEach(([k,v])=>{ if (+v) minus.push([k, +v]); });
+  (slip.adjustments||[]).filter(a=>+a.amount<0).forEach(a=>minus.push([a.reason||"Deduction", Math.abs(+a.amount)]));
+  const gross = plus.reduce((t,[,v])=>t+v,0), ded = minus.reduce((t,[,v])=>t+v,0);
+  return { cur, plus, minus, gross, ded, net: gross - ded };
+}
+function payslipMessage(slip, brand, { whatsapp = false } = {}) {
+  const b = payslipBreakdown(slip);
+  const B = (t) => whatsapp ? `*${t}*` : t;
+  const money = (n) => fmt(n, b.cur);
+  const L = [];
+  L.push(B(brand?.company || "Salary slip"));
+  L.push(`Salary slip — ${slip.month || ""}`, "");
+  L.push(`Employee: ${slip.employee}`, "");
+  L.push(B("Earnings"));
+  b.plus.forEach(([k,v])=>L.push(`${k}: ${money(v)}`));
+  L.push(`Total earnings: ${money(b.gross)}`, "");
+  L.push(B("Deductions"));
+  if (b.minus.length) b.minus.forEach(([k,v])=>L.push(`${k}: ${money(v)}`)); else L.push("None");
+  L.push(`Total deductions: ${money(b.ded)}`, "");
+  L.push(B(`Net pay: ${money(b.net)}`));
+  if (slip.paid) L.push("", `Paid on ${slip.paidOn || "—"}${slip.payMethod ? ` via ${slip.payMethod}` : ""}.`);
+  L.push("", whatsapp ? "Your detailed slip is attached as a PDF." : "Your detailed salary slip is attached to this email as a PDF.");
+  L.push("", `${brand?.company || ""}`);
+  return L.join("\n");
+}
+async function downloadPayslipPdf(slip, brand, employee) {
+  const r = await apiReq("POST", "/payslip/pdf", { slip, brand, employee });
+  const bin = atob(r.pdf); const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  const url = URL.createObjectURL(new Blob([arr], { type: "application/pdf" }));
+  const a = document.createElement("a"); a.href = url; a.download = r.filename || "payslip.pdf";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 60000);
+}
+
 /* shared slip modal */
-function SlipModal({ slip, brand, onClose }) {
+function SlipModal({ slip, brand, data, sendable = false, onClose }) {
+  const emp = (data?.employees || []).find(e => e.name === slip.employee) || {};
+  const [busy, setBusy] = useState("");
+  const [msg, setMsg] = useState(null);
+  const doPdf = async () => {
+    setBusy("pdf"); setMsg(null);
+    try { await downloadPayslipPdf(slip, brand, emp); }
+    catch (e) { setMsg({ ok:false, text: e.message || "Couldn't build the PDF." }); }
+    setBusy("");
+  };
+  const doEmail = async () => {
+    if (!emp.email) { setMsg({ ok:false, text:"There's no email address on this employee's profile — add one first." }); return; }
+    setBusy("mail"); setMsg(null);
+    try {
+      await apiReq("POST", "/payslip/email", {
+        slip, brand, employee: emp, to: emp.email,
+        subject: `Salary slip — ${slip.month || ""}`,
+        body: payslipMessage(slip, brand),
+      });
+      setMsg({ ok:true, text:`Emailed to ${emp.email} with the PDF attached.` });
+    } catch (e) { setMsg({ ok:false, text: e.message || "The email couldn't be sent." }); }
+    setBusy("");
+  };
+  const doWA = () => {
+    const num = String(emp.phone || "").replace(/\D/g, "");
+    if (!num) { setMsg({ ok:false, text:"No phone number on this employee's profile." }); return; }
+    window.open(`https://wa.me/${num}?text=${encodeURIComponent(payslipMessage(slip, brand, { whatsapp:true }))}`, "_blank");
+  };
   return (<Modal title="Salary slip" onClose={onClose}>
     <div className="bg-white text-slate-900 rounded-lg p-5 text-sm border border-slate-200"><Letterhead brand={brand}/>
       <div className="flex justify-between mb-1"><span className="text-slate-500">Employee</span><b>{slip.employee}</b></div>
@@ -1350,7 +1425,13 @@ function SlipModal({ slip, brand, onClose }) {
         {+slip.advance>0 && <div className="flex justify-between text-slate-500"><span>Advance / loan</span><span>-{fmt(slip.advance)}</span></div>}
         <div className="flex justify-between border-t pt-2 mt-2 font-bold"><span>Net pay</span><span>{fmt(netPay(slip))}</span></div>
       </div></div>
-    <Btn variant="ghost" onClick={()=>window.print()}><Download size={15}/>Print / Save PDF</Btn>
+    <div className="flex flex-wrap gap-2">
+      <Btn variant="ghost" onClick={doPdf} disabled={busy==="pdf"}>{busy==="pdf"?<Loader2 size={15} className="animate-spin"/>:<Download size={15}/>}Download PDF</Btn>
+      {sendable && <Btn onClick={doEmail} disabled={busy==="mail"}>{busy==="mail"?<Loader2 size={15} className="animate-spin"/>:<Send size={15}/>}{busy==="mail"?"Sending…":"Email with PDF attached"}</Btn>}
+      {sendable && <Btn variant="ghost" onClick={doWA}><Send size={15}/>WhatsApp message</Btn>}
+    </div>
+    {msg && <div className={`text-xs rounded-lg px-3 py-2 ${msg.ok?"bg-emerald-50 border border-emerald-200 text-emerald-700":"bg-rose-50 border border-rose-200 text-rose-700"}`}>{msg.text}</div>}
+    {sendable && <p className="text-xs text-slate-400">WhatsApp carries the written breakdown; attach the downloaded PDF there if you want the document too.</p>}
   </Modal>);
 }
 
@@ -1800,12 +1881,14 @@ function Clients({ data, update, patch }) {
   if (open) { const c = rows.find(r=>r.id===open); if (c) return <ClientProfile c={c} data={data} patch={patch} onBack={()=>setOpen(null)} onEdit={()=>openEdit(c)}/>; }
   const isActive = (c)=> (c.status||"Active")==="Active";
   const filtered = rows.filter(c=> show==="all" ? true : show==="active" ? isActive(c) : !isActive(c));
+  const bcl = useBatch(filtered);
   const activeCount = rows.filter(isActive).length;
   return (<>
     <Head title="Clients" sub={`${activeCount} active · ${rows.length} total · used across retainers, invoices, proposals, quotations`} action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>setEdit(blank)}><Plus size={15}/>Quick add</Btn><Btn onClick={()=>setOnboard(true)}><UserPlus size={15}/>Onboard client</Btn></div>}/>
     <div className="flex flex-wrap gap-2 mb-4"><Btn variant={show==="active"?"primary":"ghost"} onClick={()=>setShow("active")}>Active</Btn><Btn variant={show==="inactive"?"primary":"ghost"} onClick={()=>setShow("inactive")}>Inactive</Btn><Btn variant={show==="all"?"primary":"ghost"} onClick={()=>setShow("all")}>All</Btn></div>
-    <Card><Table cols={["Client","Status","Currency","Retainer","WhatsApp","Email",""]}>{filtered.length===0?<tr><td colSpan={7}><Empty msg={show==="inactive"?"No inactive clients":"No clients yet"}/></td></tr>:filtered.map(c=>{ const r=data.retainers.find(x=>x.client===c.name && x.status==="Active"); const act=isActive(c); return (
-      <Row key={c.id} onClick={()=>setOpen(c.id)}><Td className="font-medium">{c.name}{c.notes&&<div className="text-xs text-slate-400">{c.notes}</div>}</Td><Td><Pill s={act?"Active":"Inactive"}/></Td><Td>{c.currency}</Td><Td className="text-slate-500">{r?fmt(r.amount,r.currency):"—"}</Td><Td className="text-slate-500">{c.whatsapp||"—"}</Td><Td className="text-slate-500">{c.email||"—"}</Td>
+    <BatchBar count={bcl.count} noun="client" onClear={bcl.clear} onDelete={()=>{ const ids=new Set(bcl.selected); update("clients", (data.clients||[]).filter(x=>!ids.has(x.id)), `Deleted ${ids.size} client(s)`); bcl.clear(); }}/>
+    <Card><Table cols={[<SelBox key="a" on={bcl.allOn} onChange={bcl.toggleAll} title="Select all"/>,"Client","Status","Currency","Retainer","WhatsApp","Email",""]}>{filtered.length===0?<tr><td colSpan={8}><Empty msg={show==="inactive"?"No inactive clients":"No clients yet"}/></td></tr>:filtered.map(c=>{ const r=data.retainers.find(x=>x.client===c.name && x.status==="Active"); const act=isActive(c); return (
+      <Row key={c.id} onClick={()=>setOpen(c.id)}><SelTd on={bcl.has(c.id)} onChange={()=>bcl.toggle(c.id)}/><Td className="font-medium">{c.name}{c.notes&&<div className="text-xs text-slate-400">{c.notes}</div>}</Td><Td><Pill s={act?"Active":"Inactive"}/></Td><Td>{c.currency}</Td><Td className="text-slate-500">{r?fmt(r.amount,r.currency):"—"}</Td><Td className="text-slate-500">{c.whatsapp||"—"}</Td><Td className="text-slate-500">{c.email||"—"}</Td>
       <Td><RowActions onEdit={()=>openEdit(c)} onDelete={()=>update("clients",rows.filter(x=>x.id!==c.id), `Removed client ${c.name}`)}>
         {act
           ? <button onClick={()=>setStatus(c,"Inactive")} title="Make inactive" className="px-2 py-1 rounded text-xs bg-slate-100 text-slate-600 hover:bg-slate-200">Deactivate</button>
@@ -1955,6 +2038,42 @@ function UsersAccess({ data, update }) {
   </>);
 }
 
+function EmailSettings({ data, patch }) {
+  const cur = data.emailConfig || { host:"smtp.gmail.com", port:465, user:"", pass:"", from:"" };
+  const [f, setF] = useState(cur);
+  const [saved, setSaved] = useState(false);
+  const save = () => {
+    patch({ emailConfig: { ...f, port:+f.port || 465 } }, "Updated email sending settings");
+    setSaved(true); setTimeout(()=>setSaved(false), 3000);
+  };
+  return (<>
+    <Head title="Email (sending)" sub="The mailbox the portal sends salary slips from — with the PDF attached"/>
+    <div className="grid lg:grid-cols-2 gap-5">
+      <Card><div className="p-5 space-y-3">
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="SMTP host" value={f.host} onChange={e=>setF({...f,host:e.target.value})} placeholder="smtp.gmail.com"/>
+          <Field label="Port" type="number" value={f.port} onChange={e=>setF({...f,port:e.target.value})} placeholder="465"/>
+        </div>
+        <Field label="Mailbox address" value={f.user} onChange={e=>setF({...f,user:e.target.value})} placeholder="accounts@svype.com"/>
+        <Field label="App password" type="password" value={f.pass} onChange={e=>setF({...f,pass:e.target.value})} placeholder="16-character app password"/>
+        <Field label="Show as (optional)" value={f.from} onChange={e=>setF({...f,from:e.target.value})} placeholder="Svype Payroll &lt;accounts@svype.com&gt;"/>
+        <Btn onClick={save}><Check size={15}/>Save email settings</Btn>
+        {saved && <div className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">Saved. Open any salary slip and use “Email with PDF attached”.</div>}
+      </div></Card>
+      <Card><div className="p-5 text-sm text-slate-600 space-y-2">
+        <div className="font-semibold text-slate-900">Setting this up with Gmail</div>
+        <p>Gmail will not accept your normal password here. You need an <b>App Password</b>:</p>
+        <ol className="list-decimal ml-5 space-y-1 text-slate-600">
+          <li>Turn on 2-step verification on the Google account.</li>
+          <li>Go to Google Account → Security → App passwords.</li>
+          <li>Create one named “Svype OS” and copy the 16-character code.</li>
+          <li>Paste it above with the mailbox address, host <b>smtp.gmail.com</b>, port <b>465</b>.</li>
+        </ol>
+        <p className="text-xs text-slate-400 pt-2">This password is stored in your portal database so the server can send on your behalf. Use a dedicated mailbox (for example accounts@) rather than a personal one, and revoke the app password from Google if you ever stop using it.</p>
+      </div></Card>
+    </div>
+  </>);
+}
 function Permissions({ data, update }) {
   const users = (data.users||[]).filter(u=>u.role!=="admin"); // founder always full access
   const [sel, setSel] = useState(users[0]?.id || "");
@@ -2067,9 +2186,39 @@ function EmployeeProfile({ emp, data, onBack, onEdit }) {
   </>);
 }
 
+// Literal class strings — Tailwind only ships classes it can see written out in full.
+const MARK_STYLES = [
+  { st:"Present", on:"bg-emerald-600 border-emerald-600 text-white", off:"bg-emerald-100 border-emerald-100 text-emerald-700 hover:bg-emerald-200" },
+  { st:"Absent",  on:"bg-rose-600 border-rose-600 text-white",       off:"bg-rose-100 border-rose-100 text-rose-700 hover:bg-rose-200" },
+  { st:"Leave",   on:"bg-amber-500 border-amber-500 text-white",     off:"bg-amber-100 border-amber-100 text-amber-700 hover:bg-amber-200" },
+];
 function Attendance({ data, update, mutateData }) {
   const [view, setView] = useState("attendance");
-  const mark = (emp,status)=>{ mutateData((cur)=>{ const list=cur.attendance||[]; const ex=list.find(a=>a.employee===emp&&a.date===today()); return { ...cur, attendance: ex?list.map(a=>a===ex?{...a,status}:a):[...list,{id:uid(),employee:emp,date:today(),status}] }; }, `Marked ${emp} ${status}`); };
+  // HR always overrides: whatever the employee did, HR's mark wins and is stamped as theirs.
+  const mark = (emp,status)=>{ mutateData((cur)=>{ const list=cur.attendance||[]; const ex=list.find(a=>a.employee===emp&&a.date===today()); return { ...cur, attendance: ex?list.map(a=>a===ex?{...a,status,markedBy:"HR",markedOn:new Date().toISOString()}:a):[...list,{id:uid(),employee:emp,date:today(),status,markedBy:"HR",markedOn:new Date().toISOString()}] }; }, `Marked ${emp} ${status}`); };
+  const bh = useBatch(data.attendance||[]);
+  const [busyTime,setBusyTime]=useState(null);
+  const decideTime = async (id,sv)=>{
+    const rec=(data.attendance||[]).find(x=>x.id===id); setBusyTime(id);
+    try { await mutateData((cur)=>({ ...cur, attendance:(cur.attendance||[]).flatMap(x=>{
+        if (x.id!==id) return [x];
+        if (sv==="Rejected" && x.viaRequest && !x.checkIn) return [];
+        const timeReq={ ...x.timeReq, status:sv, decidedOn:today() };
+        if (sv==="Approved" && x.viaRequest) return [{ ...x, timeReq, status:"Present", office:x.office||"Added by HR approval" }];
+        return [{ ...x, timeReq }];
+      }) }), `Check-in correction ${sv.toLowerCase()} for ${rec?.employee} (${rec?.date}) — they have been notified`); }
+    finally { setBusyTime(null); }
+  };
+  const TimeReqActions = ({ a }) => {
+    if (!a || !a.timeReq) return null;
+    if (busyTime===a.id) return <div className="text-xs text-slate-500 flex items-center gap-1"><Loader2 size={11} className="animate-spin"/>Processing…</div>;
+    if (a.timeReq.status==="Pending") return (<div className="text-xs text-amber-600">
+      wants {timeOf(a.timeReq.requested)}{a.timeReq.reason?` · ${a.timeReq.reason}`:""}
+      <div className="flex gap-1 mt-1"><button onClick={()=>decideTime(a.id,"Approved")} className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Approve</button><button onClick={()=>decideTime(a.id,"Rejected")} className="px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 hover:bg-rose-200">Decline</button></div>
+    </div>);
+    if (a.timeReq.status==="Approved") return <div className="text-xs text-emerald-600">corrected{a.checkIn?` · was ${timeOf(a.checkIn)}`:""}</div>;
+    return <div className="text-xs text-slate-400">correction declined</div>;
+  };
   const [busyLeave,setBusyLeave]=useState(null);
   const setStatus=async (id,s)=>{ const l=data.leaves.find(x=>x.id===id); setBusyLeave(id); try { await mutateData((cur)=>({ ...cur, leaves:(cur.leaves||[]).map(x=>x.id===id?{...x,status:s,decidedOn:today()}:x) }), `Leave ${s.toLowerCase()} for ${l?.employee} — they have been notified`); } finally { setBusyLeave(null); } };
   const locLink = (loc) => loc && loc.lat ? `https://www.google.com/maps?q=${loc.lat},${loc.lng}` : null;
@@ -2079,11 +2228,15 @@ function Attendance({ data, update, mutateData }) {
     <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="attendance"?"primary":"ghost"} onClick={()=>setView("attendance")}>Today's attendance</Btn><Btn variant={view==="history"?"primary":"ghost"} onClick={()=>setView("history")}>Check-in/out log</Btn><Btn variant={view==="leave"?"primary":"ghost"} onClick={()=>setView("leave")}>Leave requests</Btn></div>
     {view==="attendance"?(
       <Card><Table cols={["Employee","Today","In / Out","Office","Location",""]}>{data.employees.filter(e=>e.status==="Active").map(e=>{const a=data.attendance.find(x=>x.employee===e.name&&x.date===today());const ll=locLink(a?.location);const lo=locLink(a?.checkOutLocation);return(
-        <Row key={e.id}><Td className="font-medium">{e.name}</Td><Td>{a?<span className="text-xs text-slate-600">{a.status}</span>:<span className="text-slate-400 text-xs">Not marked</span>}</Td><Td className="text-xs text-slate-500">{effIn(a)?timeOf(effIn(a)):"—"} / {a?.checkOut?timeOf(a.checkOut):"—"}{a?.timeReq?.status==="Pending"&&<div className="text-xs text-amber-600">correction pending</div>}{a?.timeReq?.status==="Approved"&&<div className="text-xs text-emerald-600">corrected</div>}</Td><Td className="text-xs text-slate-600">{a?.office||a?.checkOutOffice||"—"}</Td><Td className="text-xs"><div className="flex flex-col gap-0.5">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>in</a>:null}{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>out</a>:null}{!ll&&!lo&&<span className="text-slate-400">—</span>}</div></Td>
-        <Td><div className="flex gap-1 justify-end"><button onClick={()=>mark(e.name,"Present")} className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Present</button><button onClick={()=>mark(e.name,"Absent")} className="px-2 py-1 rounded text-xs bg-rose-100 text-rose-700 hover:bg-rose-200">Absent</button><button onClick={()=>mark(e.name,"Leave")} className="px-2 py-1 rounded text-xs bg-amber-100 text-amber-700 hover:bg-amber-200">Leave</button></div></Td></Row>);})}</Table></Card>
+        <Row key={e.id}><Td className="font-medium">{e.name}</Td><Td>{a?<span className="text-xs text-slate-600">{a.status}<div className="text-xs text-slate-400">{a.markedBy?"set by HR":a.checkIn?"checked in":""}</div></span>:<span className="text-slate-400 text-xs">Not marked</span>}</Td><Td className="text-xs text-slate-500">{effIn(a)?timeOf(effIn(a)):"—"} / {a?.checkOut?timeOf(a.checkOut):"—"}<TimeReqActions a={a}/></Td><Td className="text-xs text-slate-600">{a?.office||a?.checkOutOffice||"—"}</Td><Td className="text-xs"><div className="flex flex-col gap-0.5">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>in</a>:null}{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>out</a>:null}{!ll&&!lo&&<span className="text-slate-400">—</span>}</div></Td>
+        <Td><div className="flex gap-1 justify-end">{MARK_STYLES.map(({ st, on:onCls, off:offCls })=>{
+          const on = a?.status===st;
+          return <button key={st} onClick={()=>mark(e.name,st)} title={on?`Already marked ${st.toLowerCase()} — click to re-confirm`:`Set ${st.toLowerCase()} — this overrides whatever the employee did`}
+            className={`px-2 py-1 rounded text-xs border ${on?onCls:offCls}`}>{st}</button>; })}</div></Td></Row>);})}</Table></Card>
     ):view==="history"?(
-      <Card><Table cols={["Date","Employee","Office","Check-in","Check-out","In loc","Out loc"]}>{history.length===0?<tr><td colSpan={7}><Empty msg="No attendance recorded yet"/></td></tr>:history.map(a=>{const ll=locLink(a.location);const lo=locLink(a.checkOutLocation);return(
-        <Row key={a.id}><Td className="text-slate-500 whitespace-nowrap">{a.date}</Td><Td className="font-medium">{a.employee}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td><Td className="text-slate-500">{effIn(a)?timeOf(effIn(a)):"—"}{a.timeReq?.status==="Pending"&&<div className="text-xs text-amber-600">correction pending</div>}{a.timeReq?.status==="Approved"&&<div className="text-xs text-emerald-600">corrected · was {timeOf(a.checkIn)}</div>}{a.timeReq?.status==="Rejected"&&<div className="text-xs text-slate-400">correction declined</div>}</Td><Td className="text-slate-500">{a.checkOut?timeOf(a.checkOut):"—"}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td><Td className="text-xs">{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td></Row>);})}</Table></Card>
+      <><BatchBar count={bh.count} noun="record" onClear={bh.clear} onDelete={()=>{ const ids=new Set(bh.selected); update("attendance", (data.attendance||[]).filter(x=>!ids.has(x.id)), `Deleted ${ids.size} attendance record(s)`); bh.clear(); }}/>
+      <Card><Table cols={[<SelBox key="a" on={bh.allOn} onChange={bh.toggleAll} title="Select all"/>,"Date","Employee","Office","Check-in","Check-out","In loc","Out loc"]}>{history.length===0?<tr><td colSpan={8}><Empty msg="No attendance recorded yet"/></td></tr>:history.map(a=>{const ll=locLink(a.location);const lo=locLink(a.checkOutLocation);return(
+        <Row key={a.id}><SelTd on={bh.has(a.id)} onChange={()=>bh.toggle(a.id)}/><Td className="text-slate-500 whitespace-nowrap">{a.date}</Td><Td className="font-medium">{a.employee}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td><Td className="text-slate-500">{effIn(a)?timeOf(effIn(a)):"—"}<TimeReqActions a={a}/></Td><Td className="text-slate-500">{a.checkOut?timeOf(a.checkOut):"—"}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td><Td className="text-xs">{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td></Row>);})}</Table></Card></>
     ):(
       <Card><Table cols={["Employee","Type & reason","From","To","Days","Balance left","Status",""]}>{data.leaves.length===0?<tr><td colSpan={8}><Empty msg="No leave requests"/></td></tr>:data.leaves.map(l=>(
         <Row key={l.id}><Td className="font-medium">{l.employee}</Td><Td className="text-slate-500">{l.type}{l.reason&&<div className="text-xs text-slate-400 max-w-[200px] truncate">{l.reason}</div>}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td className="text-xs text-slate-500">{LEAVE_POLICY[l.type]?`${Math.max(0,leaveLeft(data,l.employee,l.type))} left`:"—"}</Td><Td><Pill s={l.status}/></Td>
@@ -2098,12 +2251,35 @@ function Payroll({ data, patch, update, brand }) {
   const [editDed, setEditDed] = useState(null);
   const [adj, setAdj] = useState(null);
   const month = monthLabel();
-  const run=()=>{
-    const ids=[]; data.payables.forEach(p=>{ if(p.kind==="reimbursement"&&p.status==="Approved"&&!p.settled&&p.payVia==="salary"&&(!p.payMonth||p.payMonth===month)) ids.push(p.id); });
-    const runs=data.employees.filter(e=>e.status==="Active").map(e=>computePayslip(e,data,month));
+  // Payroll is guarded: it shows exactly who will be processed and can never produce a
+  // second slip (or a second advance deduction) for someone already run this month.
+  const bp = useBatch(data.payroll);
+  const [bulkPay, setBulkPay] = useState(null);
+  const doBulkPay = () => {
+    const ids = new Set(bp.selected);
+    update("payroll", data.payroll.map(x=>ids.has(x.id) && !x.paid
+      ? { ...x, paid:true, payMethod:bulkPay.method, proof:bulkPay.proof||x.proof, paidOn:today() } : x),
+      `Marked ${ids.size} salary slip(s) paid`);
+    bp.clear(); setBulkPay(null);
+  };
+  const [runAsk, setRunAsk] = useState(null);
+  const askRun = () => {
+    const already = data.payroll.filter(p=>p.month===month).map(p=>p.employee);
+    const doneSet = new Set(already);
+    const targets = data.employees.filter(e=>e.status==="Active" && !doneSet.has(e.name));
+    setRunAsk({ already, targets });
+  };
+  const doRun = ()=>{
+    const names = new Set(runAsk.targets.map(e=>e.name));
+    if (!names.size) { setRunAsk(null); return; }
+    // Only the people actually being processed have reimbursements settled and an
+    // advance installment taken — that's what made a repeat run dangerous before.
+    const ids=[]; data.payables.forEach(p=>{ if(p.kind==="reimbursement"&&p.status==="Approved"&&!p.settled&&p.payVia==="salary"&&(!p.payMonth||p.payMonth===month)&&names.has(p.vendor)) ids.push(p.id); });
+    const runs=runAsk.targets.map(e=>computePayslip(e,data,month));
     const newPayables=data.payables.map(p=>ids.includes(p.id)?{...p,settled:true,status:"Paid"}:p);
-    const newAdvances=data.advances.map(a=>{ if(a.status==="Active"&&a.remaining>0){ const d=Math.min(+a.installment,a.remaining); const rem=a.remaining-d; return {...a,remaining:rem,status:rem<=0?"Cleared":"Active"};} return a; });
-    patch({ payroll:[...runs,...data.payroll], payables:newPayables, advances:newAdvances }, `Ran payroll for ${month}`);
+    const newAdvances=data.advances.map(a=>{ if(a.status==="Active"&&a.remaining>0&&names.has(a.employee)){ const d=Math.min(+a.installment,a.remaining); const rem=a.remaining-d; return {...a,remaining:rem,status:rem<=0?"Cleared":"Active"};} return a; });
+    patch({ payroll:[...runs,...data.payroll], payables:newPayables, advances:newAdvances }, `Ran payroll for ${month} · ${runs.length} employee(s)`);
+    setRunAsk(null);
   };
   const saveDed = () => {
     const tax=+editDed.tax||0, eobi=+editDed.eobi||0, pf=+editDed.pf||0, advance=+editDed.advance||0;
@@ -2125,16 +2301,48 @@ function Payroll({ data, patch, update, brand }) {
   const empEmail = (name) => data.employees.find(e=>e.name===name)?.email || "";
   const empAcct = (name) => data.employees.find(e=>e.name===name)?.account || "";
   return (<>
-    <Head title="Payroll & Salary Slips" sub={`${month} · base salary + your adjustments − deductions (no automatic allowance)${pendingReimb?` · ${fmt(pendingReimb)} reimbursements queued`:""}`} action={<Btn onClick={run}><Wallet size={15}/>Run payroll · {month}</Btn>}/>
-    <Card><Table cols={["Employee","Month","Net","Account / IBAN","Payment","",""]}>{data.payroll.length===0?<tr><td colSpan={7}><Empty msg="No payroll runs yet"/></td></tr>:data.payroll.map(p=>(
+    <Head title="Payroll & Salary Slips" sub={`${month} · base salary + your adjustments − deductions (no automatic allowance)${pendingReimb?` · ${fmt(pendingReimb)} reimbursements queued`:""}`} action={<Btn onClick={askRun}><Wallet size={15}/>Run payroll · {month}</Btn>}/>
+    <BatchBar count={bp.count} noun="salary slip" onClear={bp.clear}
+      onDelete={()=>{ const ids=new Set(bp.selected); update("payroll", data.payroll.filter(x=>!ids.has(x.id)), `Deleted ${ids.size} salary slip(s)`); bp.clear(); }}>
+      <Btn variant="ghost" onClick={()=>setBulkPay({ method:"Bank transfer", proof:null })}><Check size={15}/>Mark paid</Btn>
+    </BatchBar>
+    <Card><Table cols={[<SelBox key="a" on={bp.allOn} onChange={bp.toggleAll} title="Select all"/>,"Employee","Month","Net","Account / IBAN","Payment","",""]}>{data.payroll.length===0?<tr><td colSpan={8}><Empty msg="No payroll runs yet"/></td></tr>:data.payroll.map(p=>(
       <Row key={p.id}>
+        <SelTd on={bp.has(p.id)} onChange={()=>bp.toggle(p.id)}/>
         <Td className="font-medium">{p.employee}</Td><Td className="text-slate-500">{p.month}</Td><Td className="font-semibold">{fmt(netPay(p))}{(p.adjustments||[]).length>0&&<div className="text-xs text-slate-400 font-normal">{adjTotal(p)>=0?"+":""}{fmt(adjTotal(p))} adj.</div>}</Td>
         <Td className="text-slate-500 text-xs">{empAcct(p.employee)||"— not on file —"}</Td>
         <Td>{p.paid?<span className="flex items-center gap-2"><Pill s="Paid"/>{p.proof&&<img src={p.proof} className="w-7 h-7 rounded object-cover border border-slate-200"/>}</span>:<Pill s="Pending"/>}</Td>
         <Td><button onClick={()=>setSlip(p)} className="text-sky-600 text-xs font-medium hover:underline">View slip</button></Td>
         <Td><RowActions>{!p.paid && <button onClick={()=>openAdj(p)} title="Add increase / deduction with reason" className="px-2 py-1 rounded text-xs bg-sky-100 text-sky-700 hover:bg-sky-200">Adjust</button>}{!p.paid && <button onClick={()=>setEditDed({...p})} title="Tax / EOBI / PF / advance" className="px-2 py-1 rounded text-xs bg-slate-100 text-slate-600 hover:bg-slate-200">Deductions</button>}{!p.paid && <button onClick={()=>setPayProof({ ...p, proof:null })} className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Mark paid</button>}{p.paid && <button onClick={()=>setPayProof({ ...p })} title="Update payment" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Edit3 size={14}/></button>}</RowActions></Td>
       </Row>))}</Table></Card>
-    {slip && <SlipModal slip={slip} brand={brand} onClose={()=>setSlip(null)}/>}
+    {bulkPay && (()=>{ const chosen=data.payroll.filter(x=>bp.selected.includes(x.id)); const unpaid=chosen.filter(x=>!x.paid); return (
+      <Modal title={`Mark ${unpaid.length} salary slip(s) paid`} onClose={()=>setBulkPay(null)}>
+        {unpaid.length===0 ? <div className="text-sm text-slate-600">Everything selected is already marked paid.</div> : <>
+          <div className="text-sm text-slate-600">Total being paid: <b>{fmt(unpaid.reduce((t,x)=>t+netPay(x),0))}</b> across {unpaid.length} employee(s).</div>
+          <Select label="Payment method" options={["Bank transfer","Cheque","Cash","Wise / online"]} value={bulkPay.method} onChange={e=>setBulkPay({...bulkPay,method:e.target.value})}/>
+          <div><span className="text-xs text-slate-500 mb-1 block">Payment proof (optional — applied to all)</span>
+            <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500"><Paperclip size={15}/>{bulkPay.proof?"Change screenshot":"Attach screenshot"}
+              <input type="file" accept="image/*" className="hidden" onChange={async e=>{ const f=e.target.files[0]; if(f){ const img=await readImage(f,1200,true,0.8); setBulkPay(b=>({...b, proof:img})); } }}/></label>
+            {bulkPay.proof && <img src={bulkPay.proof} className="mt-2 h-24 rounded-lg border border-slate-200 object-cover"/>}
+          </div>
+          {chosen.length!==unpaid.length && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">{chosen.length-unpaid.length} already-paid slip(s) in your selection will be left untouched.</div>}
+          <Btn onClick={doBulkPay}><Check size={15}/>Mark {unpaid.length} paid</Btn>
+        </>}
+      </Modal>); })()}
+    {runAsk && <Modal title={`Run payroll · ${month}`} onClose={()=>setRunAsk(null)}>
+      {runAsk.targets.length===0
+        ? <div className="text-sm text-slate-600">Every active employee already has a salary slip for {month}. Nothing to run — this is what stops a second run from creating duplicate slips or deducting advances twice.</div>
+        : <>
+          <div className="text-sm text-slate-600">This will create <b>{runAsk.targets.length}</b> salary slip{runAsk.targets.length>1?"s":""} for {month}:</div>
+          <div className="max-h-40 overflow-y-auto bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm space-y-0.5">
+            {runAsk.targets.map(e=>(<div key={e.id} className="flex justify-between"><span>{e.name}</span><span className="text-slate-500">{fmt(e.salary)}</span></div>))}
+          </div>
+          {runAsk.already.length>0 && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">Skipping {runAsk.already.length} employee(s) who already have a slip for {month}: {runAsk.already.slice(0,6).join(", ")}{runAsk.already.length>6?"…":""}</div>}
+          <p className="text-xs text-slate-400">Approved reimbursements and one advance installment are applied only to the people listed above.</p>
+        </>}
+      {runAsk.targets.length>0 && <Btn onClick={doRun}><Check size={15}/>Run payroll for {runAsk.targets.length} employee{runAsk.targets.length>1?"s":""}</Btn>}
+    </Modal>}
+    {slip && <SlipModal slip={slip} brand={brand} data={data} sendable onClose={()=>setSlip(null)}/>}
     {adj && <Modal title={`Adjust pay · ${adj.employee}`} onClose={()=>setAdj(null)}>
       <p className="text-xs text-slate-500">Add an increase (bonus, arrears) or a deduction (fine, leave-without-pay) with a reason. Each line appears on the payslip.</p>
       <div className="space-y-2">{adj.list.length===0 && <div className="text-xs text-slate-400">No adjustments yet.</div>}
@@ -2206,6 +2414,7 @@ function PayrollPaidModal({ rec, brand, email, onClose, onSave }) {
 }
 
 function VendorBills({ data, update, patch, role, brand }) {
+  const bv = useBatch(data.vendorBills||[]);
   const rows = data.vendorBills || [];
   const [edit, setEdit] = useState(null);
   const [viewBill, setViewBill] = useState(null);
@@ -2248,9 +2457,10 @@ function VendorBills({ data, update, patch, role, brand }) {
   };
   return (<>
     <Head title="Vendor Bills" sub="Upload vendor invoices → HR approves → Founder approves → moves to Payables (unpaid) → mark paid from Payables" action={<Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Upload bill</Btn>}/>
-    <Card><Table cols={["Vendor","For","Amount","Due","HR","Founder","Status",""]}>
-      {rows.length===0?<tr><td colSpan={8}><Empty msg="No vendor bills uploaded yet"/></td></tr>:rows.map(b=>(
-        <Row key={b.id}>
+    <BatchBar count={bv.count} noun="vendor bill" onClear={bv.clear} onDelete={()=>{ const ids=new Set(bv.selected); update("vendorBills", rows.filter(x=>!ids.has(x.id)), `Deleted ${ids.size} vendor bill(s)`); bv.clear(); }}/>
+    <Card><Table cols={[<SelBox key="a" on={bv.allOn} onChange={bv.toggleAll} title="Select all"/>,"Vendor","For","Amount","Due","HR","Founder","Status",""]}>
+      {rows.length===0?<tr><td colSpan={9}><Empty msg="No vendor bills uploaded yet"/></td></tr>:rows.map(b=>(
+        <Row key={b.id}><SelTd on={bv.has(b.id)} onChange={()=>bv.toggle(b.id)}/>
           <Td className="font-medium">{b.vendor}</Td>
           <Td className="text-slate-500">{b.desc||b.category}</Td>
           <Td>{fmt(b.amount,b.currency)}</Td>
@@ -2297,14 +2507,16 @@ function VendorBills({ data, update, patch, role, brand }) {
 }
 
 function Advances({ data, update }) {
+  const ba = useBatch(data.advances||[]);
   const rows = data.advances, setRows=r=>update("advances",r);
   const [edit, setEdit] = useState(null);
   const blank = { employee:data.employees[0]?.name||"", total:"", installment:"", date:today() };
   const save = (a)=>{ const rec={ ...a, id:uid(), total:+a.total, installment:+a.installment, remaining:+a.total, status:"Active" }; update("advances",[rec,...rows], `Advance ${fmt(rec.total)} to ${rec.employee}`); setEdit(null); };
   return (<>
     <Head title="Advances & Loans" sub="Installments auto-deduct from payslips until cleared" action={<Btn onClick={()=>setEdit(blank)}><Plus size={15}/>New advance</Btn>}/>
-    <Card><Table cols={["Employee","Date","Total","Installment","Remaining","Status",""]}>{rows.length===0?<tr><td colSpan={7}><Empty msg="No advances or loans"/></td></tr>:rows.map(a=>(
-      <Row key={a.id}><Td className="font-medium">{a.employee}</Td><Td className="text-slate-500">{a.date}</Td><Td>{fmt(a.total)}</Td><Td>{fmt(a.installment)}</Td><Td className={a.remaining>0?"text-amber-600 font-medium":"text-slate-400"}>{fmt(a.remaining)}</Td><Td><Pill s={a.status}/></Td><Td><RowActions onDelete={()=>setRows(rows.filter(x=>x.id!==a.id))}/></Td></Row>))}</Table></Card>
+    <BatchBar count={ba.count} noun="advance" onClear={ba.clear} onDelete={()=>{ const ids=new Set(ba.selected); update("advances", rows.filter(x=>!ids.has(x.id)), `Deleted ${ids.size} advance(s)`); ba.clear(); }}/>
+    <Card><Table cols={[<SelBox key="a" on={ba.allOn} onChange={ba.toggleAll} title="Select all"/>,"Employee","Date","Total","Installment","Remaining","Status",""]}>{rows.length===0?<tr><td colSpan={8}><Empty msg="No advances or loans"/></td></tr>:rows.map(a=>(
+      <Row key={a.id}><SelTd on={ba.has(a.id)} onChange={()=>ba.toggle(a.id)}/><Td className="font-medium">{a.employee}</Td><Td className="text-slate-500">{a.date}</Td><Td>{fmt(a.total)}</Td><Td>{fmt(a.installment)}</Td><Td className={a.remaining>0?"text-amber-600 font-medium":"text-slate-400"}>{fmt(a.remaining)}</Td><Td><Pill s={a.status}/></Td><Td><RowActions onDelete={()=>setRows(rows.filter(x=>x.id!==a.id))}/></Td></Row>))}</Table></Card>
     {edit && <Modal title="New advance / loan" onClose={()=>setEdit(null)}>
       <Select label="Employee" options={data.employees.map(e=>e.name)} value={edit.employee} onChange={e=>setEdit({...edit,employee:e.target.value})}/>
       <div className="grid grid-cols-2 gap-3"><Field label="Total amount (PKR)" type="number" value={edit.total} onChange={e=>setEdit({...edit,total:e.target.value})}/><Field label="Monthly installment (PKR)" type="number" value={edit.installment} onChange={e=>setEdit({...edit,installment:e.target.value})}/></div>
@@ -2712,16 +2924,26 @@ function Retainers({ data, update, patch, brand, go }) {
     if (after !== db) patch({ retainerInvoices: after.retainerInvoices, retainers: after.retainers }, `Generated retainer invoices`);
     else alert("Nothing new to generate — every active client already has an invoice for their billing period.\n\nPrepaid clients are billed for the upcoming month, postpaid clients for the month just finished.");
   };
+  const [genAsk, setGenAsk] = useState(null);
+  const openGenPreview = (db) => {
+    const pre = nextMonthInfo(), post = currentMonthInfo();
+    const items = (db.retainers||[]).filter(r=>r.status==="Active").map(r=>{
+      const cyc = r.billing==="Postpaid" ? post : pre;
+      const exists = (db.retainerInvoices||[]).some(i=>i.retainerId===r.id && i.monthKey===cyc.key);
+      return { id:r.id, client:r.client, amount:r.amount, currency:r.currency, billing:r.billing==="Postpaid"?"Postpaid":"Prepaid", period:cyc.label, exists };
+    });
+    setGenAsk({ db, items });
+  };
   const genDue = () => {
     const missing = rets.filter(r=>r.status==="Active" && r.billing!=="Prepaid" && r.billing!=="Postpaid");
     if (missing.length) { setBillAsk(Object.fromEntries(missing.map(r=>[r.id, ""]))); return; }
-    runGeneration(data);
+    openGenPreview(data);
   };
   const saveBillingAndGenerate = () => {
     if (Object.values(billAsk).some(v=>!v)) { alert("Choose Prepaid or Postpaid for every client — this is saved once and remembered."); return; }
     const newRets = rets.map(r=>billAsk[r.id] ? { ...r, billing: billAsk[r.id] } : r);
     setBillAsk(null);
-    runGeneration({ ...data, retainers: newRets });
+    openGenPreview({ ...data, retainers: newRets });
   };
   // manual invoice
   const newManual = () => setManual({ client:"", retainerId:"", month: monthLabel(), base:"", carry:0, currency:"PKR", date: today(), due:"", sendOn:"" });
@@ -2802,6 +3024,19 @@ function Retainers({ data, update, patch, brand, go }) {
       </div>
       <Btn onClick={saveBillingAndGenerate}><Check size={15}/>Save & generate invoices</Btn>
     </Modal>}
+    {genAsk && (()=>{ const make=genAsk.items.filter(i=>!i.exists), skip=genAsk.items.filter(i=>i.exists); return (
+      <Modal title="Generate retainer invoices" onClose={()=>setGenAsk(null)}>
+        {make.length===0
+          ? <div className="text-sm text-slate-600">Every active retainer client already has an invoice for their billing period. Nothing to generate — this is the guard that stops a second run creating duplicates.</div>
+          : <>
+            <div className="text-sm text-slate-600">This will create <b>{make.length}</b> invoice{make.length>1?"s":""}:</div>
+            <div className="max-h-56 overflow-y-auto bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm space-y-1">
+              {make.map(i=>(<div key={i.id} className="flex justify-between gap-2"><span>{i.client}<span className="text-xs text-slate-400 ml-1">{i.billing}</span></span><span className="text-slate-500 whitespace-nowrap">{i.period} · {fmt(i.amount,i.currency)}</span></div>))}
+            </div>
+          </>}
+        {skip.length>0 && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">Skipping {skip.length} client(s) already invoiced for their period: {skip.slice(0,6).map(i=>i.client).join(", ")}{skip.length>6?"…":""}</div>}
+        {make.length>0 && <Btn onClick={()=>{ runGeneration(genAsk.db); setGenAsk(null); }}><Check size={15}/>Generate {make.length} invoice{make.length>1?"s":""}</Btn>}
+      </Modal>); })()}
     {extend && <Modal title={`Extend due date · ${extend.number}`} onClose={()=>setExtend(null)}>
       <p className="text-xs text-slate-500">Give {extend.client} more time to pay. This updates the invoice's due date.</p>
       <Field label="New due date" type="date" value={extend.due} onChange={e=>setExtend({...extend,due:e.target.value})}/>
@@ -2857,6 +3092,7 @@ function Invoices({ data, update, patch }) {
     fields={(e,s)=>(<><ClientInput clients={clients} value={e.client} onChange={ev=>{const v=ev.target.value;const c=clients.find(x=>x.name===v);s({...e,client:v,...(c?{currency:c.currency||"PKR"}:{})});}}/><Field label="Number" value={e.number} onChange={ev=>s({...e,number:ev.target.value})}/><Select label="Type" options={["Invoice","Receipt"]} value={e.type} onChange={ev=>s({...e,type:ev.target.value})}/><div className="grid grid-cols-2 gap-3"><Field label="Amount" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Select label="Currency" options={CURRENCIES} value={e.currency} onChange={ev=>s({...e,currency:ev.target.value})}/></div><Field label="Date" type="date" value={e.date} onChange={ev=>s({...e,date:ev.target.value})}/><Select label="Status" options={["Draft","Sent","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>;
 }
 function Receipts({ data, update, brand }) {
+  const br = useBatch(data.receipts||[]);
   const rows = data.receipts || [];
   const clients = data.clients || [];
   const waNum = (client) => (clients.find(c=>c.name===client)?.whatsapp || "").replace(/\D/g,"");
@@ -2869,8 +3105,9 @@ function Receipts({ data, update, brand }) {
   const total = rows.reduce((s,r)=>s+ +r.amount,0);
   return (<>
     <Head title="Receipts" sub={`Payment receipts · ${rows.length} issued · ${fmt(total)} received in total`}/>
-    <Card><Table cols={["Receipt","Client","For","Amount","Account","Date",""]}>{rows.length===0?<tr><td colSpan={7}><Empty msg="No receipts yet — they're created automatically when you mark a client invoice or retainer as paid"/></td></tr>:rows.map(r=>(
-      <Row key={r.id}><Td className="font-medium">{r.number}</Td><Td className="text-slate-500">{r.client}</Td><Td className="text-slate-500">{r.for}</Td><Td className="font-semibold">{fmt(r.amount,r.currency)}</Td><Td className="text-slate-500">{r.account||"—"}</Td><Td className="text-slate-500">{r.date}</Td>
+    <BatchBar count={br.count} noun="receipt" onClear={br.clear} onDelete={()=>{ const ids=new Set(br.selected); update("receipts", rows.filter(x=>!ids.has(x.id)), `Deleted ${ids.size} receipt(s)`); br.clear(); }}/>
+    <Card><Table cols={[<SelBox key="a" on={br.allOn} onChange={br.toggleAll} title="Select all"/>,"Receipt","Client","For","Amount","Account","Date",""]}>{rows.length===0?<tr><td colSpan={8}><Empty msg="No receipts yet — they're created automatically when you mark a client invoice or retainer as paid"/></td></tr>:rows.map(r=>(
+      <Row key={r.id}><SelTd on={br.has(r.id)} onChange={()=>br.toggle(r.id)}/><Td className="font-medium">{r.number}</Td><Td className="text-slate-500">{r.client}</Td><Td className="text-slate-500">{r.for}</Td><Td className="font-semibold">{fmt(r.amount,r.currency)}</Td><Td className="text-slate-500">{r.account||"—"}</Td><Td className="text-slate-500">{r.date}</Td>
       <Td><RowActions onDelete={()=>update("receipts", rows.filter(x=>x.id!==r.id), `Deleted receipt ${r.number}`)}>
         <button onClick={()=>openReceiptPDF(r, brand)} title="Download receipt PDF" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Download size={14}/></button>
         <button onClick={()=>sendWA(r)} title="Send on WhatsApp" className="p-1.5 rounded text-slate-400 hover:text-green-600 hover:bg-slate-100"><Send size={14}/></button>
