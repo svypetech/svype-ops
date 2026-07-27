@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · payslip-design-v2";
+const APP_BUILD = "Build 27 Jul 2026 · direct-send-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -2212,6 +2212,7 @@ function Employees({ data, update, mutateData }) {
   };
   const filtered = rows.filter(r=>r.name.toLowerCase().includes(q.toLowerCase()));
   const be = useBatch(filtered);
+  const noEmail = (data.employees||[]).filter(e=>e.status==="Active" && !e.email).length;
   const found = lookup ? rows.find(r=>r.name.toLowerCase().includes(lookup.toLowerCase())) : null;
   if (open) { const emp = rows.find(r=>r.id===open); if (emp) return <EmployeeProfile emp={emp} data={data} onBack={()=>setOpen(null)} onEdit={()=>{ setEdit(emp); setOpen(null); }} />; }
   return (<>
@@ -2222,9 +2223,10 @@ function Employees({ data, update, mutateData }) {
       {lookup && (found ? <div className="mt-3 bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm flex flex-wrap gap-x-6 gap-y-1"><span><span className="text-slate-500">Name:</span> <b>{found.name}</b></span><span><span className="text-slate-500">Bank:</span> {found.bankName||"—"}</span><span><span className="text-slate-500">Account / IBAN:</span> <b>{found.account||"— not on file —"}</b></span></div> : <div className="mt-3 text-sm text-slate-400">No employee matches that name.</div>)}
     </div></Card>
     <div className="relative my-4 max-w-xs"><Search size={15} className="absolute left-3 top-2.5 text-slate-400"/><input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search name" className={inputCls+" pl-9"}/></div>
+    {noEmail>0 && <div className="mb-3 text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">{noEmail} active employee(s) have no email address — their salary slips can't be emailed until you add one.</div>}
     <BatchBar count={be.count} noun="employee" onClear={be.clear} onDelete={()=>{ const ids=new Set(be.selected); mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(x=>!ids.has(x.id)) }), `Removed ${ids.size} employee(s)`); be.clear(); }}/>
-    <Card><Table cols={[<SelBox key="a" on={be.allOn} onChange={be.toggleAll} title="Select all"/>,"Name","Role","Account / IBAN","Salary","Status",""]}>{filtered.length===0?<tr><td colSpan={7}><Empty msg="No employees"/></td></tr>:filtered.map(e=>(
-      <Row key={e.id} onClick={()=>setOpen(e.id)}><SelTd on={be.has(e.id)} onChange={()=>be.toggle(e.id)}/><Td><div className="font-medium">{e.name}</div><div className="text-xs text-slate-400">{e.email}</div>{e.onNotice&&<div className="text-xs text-amber-600 mt-0.5">On notice{e.lastWorkingDay?` · last day ${e.lastWorkingDay}`:""}</div>}</Td><Td className="text-slate-500">{e.role}</Td><Td className="text-slate-500">{e.account||"—"}</Td><Td className="text-slate-500">{fmt(e.salary)}</Td><Td><Pill s={e.status}/></Td><Td><RowActions onEdit={()=>setEdit(e)} onDelete={()=>mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(r=>r.id!==e.id) }), `Removed employee ${e.name}`)}/></Td></Row>))}</Table></Card>
+    <Card><Table cols={[<SelBox key="a" on={be.allOn} onChange={be.toggleAll} title="Select all"/>,"Name","Role","Email","Account / IBAN","Salary","Status",""]}>{filtered.length===0?<tr><td colSpan={8}><Empty msg="No employees"/></td></tr>:filtered.map(e=>(
+      <Row key={e.id} onClick={()=>setOpen(e.id)}><SelTd on={be.has(e.id)} onChange={()=>be.toggle(e.id)}/><Td><div className="font-medium">{e.name}</div>{e.onNotice&&<div className="text-xs text-amber-600 mt-0.5">On notice{e.lastWorkingDay?` · last day ${e.lastWorkingDay}`:""}</div>}</Td><Td className="text-slate-500">{e.role}</Td><Td className="text-xs">{e.email?<span className="text-slate-600">{e.email}</span>:<button onClick={(ev)=>{ev.stopPropagation();setEdit(e);}} className="text-amber-600 hover:underline">add email</button>}</Td><Td className="text-slate-500">{e.account||"—"}</Td><Td className="text-slate-500">{fmt(e.salary)}</Td><Td><Pill s={e.status}/></Td><Td><RowActions onEdit={()=>setEdit(e)} onDelete={()=>mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(r=>r.id!==e.id) }), `Removed employee ${e.name}`)}/></Td></Row>))}</Table></Card>
     {edit && <EmployeeForm edit={edit} setEdit={setEdit} save={save}/>}
   </>);
 }
@@ -2441,13 +2443,32 @@ function Payroll({ data, patch, update, brand }) {
       <div className="grid grid-cols-2 gap-3"><Field label="Provident fund" type="number" value={editDed.pf} onChange={e=>setEditDed({...editDed,pf:e.target.value})}/><Field label="Advance / loan" type="number" value={editDed.advance} onChange={e=>setEditDed({...editDed,advance:e.target.value})}/></div>
       <Btn onClick={saveDed}><Check size={15}/>Save deductions</Btn>
     </Modal>}
-    {payProof && <PayrollPaidModal rec={payProof} brand={brand} email={empEmail(payProof.employee)} onClose={()=>setPayProof(null)}
+    {payProof && <PayrollPaidModal rec={payProof} brand={brand} email={empEmail(payProof.employee)} employee={data.employees.find(e=>e.name===payProof.employee)||{}} onClose={()=>setPayProof(null)}
       onSave={(proof, method)=>{ update("payroll", data.payroll.map(x=>x.id===payProof.id?{...x,paid:true,proof,payMethod:method,paidOn:today()}:x), `Marked salary paid: ${payProof.employee} (${payProof.month})`); setPayProof(null); }}/>}
   </>);
 }
-function PayrollPaidModal({ rec, brand, email, onClose, onSave }) {
+function PayrollPaidModal({ rec, brand, email, employee, onClose, onSave }) {
   const [proof, setProof] = useState(rec.proof || null);
   const [method, setMethod] = useState(rec.payMethod || "Bank transfer");
+  const [sending, setSending] = useState(false);
+  const [note, setNote] = useState(null);
+  // Send the real payslip PDF from the company mailbox, then record the payment.
+  const saveAndEmail = async () => {
+    if (!email) { setNote({ ok:false, text:"This employee has no email on file — add one under Employees, or use “Save as paid” and send it later." }); return; }
+    setSending(true); setNote(null);
+    const paidRec = { ...rec, paid:true, paidOn:today(), payMethod:method };   // so the PDF shows as paid
+    try {
+      await apiReq("POST", "/payslip/email", {
+        slip: paidRec, brand: pdfBrand(brand), employee: employee || {}, to: email,
+        subject: `Salary slip — ${rec.month}`,
+        body: payslipMessage(paidRec, brand),
+      });
+      onSave(proof, method);          // records the payment and closes
+    } catch (e) {
+      setNote({ ok:false, text:(e.message || "The email couldn't be sent.") + " Nothing was recorded — you can still use “Save as paid”." });
+      setSending(false);
+    }
+  };
   const onImg = async (f) => { if (f) setProof(await readImage(f, 1000)); };
   const slipLines = () => {
     const L = [];
@@ -2483,12 +2504,13 @@ function PayrollPaidModal({ rec, brand, email, onClose, onSave }) {
       <div className="text-xs font-medium text-slate-600 mb-1 flex items-center gap-1.5"><Mail size={13}/>Email {email?`→ ${email}`:"(no email on file)"}</div>
       <div className="text-xs text-slate-500 whitespace-pre-wrap" style={{maxHeight:140, overflow:"auto"}}>{bodyText}</div>
     </div>
+    {note && <div className={`text-xs rounded-lg px-3 py-2 ${note.ok?"bg-emerald-50 border border-emerald-200 text-emerald-700":"bg-rose-50 border border-rose-200 text-rose-700"}`}>{note.text}</div>}
     <div className="flex flex-wrap gap-2">
-      <Btn variant="ok" onClick={()=>onSave(proof, method)}><Check size={15}/>Save as paid</Btn>
-      <Btn onClick={sendGmail}><Mail size={15}/>Send via Gmail</Btn>
-      <Btn variant="ghost" onClick={sendMailto}><Mail size={15}/>Default mail app</Btn>
+      <Btn onClick={saveAndEmail} disabled={sending}>{sending?<Loader2 size={15} className="animate-spin"/>:<Send size={15}/>}{sending?"Sending payslip…":"Save as paid & email payslip"}</Btn>
+      <Btn variant="ok" onClick={()=>onSave(proof, method)} disabled={sending}><Check size={15}/>Save as paid only</Btn>
+      <Btn variant="ghost" onClick={sendGmail} disabled={sending}><Mail size={15}/>Open in Gmail instead</Btn>
     </div>
-    <p className="text-xs text-slate-400">"Send via Gmail" opens Gmail compose with the employee's address, subject and full payslip pre-filled — you just press Send. (Attaching a file isn't possible via a link; the payslip details are in the email body.)</p>
+    <p className="text-xs text-slate-400">“Save as paid &amp; email payslip” sends the slip straight from {brand.email || "your company mailbox"} with the PDF attached — no Gmail window. The Gmail option is only a fallback (it can't carry an attachment).</p>
   </Modal>);
 }
 
