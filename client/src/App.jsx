@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · email-test-v1";
+const APP_BUILD = "Build 27 Jul 2026 · payslip-design-v2";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -269,7 +269,22 @@ const SEED = {
   vaultMeta: null,
   todos: [],
 };
-const SEED_BRAND = { company: "Svype Tech Limited", tagline: "Digital Marketing & Creative Agency", address: "Islamabad · Lahore, Pakistan", contact: "hello@svype.com · www.svype.com", accent: "#0284c7", logo: null, signatories: [], stamps: [] };
+const OFFICE_ADDRESSES = [
+  { city: "Islamabad", address: "Floor 1, Nova, Business Square, Gulberg Greens, Islamabad." },
+  { city: "Lahore", address: "71 C3, Facing Qarshi Park, Gulberg III, Lahore" },
+];
+const COMPANY_PHONE = "0327-7777201";
+const COMPANY_EMAIL = "info@svype.net";
+const COMPANY_WEB = "www.svype.com";
+// Bumping BRAND_V pushes the company details below into an existing saved brand once.
+const BRAND_V = 2;
+const BRAND_DETAILS = {
+  offices: OFFICE_ADDRESSES, phone: COMPANY_PHONE, email: COMPANY_EMAIL, website: COMPANY_WEB,
+  address: OFFICE_ADDRESSES.map(o=>`${o.city}: ${o.address}`).join("  ·  "),
+  contact: `${COMPANY_PHONE} · ${COMPANY_EMAIL} · ${COMPANY_WEB}`,
+  brandV: BRAND_V,
+};
+const SEED_BRAND = { company: "Svype Tech Limited", tagline: "Digital Marketing & Creative Agency", accent: "#0284c7", logo: null, signatories: [], stamps: [], payslipSigId: "", payslipStampId: "", ...BRAND_DETAILS };
 
 // Office geofence: check-in/out only allowed within RADIUS metres of an office.
 const OFFICES = [
@@ -478,7 +493,14 @@ export default function App() {
     setData(merged);
     if (!d && serverFounders === false) DB.set("svype_db", merged); // only seed empty doc on a genuine fresh install
     const b = await DB.get("svype_brand", null);
-    if (b) setBrand(b);
+    if (b) {
+      // Fill in the company addresses/contact once, without touching anything else.
+      if ((b.brandV || 0) < BRAND_V) {
+        const upgraded = { ...b, ...BRAND_DETAILS };
+        setBrand(upgraded);
+        try { await DB.set("svype_brand", upgraded); } catch {}
+      } else setBrand(b);
+    }
     else {
       // No token on this device yet (brand-new browser): fetch just the public brand
       // so the login screen still shows the company logo and colours.
@@ -903,7 +925,20 @@ function BrandSetup({ brand, saveBrand, done }) {
       <label className="w-24 h-24 rounded-xl border-2 border-dashed border-slate-300 grid place-items-center cursor-pointer hover:border-sky-500 overflow-hidden">{b.logo ? <img src={b.logo} className="w-full h-full object-contain p-2"/> : <Upload className="text-slate-400"/>}<input type="file" accept="image/png,image/jpeg" className="hidden" onChange={e=>onLogo(e.target.files[0])}/></label>
       <div className="text-xs text-slate-500">PNG with transparent background works best.</div>
     </div>
-    <div className="space-y-3"><Field label="Company name" value={b.company} onChange={e=>setB({...b,company:e.target.value})}/><Field label="Tagline" value={b.tagline} onChange={e=>setB({...b,tagline:e.target.value})}/><Field label="Address" value={b.address} onChange={e=>setB({...b,address:e.target.value})}/><Field label="Contact line" value={b.contact} onChange={e=>setB({...b,contact:e.target.value})}/></div>
+    <div className="space-y-3"><Field label="Company name" value={b.company} onChange={e=>setB({...b,company:e.target.value})}/><Field label="Tagline" value={b.tagline} onChange={e=>setB({...b,tagline:e.target.value})}/><div className="grid sm:grid-cols-2 gap-3">
+          <Field label="Islamabad office address" value={(b.offices?.[0]?.address)||""} onChange={e=>{const o=[...(b.offices||OFFICE_ADDRESSES)]; o[0]={...o[0],city:"Islamabad",address:e.target.value}; setB({...b,offices:o});}}/>
+          <Field label="Lahore office address" value={(b.offices?.[1]?.address)||""} onChange={e=>{const o=[...(b.offices||OFFICE_ADDRESSES)]; o[1]={...o[1],city:"Lahore",address:e.target.value}; setB({...b,offices:o});}}/>
+        </div>
+        <div className="grid sm:grid-cols-3 gap-3">
+          <Field label="Phone" value={b.phone||""} onChange={e=>setB({...b,phone:e.target.value})}/>
+          <Field label="Email" value={b.email||""} onChange={e=>setB({...b,email:e.target.value})}/>
+          <Field label="Website" value={b.website||""} onChange={e=>setB({...b,website:e.target.value})}/>
+        </div>
+        <div className="grid sm:grid-cols-2 gap-3">
+          <Select label="Payslip signature" options={["", ...(b.signatories||[]).map(x=>x.name)]} value={(b.signatories||[]).find(x=>x.id===b.payslipSigId)?.name || ""} onChange={e=>setB({...b, payslipSigId:(b.signatories||[]).find(x=>x.name===e.target.value)?.id || ""})}/>
+          <Select label="Payslip stamp" options={["", ...(b.stamps||[]).map(x=>x.label)]} value={(b.stamps||[]).find(x=>x.id===b.payslipStampId)?.label || ""} onChange={e=>setB({...b, payslipStampId:(b.stamps||[]).find(x=>x.label===e.target.value)?.id || ""})}/>
+        </div>
+        <p className="text-xs text-slate-400 -mt-1">The chosen signature and stamp are printed on every salary slip PDF. Add them in the panels on the right first.</p></div>
     <div className="mt-6 flex justify-end gap-2"><Btn variant="ghost" onClick={()=>{saveBrand(b);done();}}>Skip for now</Btn><Btn onClick={()=>{saveBrand(b);done();}}><Check size={15}/>Save letterhead</Btn></div>
   </div></div>);
 }
@@ -1023,7 +1058,11 @@ const netPay = (p) => +p.basic + +p.allowances + (+p.reimbursements||0) + adjTot
 function Letterhead({ brand }) {
   return (<div className="flex items-start justify-between border-b-2 pb-3 mb-5" style={{ borderColor: brand.accent }}>
     <div className="flex items-center gap-3">{brand.logo ? <img src={brand.logo} className="h-12 object-contain"/> : <Building2 size={28}/>}<div><div className="font-bold text-base leading-tight">{brand.company}</div><div className="text-xs text-slate-500">{brand.tagline}</div></div></div>
-    <div className="text-right text-xs text-slate-500 leading-tight"><div>{brand.address}</div><div>{brand.contact}</div></div></div>);
+    <div className="text-right text-xs text-slate-500 leading-tight max-w-[46%]">
+      {(brand.offices||[]).map(o=>(<div key={o.city}>{o.city}: {o.address}</div>))}
+      {!(brand.offices||[]).length && <div>{brand.address}</div>}
+      <div className="mt-0.5">{[brand.phone, brand.email, brand.website].filter(Boolean).join(" · ") || brand.contact}</div>
+    </div></div>);
 }
 function DocSheet({ brand, body, signed, setSigned }) {
   const sig = brand.signatories.find(s=>s.id===signed?.sigId);
@@ -1371,8 +1410,19 @@ function payslipMessage(slip, brand, { whatsapp = false } = {}) {
   L.push("", `${brand?.company || ""}`);
   return L.join("\n");
 }
+// The PDF builder wants the actual images, not ids.
+function pdfBrand(brand) {
+  const sig = (brand?.signatories || []).find(x => x.id === brand.payslipSigId) || (brand?.signatories || [])[0] || null;
+  const stamp = (brand?.stamps || []).find(x => x.id === brand.payslipStampId) || (brand?.stamps || [])[0] || null;
+  return {
+    ...brand,
+    signatories: undefined, stamps: undefined,      // don't ship every image to the server
+    payslipSignature: sig ? { img: sig.sig, name: sig.name, role: sig.role } : null,
+    payslipStamp: stamp ? stamp.img : null,
+  };
+}
 async function downloadPayslipPdf(slip, brand, employee) {
-  const r = await apiReq("POST", "/payslip/pdf", { slip, brand, employee });
+  const r = await apiReq("POST", "/payslip/pdf", { slip, brand: pdfBrand(brand), employee });
   const bin = atob(r.pdf); const arr = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
   const url = URL.createObjectURL(new Blob([arr], { type: "application/pdf" }));
@@ -1397,7 +1447,7 @@ function SlipModal({ slip, brand, data, sendable = false, onClose }) {
     setBusy("mail"); setMsg(null);
     try {
       await apiReq("POST", "/payslip/email", {
-        slip, brand, employee: emp, to: emp.email,
+        slip, brand: pdfBrand(brand), employee: emp, to: emp.email,
         subject: `Salary slip — ${slip.month || ""}`,
         body: payslipMessage(slip, brand),
       });
@@ -1425,6 +1475,13 @@ function SlipModal({ slip, brand, data, sendable = false, onClose }) {
         {+slip.advance>0 && <div className="flex justify-between text-slate-500"><span>Advance / loan</span><span>-{fmt(slip.advance)}</span></div>}
         <div className="flex justify-between border-t pt-2 mt-2 font-bold"><span>Net pay</span><span>{fmt(netPay(slip))}</span></div>
       </div></div>
+    {(()=>{ const pb=pdfBrand(brand); if(!pb.payslipSignature && !pb.payslipStamp) return null; return (
+      <div className="flex items-end justify-between gap-4 pt-2">
+        <div>{pb.payslipSignature?.img && <img src={pb.payslipSignature.img} className="h-12 object-contain"/>}
+          <div className="border-t border-slate-400 w-40 mt-1 pt-1"><div className="text-xs font-semibold text-slate-700">{pb.payslipSignature?.name||"Authorised signatory"}</div><div className="text-xs text-slate-400">{pb.payslipSignature?.role||"Human Resources"}</div></div>
+        </div>
+        {pb.payslipStamp && <img src={pb.payslipStamp} className="h-20 object-contain opacity-90"/>}
+      </div>); })()}
     <div className="flex flex-wrap gap-2">
       <Btn variant="ghost" onClick={doPdf} disabled={busy==="pdf"}>{busy==="pdf"?<Loader2 size={15} className="animate-spin"/>:<Download size={15}/>}Download PDF</Btn>
       {sendable && <Btn onClick={doEmail} disabled={busy==="mail"}>{busy==="mail"?<Loader2 size={15} className="animate-spin"/>:<Send size={15}/>}{busy==="mail"?"Sending…":"Email with PDF attached"}</Btn>}
@@ -2053,7 +2110,7 @@ function EmailSettings({ data, patch, brand }) {
   const sendTest = async () => {
     setTesting(true); setResult(null);
     try {
-      const r = await apiReq("POST", "/payslip/test", { to: testTo || f.user, brand });
+      const r = await apiReq("POST", "/payslip/test", { to: testTo || f.user, brand: pdfBrand(brand) });
       setResult({ ok:true, text:`Sent to ${r.to} from “${r.from}”. Check the inbox — the sample PDF should be attached.` });
     } catch (e) { setResult({ ok:false, text: e.message || "The test email couldn't be sent." }); }
     setTesting(false);
@@ -2806,7 +2863,7 @@ function retainerInvoiceHTML(inv, brand) {
     .pill{display:inline-block;padding:3px 10px;border-radius:6px;font-size:12px;background:#fef3c7;color:#b45309}
   </style></head><body>
   <div class="hd"><div style="display:flex;gap:12px;align-items:center">${logo}<div><div class="co">${brand.company||""}</div><div class="tag">${brand.tagline||""}</div></div></div>
-  <div class="meta">${brand.address||""}<br>${brand.contact||""}</div></div>
+  <div class="meta">${(brand.offices||[]).map(o=>`${o.city}: ${o.address}`).join("<br>")||brand.address||""}<br>${[brand.phone,brand.email,brand.website].filter(Boolean).join(" &middot; ")||brand.contact||""}</div></div>
   <h1>INVOICE</h1>
   <div style="display:flex;justify-content:space-between;font-size:13px;color:#475569;margin-top:8px">
     <div><b>Billed to:</b><br>${inv.client||""}</div>
@@ -2886,7 +2943,7 @@ function receiptHTML(r, brand) {
     .foot{margin-top:30px;color:#64748b;font-size:12px}
   </style></head><body>
   <div class="hd"><div style="display:flex;gap:12px;align-items:center">${logo}<div><div class="co">${brand.company||""}</div><div class="tag">${brand.tagline||""}</div></div></div>
-  <div class="meta">${brand.address||""}<br>${brand.contact||""}</div></div>
+  <div class="meta">${(brand.offices||[]).map(o=>`${o.city}: ${o.address}`).join("<br>")||brand.address||""}<br>${[brand.phone,brand.email,brand.website].filter(Boolean).join(" &middot; ")||brand.contact||""}</div></div>
   <h1>PAYMENT RECEIPT</h1>
   <div style="display:flex;justify-content:space-between;font-size:13px;color:#475569;margin-top:8px">
     <div><b>Received from:</b><br>${r.client||""}</div>
@@ -3531,7 +3588,20 @@ function BrandSettings({ brand, saveBrand }) {
     <div className="grid lg:grid-cols-2 gap-5">
       <Card><div className="p-5 space-y-3"><div className="font-semibold text-sm mb-1">Letterhead</div>
         <div className="flex items-center gap-4"><label className="w-20 h-20 rounded-xl border-2 border-dashed border-slate-300 grid place-items-center cursor-pointer hover:border-sky-500 overflow-hidden">{b.logo?<img src={b.logo} className="w-full h-full object-contain p-1"/>:<Upload className="text-slate-400" size={18}/>}<input type="file" accept="image/*" className="hidden" onChange={e=>onLogo(e.target.files[0])}/></label><span className="text-xs text-slate-500">Click to replace logo</span></div>
-        <Field label="Company name" value={b.company} onChange={e=>setB({...b,company:e.target.value})}/><Field label="Tagline" value={b.tagline} onChange={e=>setB({...b,tagline:e.target.value})}/><Field label="Address" value={b.address} onChange={e=>setB({...b,address:e.target.value})}/><Field label="Contact line" value={b.contact} onChange={e=>setB({...b,contact:e.target.value})}/>
+        <Field label="Company name" value={b.company} onChange={e=>setB({...b,company:e.target.value})}/><Field label="Tagline" value={b.tagline} onChange={e=>setB({...b,tagline:e.target.value})}/><div className="grid sm:grid-cols-2 gap-3">
+          <Field label="Islamabad office address" value={(b.offices?.[0]?.address)||""} onChange={e=>{const o=[...(b.offices||OFFICE_ADDRESSES)]; o[0]={...o[0],city:"Islamabad",address:e.target.value}; setB({...b,offices:o});}}/>
+          <Field label="Lahore office address" value={(b.offices?.[1]?.address)||""} onChange={e=>{const o=[...(b.offices||OFFICE_ADDRESSES)]; o[1]={...o[1],city:"Lahore",address:e.target.value}; setB({...b,offices:o});}}/>
+        </div>
+        <div className="grid sm:grid-cols-3 gap-3">
+          <Field label="Phone" value={b.phone||""} onChange={e=>setB({...b,phone:e.target.value})}/>
+          <Field label="Email" value={b.email||""} onChange={e=>setB({...b,email:e.target.value})}/>
+          <Field label="Website" value={b.website||""} onChange={e=>setB({...b,website:e.target.value})}/>
+        </div>
+        <div className="grid sm:grid-cols-2 gap-3">
+          <Select label="Payslip signature" options={["", ...(b.signatories||[]).map(x=>x.name)]} value={(b.signatories||[]).find(x=>x.id===b.payslipSigId)?.name || ""} onChange={e=>setB({...b, payslipSigId:(b.signatories||[]).find(x=>x.name===e.target.value)?.id || ""})}/>
+          <Select label="Payslip stamp" options={["", ...(b.stamps||[]).map(x=>x.label)]} value={(b.stamps||[]).find(x=>x.id===b.payslipStampId)?.label || ""} onChange={e=>setB({...b, payslipStampId:(b.stamps||[]).find(x=>x.label===e.target.value)?.id || ""})}/>
+        </div>
+        <p className="text-xs text-slate-400 -mt-1">The chosen signature and stamp are printed on every salary slip PDF. Add them in the panels on the right first.</p>
         <label className="flex items-center gap-3"><span className="text-xs text-slate-500">Accent color</span><input type="color" value={b.accent} onChange={e=>setB({...b,accent:e.target.value})} className="w-10 h-8 bg-transparent rounded cursor-pointer"/></label>
       </div></Card>
       <div className="space-y-5">
