@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · notice-timefix-v1";
+const APP_BUILD = "Build 27 Jul 2026 · timefix-v2";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -1091,6 +1091,30 @@ function CheckInCard({ data, mutateData, me }) {
   const a = data.attendance.find(x=>x.employee===me.name && x.date===today());
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState(null);
+  const [tf, setTf] = useState(null); const [terr, setTerr] = useState(""); const [tbusy, setTbusy] = useState(false); const [tsent, setTsent] = useState("");
+  const minDate = new Date(Date.now() - 7*86400000).toISOString().slice(0,10);
+  const sendCorrection = async () => {
+    if (!tf.date) { setTerr("Pick the day."); return; }
+    if (!tf.time) { setTerr("Enter the time you actually started."); return; }
+    const iso = new Date(`${tf.date}T${tf.time}`).toISOString();
+    if (isNaN(new Date(iso).getTime())) { setTerr("That time doesn't look right."); return; }
+    setTbusy(true); setTerr("");
+    try {
+      await mutateData((cur)=>{
+        const list = cur.attendance || [];
+        const req = { requested: iso, reason: (tf.reason||"").trim(), status:"Pending", submittedAt: new Date().toISOString() };
+        const existing = list.find(x=>x.employee===me.name && x.date===tf.date);
+        if (existing) return { ...cur, attendance: list.map(x=>x===existing ? { ...x, timeReq: req } : x) };
+        // No attendance at all for that day (they forgot entirely). Create a placeholder
+        // that does NOT count as present until HR approves it.
+        return { ...cur, attendance: [...list, { id:uid(), employee:me.name, date:tf.date, status:"Requested", checkIn:null, checkOut:null, viaRequest:true, timeReq:req }] };
+      }, `${me.name} requested a check-in time for ${tf.date}`);
+      setTf(null);
+      setTsent("Sent to HR. Your attendance stays as recorded until they approve it.");
+      setTimeout(()=>setTsent(""), 8000);
+    } catch { setTerr("Couldn't reach the server — please try again."); }
+    setTbusy(false);
+  };
   const doAction = (which) => {
     setBusy(true); setMsg(null);
     checkInOut(mutateData, me.name, which, (res)=>{ setBusy(false); setMsg(res); }, !!me.remoteAllowed);
@@ -1103,6 +1127,21 @@ function CheckInCard({ data, mutateData, me }) {
       {a?.office && <span className="text-xs text-slate-500 flex items-center gap-1"><MapPin size={12}/>{a.office}</span>}
     </div>
     {msg && <div className={`mt-3 text-xs rounded-lg px-3 py-2 ${msg.ok?"bg-emerald-50 border border-emerald-200 text-emerald-700":"bg-rose-50 border border-rose-200 text-rose-700"}`}>{msg.msg}</div>}
+    {a?.timeReq?.status==="Pending" && <div className="mt-3 text-xs rounded-lg px-3 py-2 bg-amber-50 border border-amber-200 text-amber-700">Correction to {timeOf(a.timeReq.requested)} sent — waiting for HR approval.</div>}
+    {a?.timeReq?.status==="Approved" && <div className="mt-3 text-xs rounded-lg px-3 py-2 bg-emerald-50 border border-emerald-200 text-emerald-700">HR approved your check-in time of {timeOf(a.timeReq.requested)}.</div>}
+    {a?.timeReq?.status==="Rejected" && <div className="mt-3 text-xs rounded-lg px-3 py-2 bg-rose-50 border border-rose-200 text-rose-700">HR declined the correction — the recorded time stands.</div>}
+    {tsent && <div className="mt-3 text-xs rounded-lg px-3 py-2 bg-emerald-50 border border-emerald-200 text-emerald-700">{tsent}</div>}
+    <button onClick={()=>{ setTf({ date: today(), time:"", reason:"" }); setTerr(""); }} className="mt-3 text-xs text-sky-600 hover:underline">Forgot to check in on time? Send a correction to HR →</button>
+    {tf && <Modal title="Correct my check-in time" onClose={()=>{setTf(null);setTerr("");}}>
+      <p className="text-xs text-slate-500">Tell HR the time you actually started. This is a request — until HR approves it, your attendance stays exactly as recorded.</p>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Day" type="date" value={tf.date} min={minDate} max={today()} onChange={e=>{setTf({...tf,date:e.target.value});setTerr("");}}/>
+        <Field label="Time I actually started" type="time" value={tf.time} onChange={e=>{setTf({...tf,time:e.target.value});setTerr("");}}/>
+      </div>
+      <Area label="Why the check-in was late or missed" value={tf.reason} onChange={e=>setTf({...tf,reason:e.target.value})}/>
+      {terr && <div className="text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{terr}</div>}
+      <Btn onClick={sendCorrection} disabled={tbusy}>{tbusy?<Loader2 size={15} className="animate-spin"/>:<Check size={15}/>}{tbusy?"Sending…":"Send to HR for approval"}</Btn>
+    </Modal>}
     <div className="mt-3 text-xs text-slate-400">{me.remoteAllowed ? "You\u2019re approved for work from home — you can check in from anywhere. Your location is recorded when available." : `Check-in and check-out require being within ${GEOFENCE_RADIUS_M}m of a Svype office.`}</div>
   </div></Card>);
 }
@@ -1195,7 +1234,7 @@ function EmpAttendance({ data, update, mutateData, me }) {
           {a.timeReq && a.timeReq.status==="Rejected" && <div className="text-xs text-rose-500">correction declined</div>}
         </Td>
         <Td className="text-slate-500">{timeOf(a.checkOut)||"—"}</Td>
-        <Td>{a.checkIn && (!a.timeReq || a.timeReq.status==="Rejected")
+        <Td>{(!a.timeReq || a.timeReq.status==="Rejected")
           ? <button onClick={()=>{setTf({ id:a.id, date:a.date, time:"", reason:"" });setTerr("");}} className="text-xs text-sky-600 hover:underline whitespace-nowrap">Correct time</button>
           : <span className="text-xs text-slate-300">—</span>}</Td></Row>))}</Table></Card>
     </div>
@@ -1461,7 +1500,8 @@ function Dashboard({ data, role, go, mutateData, session, me }) {
   const present = att.filter(a=>a.status==="Present").length;
   const onLeave = att.filter(a=>a.status==="Leave").length;
   const absent = att.filter(a=>a.status==="Absent").length;
-  const notMarked = Math.max(0, activeEmp.length - att.length);
+  const marked = att.filter(a=>a.status!=="Requested");   // pending claims are not attendance yet
+  const notMarked = Math.max(0, activeEmp.length - marked.length);
   // --- requests: left vs handled ---
   const pendLeaves = data.leaves.filter(l=>l.status==="Pending").length;
   const decidedMonth = data.leaves.filter(l=>l.status!=="Pending" && (l.decidedOn||"").startsWith(mk)).length;
@@ -2039,11 +2079,11 @@ function Attendance({ data, update, mutateData }) {
     <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="attendance"?"primary":"ghost"} onClick={()=>setView("attendance")}>Today's attendance</Btn><Btn variant={view==="history"?"primary":"ghost"} onClick={()=>setView("history")}>Check-in/out log</Btn><Btn variant={view==="leave"?"primary":"ghost"} onClick={()=>setView("leave")}>Leave requests</Btn></div>
     {view==="attendance"?(
       <Card><Table cols={["Employee","Today","In / Out","Office","Location",""]}>{data.employees.filter(e=>e.status==="Active").map(e=>{const a=data.attendance.find(x=>x.employee===e.name&&x.date===today());const ll=locLink(a?.location);const lo=locLink(a?.checkOutLocation);return(
-        <Row key={e.id}><Td className="font-medium">{e.name}</Td><Td>{a?<span className="text-xs text-slate-600">{a.status}</span>:<span className="text-slate-400 text-xs">Not marked</span>}</Td><Td className="text-xs text-slate-500">{a?.checkIn?timeOf(effIn(a)):"—"} / {a?.checkOut?timeOf(a.checkOut):"—"}{a?.timeReq?.status==="Pending"&&<div className="text-xs text-amber-600">correction pending</div>}{a?.timeReq?.status==="Approved"&&<div className="text-xs text-emerald-600">corrected</div>}</Td><Td className="text-xs text-slate-600">{a?.office||a?.checkOutOffice||"—"}</Td><Td className="text-xs"><div className="flex flex-col gap-0.5">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>in</a>:null}{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>out</a>:null}{!ll&&!lo&&<span className="text-slate-400">—</span>}</div></Td>
+        <Row key={e.id}><Td className="font-medium">{e.name}</Td><Td>{a?<span className="text-xs text-slate-600">{a.status}</span>:<span className="text-slate-400 text-xs">Not marked</span>}</Td><Td className="text-xs text-slate-500">{effIn(a)?timeOf(effIn(a)):"—"} / {a?.checkOut?timeOf(a.checkOut):"—"}{a?.timeReq?.status==="Pending"&&<div className="text-xs text-amber-600">correction pending</div>}{a?.timeReq?.status==="Approved"&&<div className="text-xs text-emerald-600">corrected</div>}</Td><Td className="text-xs text-slate-600">{a?.office||a?.checkOutOffice||"—"}</Td><Td className="text-xs"><div className="flex flex-col gap-0.5">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>in</a>:null}{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>out</a>:null}{!ll&&!lo&&<span className="text-slate-400">—</span>}</div></Td>
         <Td><div className="flex gap-1 justify-end"><button onClick={()=>mark(e.name,"Present")} className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Present</button><button onClick={()=>mark(e.name,"Absent")} className="px-2 py-1 rounded text-xs bg-rose-100 text-rose-700 hover:bg-rose-200">Absent</button><button onClick={()=>mark(e.name,"Leave")} className="px-2 py-1 rounded text-xs bg-amber-100 text-amber-700 hover:bg-amber-200">Leave</button></div></Td></Row>);})}</Table></Card>
     ):view==="history"?(
       <Card><Table cols={["Date","Employee","Office","Check-in","Check-out","In loc","Out loc"]}>{history.length===0?<tr><td colSpan={7}><Empty msg="No attendance recorded yet"/></td></tr>:history.map(a=>{const ll=locLink(a.location);const lo=locLink(a.checkOutLocation);return(
-        <Row key={a.id}><Td className="text-slate-500 whitespace-nowrap">{a.date}</Td><Td className="font-medium">{a.employee}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td><Td className="text-slate-500">{a.checkIn?timeOf(effIn(a)):"—"}{a.timeReq?.status==="Pending"&&<div className="text-xs text-amber-600">correction pending</div>}{a.timeReq?.status==="Approved"&&<div className="text-xs text-emerald-600">corrected · was {timeOf(a.checkIn)}</div>}{a.timeReq?.status==="Rejected"&&<div className="text-xs text-slate-400">correction declined</div>}</Td><Td className="text-slate-500">{a.checkOut?timeOf(a.checkOut):"—"}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td><Td className="text-xs">{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td></Row>);})}</Table></Card>
+        <Row key={a.id}><Td className="text-slate-500 whitespace-nowrap">{a.date}</Td><Td className="font-medium">{a.employee}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td><Td className="text-slate-500">{effIn(a)?timeOf(effIn(a)):"—"}{a.timeReq?.status==="Pending"&&<div className="text-xs text-amber-600">correction pending</div>}{a.timeReq?.status==="Approved"&&<div className="text-xs text-emerald-600">corrected · was {timeOf(a.checkIn)}</div>}{a.timeReq?.status==="Rejected"&&<div className="text-xs text-slate-400">correction declined</div>}</Td><Td className="text-slate-500">{a.checkOut?timeOf(a.checkOut):"—"}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td><Td className="text-xs">{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td></Row>);})}</Table></Card>
     ):(
       <Card><Table cols={["Employee","Type & reason","From","To","Days","Balance left","Status",""]}>{data.leaves.length===0?<tr><td colSpan={8}><Empty msg="No leave requests"/></td></tr>:data.leaves.map(l=>(
         <Row key={l.id}><Td className="font-medium">{l.employee}</Td><Td className="text-slate-500">{l.type}{l.reason&&<div className="text-xs text-slate-400 max-w-[200px] truncate">{l.reason}</div>}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td className="text-xs text-slate-500">{LEAVE_POLICY[l.type]?`${Math.max(0,leaveLeft(data,l.employee,l.type))} left`:"—"}</Td><Td><Pill s={l.status}/></Td>
@@ -2910,7 +2950,16 @@ function Requests({ data, update, mutateData, go }) {
   const setTimeReq = async (id,sv)=>{
     const a = (data.attendance||[]).find(x=>x.id===id);
     setBusyId("T"+id);
-    try { await mutateData((cur)=>({ ...cur, attendance:(cur.attendance||[]).map(x=>x.id===id?{ ...x, timeReq:{ ...x.timeReq, status:sv, decidedOn:today() } }:x) }),
+    try { await mutateData((cur)=>({ ...cur, attendance:(cur.attendance||[]).flatMap(x=>{
+        if (x.id !== id) return [x];
+        // A claim for a day they never checked in at all: approving marks them present,
+        // declining removes the placeholder so attendance stays clean (the decision is
+        // still recorded in the activity log).
+        if (sv === "Rejected" && x.viaRequest && !x.checkIn) return [];
+        const timeReq = { ...x.timeReq, status:sv, decidedOn:today() };
+        if (sv === "Approved" && x.viaRequest) return [{ ...x, timeReq, status:"Present", office: x.office || "Added by HR approval" }];
+        return [{ ...x, timeReq }];
+      }) }),
       `Check-in correction ${sv.toLowerCase()} for ${a?.employee} (${a?.date}) — they have been notified`); } finally { setBusyId(null); }
   };
   const setLeave = async (id,sv)=>{ const l=data.leaves.find(x=>x.id===id); setBusyId("L"+id); try { await mutateData((cur)=>({ ...cur, leaves:(cur.leaves||[]).map(x=>x.id===id?{...x,status:sv,decidedOn:today()}:x) }), `Leave ${sv.toLowerCase()} for ${l?.employee} — they have been notified`); } finally { setBusyId(null); } };
@@ -2920,7 +2969,7 @@ function Requests({ data, update, mutateData, go }) {
     ...(data.leaves||[]).map(l=>({ key:"L"+l.id, id:l.id, kind:"leave", employee:l.employee, title:`${l.type||"Leave"} leave`, details:`${l.from} → ${l.to} · ${dayCount(l.from,l.to)}d${l.reason?` · ${l.reason}`:""}`, date:l.requestedOn||l.from, status:l.status, decidedOn:l.decidedOn })),
     ...(data.requests||[]).map(r=>({ key:"R"+r.id, id:r.id, kind:"cert", employee:r.employee, title:r.type, details:r.note||"", date:r.date, status:r.status, decidedOn:r.decidedOn })),
     ...(data.payables||[]).filter(p=>p.kind==="reimbursement").map(p=>({ key:"P"+p.id, id:p.id, kind:"reimb", employee:p.vendor, title:"Expense claim", details:`${fmt(p.amount)}${p.note?` · ${p.note}`:""}`, date:p.date, status:p.status, decidedOn:p.decidedOn })),
-    ...(data.attendance||[]).filter(a=>a.timeReq).map(a=>({ key:"T"+a.id, id:a.id, kind:"time", employee:a.employee, title:"Check-in time correction", details:`${a.date}: recorded ${timeOf(a.checkIn)||"—"} → asking for ${timeOf(a.timeReq.requested)}${a.timeReq.reason?` · ${a.timeReq.reason}`:""}`, date:a.date, status:a.timeReq.status, decidedOn:a.timeReq.decidedOn })),
+    ...(data.attendance||[]).filter(a=>a.timeReq).map(a=>({ key:"T"+a.id, id:a.id, kind:"time", employee:a.employee, title:"Check-in time correction", details:`${a.date}: ${a.checkIn?`recorded ${timeOf(a.checkIn)}`:"no check-in recorded"} → asking for ${timeOf(a.timeReq.requested)}${a.timeReq.reason?` · ${a.timeReq.reason}`:""}`, date:a.date, status:a.timeReq.status, decidedOn:a.timeReq.decidedOn })),
   ].sort((a,b)=>(b.date||"").localeCompare(a.date||""));
   const isOpen = (r)=> r.kind==="leave" ? r.status==="Pending" : r.kind==="cert" ? (r.status!=="Done"&&r.status!=="Declined") : r.status==="Pending";
   const filtered = rows.filter(r=>(kind==="all"||r.kind===kind) && (st==="all" ? true : st==="open" ? isOpen(r) : !isOpen(r)));
