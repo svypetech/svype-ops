@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · nightly-backup-v1";
+const APP_BUILD = "Build 27 Jul 2026 · receipt-fix-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -1569,9 +1569,9 @@ function EmpExpenses({ data, update, me }) {
   };
   const submit = () => {
     if (!f.desc || !f.amount) { setErr("Please add a description and amount."); return; }
-    if (!f.receipt) { setErr("A photo of the bill/receipt is required to submit a claim."); return; }
+    if (!f.receipt && !f.receiptFileId) { setErr("A photo of the bill/receipt is required to submit a claim."); return; }
     update("payables", [{ id:uid(), vendor:me.name, desc:"Reimbursement: "+f.desc, amount:+f.amount, due:today(), status:"Pending", kind:"reimbursement", settled:false, receipt:f.receipt, receiptFileId:f.receiptFileId, receiptMime:f.receiptMime, receiptName:f.receiptName }, ...data.payables], `${me.name} submitted an expense claim`);
-    setF({ desc:"", amount:"", receipt:null }); setErr("");
+    setF({ desc:"", amount:"", receipt:null, receiptFileId:null, receiptMime:null, receiptName:"", receiptIsImg:undefined }); setErr("");
   };
   return (<>
     <Head title="Expense Claims" sub="Submit a claim with a receipt — approved claims are added to your salary"/>
@@ -2643,7 +2643,7 @@ function Payroll({ data, patch, update, brand }) {
         <SelTd on={bp.has(p.id)} onChange={()=>bp.toggle(p.id)}/>
         <Td className="font-medium">{p.employee}</Td><Td className="text-slate-500">{p.month}</Td><Td className="font-semibold">{fmt(netPay(p))}{(p.adjustments||[]).length>0&&<div className="text-xs text-slate-400 font-normal">{adjTotal(p)>=0?"+":""}{fmt(adjTotal(p))} adj.</div>}</Td>
         <Td className="text-slate-500 text-xs">{empAcct(p.employee)||"— not on file —"}</Td>
-        <Td>{p.paid?<span className="flex items-center gap-2"><Pill s="Paid"/>{p.proof&&<img src={p.proof} className="w-7 h-7 rounded object-cover border border-slate-200"/>}</span>:<Pill s="Pending"/>}</Td>
+        <Td>{p.paid?<span className="flex items-center gap-2"><Pill s="Paid"/>{p.proof&&<button onClick={(e)=>{e.stopPropagation();openStored(typeof p.proof==="string"?{img:p.proof}:{...p.proof},"payment-proof");}} title="Open payment proof" className="w-7 h-7 rounded border border-slate-200 overflow-hidden grid place-items-center hover:ring-2 hover:ring-sky-400"><StoredImg d={typeof p.proof==="string"?{img:p.proof}:{...p.proof}} className="w-7 h-7 object-cover"/></button>}</span>:<Pill s="Pending"/>}</Td>
         <Td><button onClick={()=>setSlip(p)} className="text-sky-600 text-xs font-medium hover:underline">View slip</button></Td>
         <Td><RowActions>{!p.paid && <button onClick={()=>openAdj(p)} title="Add increase / deduction with reason" className="px-2 py-1 rounded text-xs bg-sky-100 text-sky-700 hover:bg-sky-200">Adjust</button>}{!p.paid && <button onClick={()=>setEditDed({...p})} title="Tax / EOBI / PF / advance" className="px-2 py-1 rounded text-xs bg-slate-100 text-slate-600 hover:bg-slate-200">Deductions</button>}{!p.paid && <button onClick={()=>setPayProof({ ...p, proof:null })} className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Mark paid</button>}{p.paid && <button onClick={()=>setPayProof({ ...p })} title="Update payment" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Edit3 size={14}/></button>}</RowActions></Td>
       </Row>))}</Table></Card>
@@ -2804,8 +2804,13 @@ function VendorBills({ data, update, patch, role, brand }) {
   const onFile = async (f, setFn, cur) => {
     if(!f) return;
     const isImg = f.type.startsWith("image/");
-    const data = isImg ? await readImage(f, 1100) : await readFile(f);
-    setFn({ ...cur, fileName:f.name, fileType: isImg ? "image" : "file", file: data });
+    const data = isImg ? await readImage(f, 1600, true, 0.82) : await readFile(f);
+    try {
+      const st = await uploadFile(data, f.name);          // kept out of the main record
+      setFn({ ...cur, fileName:f.name, fileType: isImg ? "image" : "file", file:null, fileId:st.fileId, fileMime:st.mime });
+    } catch {
+      setFn({ ...cur, fileName:f.name, fileType: isImg ? "image" : "file", file: data });
+    }
   };
   return (<>
     <Head title="Vendor Bills" sub="Upload vendor invoices → HR approves → Founder approves → moves to Payables (unpaid) → mark paid from Payables" action={<Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Upload bill</Btn>}/>
@@ -2840,7 +2845,7 @@ function VendorBills({ data, update, patch, role, brand }) {
       <Field label="Due date" type="date" value={edit.due} onChange={e=>setEdit({...edit,due:e.target.value})}/>
       <div><span className="text-xs text-slate-500 mb-1 block">Bill / invoice file</span>
         <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500"><Paperclip size={15}/>{edit.fileName||"Attach invoice (image or PDF)"}<input type="file" accept="image/*,.pdf" className="hidden" onChange={e=>onFile(e.target.files[0], setEdit, edit)}/></label>
-        {edit.file && (edit.fileType==="image" || edit.file.startsWith("data:image")) && <img src={edit.file} className="mt-2 h-32 rounded-lg border border-slate-200 object-cover"/>}
+        {(edit.file || edit.fileId) && <div className="mt-2">{edit.fileType==="image" ? <StoredImg d={{ fileId:edit.fileId, mime:edit.fileMime, img:edit.file }} className="h-32 rounded-lg border border-slate-200 object-cover"/> : null}<button onClick={()=>openStored({ fileId:edit.fileId, mime:edit.fileMime, file:edit.file, img:edit.fileType==="image"?edit.file:null }, edit.fileName)} className="flex items-center gap-2 text-sm text-sky-600 hover:underline mt-1"><FileText size={15}/>{edit.fileName||"Attached file"} ↗</button></div>}
         {edit.file && !(edit.fileType==="image" || edit.file.startsWith("data:image")) && <button onClick={()=>openDataUrl(edit.file, edit.fileName)} className="mt-2 text-sky-600 text-xs hover:underline flex items-center gap-1"><FileText size={13}/>Open {edit.fileName||"file"}</button>}
       </div>
       {edit._err && <div className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{edit._err}</div>}
@@ -2848,11 +2853,10 @@ function VendorBills({ data, update, patch, role, brand }) {
     </Modal>}
 
     {viewBill && <Modal title={`Bill · ${viewBill.vendor}`} onClose={()=>setViewBill(null)}>
-      {viewBill.file && (viewBill.fileType==="image" || (viewBill.file||"").startsWith("data:image"))
-        ? <img src={viewBill.file} className="w-full rounded-lg border border-slate-200"/>
-        : viewBill.file
-          ? <Btn variant="ghost" onClick={()=>openDataUrl(viewBill.file, viewBill.fileName)}><FileText size={15}/>Open {viewBill.fileName||"bill file"}</Btn>
-          : <div className="text-sm text-slate-500 text-center py-6">No file attached.</div>}
+      {(viewBill.file || viewBill.fileId) ? (<>
+        {viewBill.fileType==="image" && <StoredImg d={{ fileId:viewBill.fileId, mime:viewBill.fileMime, img:viewBill.file }} className="w-full rounded-lg border border-slate-200"/>}
+        <Btn variant="ghost" onClick={()=>openStored({ fileId:viewBill.fileId, mime:viewBill.fileMime, file:viewBill.file, img:viewBill.fileType==="image"?viewBill.file:null }, viewBill.fileName)}><FileText size={15}/>Open {viewBill.fileName||"bill file"}</Btn>
+      </>) : <div className="text-sm text-slate-500 text-center py-6">No file attached.</div>}
       <div className="text-sm space-y-1"><div className="flex justify-between"><span className="text-slate-500">Amount</span><b>{fmt(viewBill.amount,viewBill.currency)}</b></div><div className="flex justify-between"><span className="text-slate-500">Due</span><span>{viewBill.due}</span></div></div>
     </Modal>}
   </>);
