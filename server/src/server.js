@@ -106,5 +106,10 @@ app.set("broadcast", broadcast);
 
 const PORT = process.env.PORT || 4000;
 init()
-  .then(() => server.listen(PORT, () => console.log("Svype OS API on :" + PORT)))
+  .then(() => server.listen(PORT, () => {
+    console.log("Svype OS API on :" + PORT);
+    // Heal an oversized data record automatically, just after the port is open so a
+    // slow cleanup can never delay or block start-up.
+    setTimeout(() => { try { files.autoTidyOnBoot(); } catch (e) { console.error("auto-tidy skipped:", e.message); } }, 3000);
+  }))
   .catch((e) => { console.error("DB init failed:", e); process.exit(1); });

@@ -66,60 +66,94 @@ async function stash(dataUrl, name) {
   return { id, size: bytes.length, mime: m[1] || "application/octet-stream" };
 }
 
-router.post("/migrate-state", auth, async (req, res) => {
-  try {
-    const r = await pool.query("SELECT doc, rev FROM app_state WHERE id=1");
-    if (!r.rowCount) return res.json({ ok: true, moved: 0, freedMb: 0 });
-    const doc = r.rows[0].doc || {};
-    const rev = +r.rows[0].rev || 0;
-    const before = Buffer.byteLength(JSON.stringify(doc));
-    let moved = 0;
+// Move embedded files out, ONE RECORD AT A TIME. Loading the whole document into
+// memory is exactly what was killing the process, so every step below reads and writes
+// a single element via jsonb paths and never materialises the full document.
+const docSizeMb = async () => {
+  const r = await pool.query("SELECT octet_length(doc::text) AS b FROM app_state WHERE id=1");
+  return r.rowCount ? +(+r.rows[0].b / 1048576).toFixed(2) : 0;
+};
+const arrLen = async (key) => {
+  const r = await pool.query(`SELECT jsonb_array_length(COALESCE(doc->'${key}','[]'::jsonb)) AS n FROM app_state WHERE id=1`);
+  return r.rowCount ? +r.rows[0].n || 0 : 0;
+};
 
-    // employee documents
-    for (const emp of doc.employees || []) {
-      for (const d of emp.docs || []) {
-        for (const key of ["img", "file"]) {
-          if (typeof d[key] === "string" && DATA_URL.test(d[key])) {
-            const f = await stash(d[key], d.name || key);
-            if (f) { d.fileId = f.id; d.mime = f.mime; d[key] = null; moved++; }
-          }
+async function tidyFiles() {
+  const beforeMb = await docSizeMb();
+  let moved = 0;
+
+  // employee documents (the big one: several files per person)
+  const empCount = await arrLen("employees");
+  for (let i = 0; i < empCount; i++) {
+    const r = await pool.query("SELECT doc->'employees'->($1::int)->'docs' AS docs FROM app_state WHERE id=1", [i]);
+    const docs = r.rows[0] && r.rows[0].docs;
+    if (!Array.isArray(docs) || !docs.length) continue;
+    let changed = false;
+    for (const d of docs) {
+      for (const key of ["img", "file"]) {
+        if (typeof d[key] === "string" && DATA_URL.test(d[key])) {
+          const f = await stash(d[key], d.name || key);
+          if (f) { d.fileId = f.id; d.mime = f.mime; d[key] = null; changed = true; moved++; }
         }
       }
     }
-    // reimbursement receipts and payment proofs
-    for (const p of doc.payables || []) {
-      if (typeof p.receipt === "string" && DATA_URL.test(p.receipt)) {
-        const f = await stash(p.receipt, p.receiptName || "receipt");
-        if (f) { p.receiptFileId = f.id; p.receiptMime = f.mime; p.receipt = null; moved++; }
-      }
+    if (changed) {
+      await pool.query(
+        "UPDATE app_state SET doc = jsonb_set(doc, ARRAY['employees',$1::text,'docs'], $2::jsonb), rev = rev+1, updated_at = now() WHERE id=1",
+        [String(i), JSON.stringify(docs)]
+      );
     }
-    for (const p of doc.payroll || []) {
-      if (typeof p.proof === "string" && DATA_URL.test(p.proof)) {
-        const f = await stash(p.proof, "payment-proof");
-        if (f) { p.proofFileId = f.id; p.proofMime = f.mime; p.proof = null; moved++; }
-      }
-    }
-    for (const b of doc.vendorBills || []) {
-      if (typeof b.bill === "string" && DATA_URL.test(b.bill)) {
-        const f = await stash(b.bill, b.billName || "bill");
-        if (f) { b.billFileId = f.id; b.billMime = f.mime; b.bill = null; moved++; }
-      }
-    }
-
-    const after = Buffer.byteLength(JSON.stringify(doc));
-    if (moved) {
-      await pool.query("UPDATE app_state SET doc=$1::jsonb, rev=rev+1, updated_at=now() WHERE id=1 AND rev=$2", [JSON.stringify(doc), rev]);
-    }
-    res.json({ ok: true, moved, beforeMb: +(before / 1048576).toFixed(2), afterMb: +(after / 1048576).toFixed(2) });
-  } catch (e) {
-    res.status(500).json({ error: "Cleanup failed: " + (e.message || "") });
   }
+
+  // single-attachment records
+  for (const [arr, field] of [["payables", "receipt"], ["payroll", "proof"], ["vendorBills", "bill"]]) {
+    const n = await arrLen(arr);
+    for (let i = 0; i < n; i++) {
+      const r = await pool.query(`SELECT doc->'${arr}'->($1::int)->>'${field}' AS v FROM app_state WHERE id=1`, [i]);
+      const v = r.rows[0] && r.rows[0].v;
+      if (typeof v === "string" && DATA_URL.test(v)) {
+        const f = await stash(v, field);
+        if (!f) continue;
+        await pool.query(
+          `UPDATE app_state SET doc = jsonb_set(jsonb_set(jsonb_set(doc,
+              ARRAY['${arr}',$1::text,'${field}'], 'null'::jsonb),
+              ARRAY['${arr}',$1::text,'${field}FileId'], to_jsonb($2::text)),
+              ARRAY['${arr}',$1::text,'${field}Mime'], to_jsonb($3::text)),
+            rev = rev+1, updated_at = now() WHERE id=1`,
+          [String(i), f.id, f.mime]
+        );
+        moved++;
+      }
+    }
+  }
+
+  const afterMb = await docSizeMb();
+  return { moved, beforeMb, afterMb };
+}
+
+router.post("/migrate-state", auth, async (req, res) => {
+  try { res.json({ ok: true, ...(await tidyFiles()) }); }
+  catch (e) { res.status(500).json({ error: "Cleanup failed: " + (e.message || "") }); }
 });
+
+// Runs once on start-up. A deploy alone is enough to heal an oversized record —
+// nobody has to find a button for the portal to become usable again.
+async function autoTidyOnBoot() {
+  try {
+    const mb = await docSizeMb();
+    if (mb < 2) return;
+    console.log(`[files] data record is ${mb} MB — moving embedded uploads into file storage…`);
+    const r = await tidyFiles();
+    console.log(`[files] moved ${r.moved} file(s); ${r.beforeMb} MB -> ${r.afterMb} MB`);
+  } catch (e) {
+    console.error("[files] automatic cleanup failed:", e.message);
+  }
+}
 
 // Size report so the problem is visible before and after.
 router.get("/_/state-size", auth, async (req, res) => {
   try {
-    const r = await pool.query("SELECT pg_column_size(doc) AS bytes FROM app_state WHERE id=1");
+    const r = await pool.query("SELECT octet_length(doc::text) AS bytes FROM app_state WHERE id=1");
     const bytes = r.rowCount ? +r.rows[0].bytes : 0;
     const f = await pool.query("SELECT count(*)::int AS n, COALESCE(sum(size),0)::bigint AS total FROM files");
     res.json({ docMb: +(bytes / 1048576).toFixed(2), files: f.rows[0].n, filesMb: +(f.rows[0].total / 1048576).toFixed(2) });
@@ -129,3 +163,4 @@ router.get("/_/state-size", auth, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.autoTidyOnBoot = autoTidyOnBoot;

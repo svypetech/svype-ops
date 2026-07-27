@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · filestore-v1";
+const APP_BUILD = "Build 27 Jul 2026 · autoheal-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -103,6 +103,11 @@ async function _putState(doc, baseRev, base) {
     payload = { doc, baseRev };
   }
   const json = JSON.stringify(payload);
+  if (json.length > 18 * 1024 * 1024) {
+    // Sending this would time the server out. Say exactly how to fix it instead.
+    const mb = (json.length / 1048576).toFixed(1);
+    throw new Error(`TOO_LARGE:${mb}`);
+  }
   const headers = { "Content-Type": "application/json", ...(getChatToken() ? { Authorization: "Bearer " + getChatToken() } : {}) };
   let body = json;
   const gz = await _gzipBody(json);          // typically 2–4× smaller → 2–4× faster upload
@@ -147,7 +152,12 @@ async function _drainSaves() {
         batch.forEach(b=>b.reject && b.reject(e));
         _saveQueue.forEach(q=>q.reject && q.reject(e)); _saveQueue = [];
         _setSaveStatus("error");
-        alert("⚠️ Your last change could NOT be saved to the server, so it will be lost on refresh.\n\nPlease sign out and back in, then try again. If it keeps happening, check your internet connection.\n\n(Technical detail: " + (e?.message || "save failed") + ")");
+        const raw = e?.message || "save failed";
+        if (String(raw).startsWith("TOO_LARGE:")) {
+          alert("⚠️ Your change could not be saved because the data record has grown too large (" + String(raw).split(":")[1] + " MB).\n\nThis happens when uploaded files (CNICs, contracts, receipts) are stored inside the main record.\n\nFIX — open Settings → Backup → Storage health and press “Move uploaded files to storage”. It takes a moment and only needs doing once, then saving will work normally again.");
+        } else {
+          alert("⚠️ Your last change could NOT be saved to the server, so it will be lost on refresh.\n\nFirst try: reload the page and do it again.\nIf it keeps happening, open Settings → Backup → Storage health and run “Move uploaded files to storage”.\n\n(Technical detail: " + raw + ")");
+        }
         return;
       }
     }
