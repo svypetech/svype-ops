@@ -13,6 +13,7 @@ const special = require("./routes/special");
 const chat = require("./routes/chat");
 const state = require("./routes/state");
 const payslip = require("./routes/payslip");
+const files = require("./routes/files");
 const ai = require("./routes/ai");
 const { crud } = require("./routes/crud");
 
@@ -29,6 +30,7 @@ app.use("/api", special);
 app.use("/api/chat", chat);
 app.use("/api/state", state);
 app.use("/api/payslip", payslip);
+app.use("/api/files", files);
 app.use("/api/ai", ai);
 
 // generic CRUD modules

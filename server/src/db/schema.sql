@@ -319,3 +319,14 @@ CREATE TABLE IF NOT EXISTS app_state (
 );
 -- migration for existing databases (safe to re-run)
 ALTER TABLE app_state ADD COLUMN IF NOT EXISTS rev BIGINT NOT NULL DEFAULT 0;
+
+-- Uploaded files (employee documents, receipts, payment proofs).
+-- Kept OUT of app_state.doc so that saving a record never re-uploads every file.
+CREATE TABLE IF NOT EXISTS files (
+  id         TEXT PRIMARY KEY,
+  name       TEXT,
+  mime       TEXT,
+  size       INTEGER,
+  bytes      BYTEA NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

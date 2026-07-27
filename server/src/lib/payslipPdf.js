@@ -264,7 +264,14 @@ function buildPayslipPdf(slip = {}, brand = {}, employee = {}) {
   // ---------- header ----------
   let y = PAGE_H - M - 30;
   let tx = M;
-  if (logo) { d.image(logo, M, y - 4, 104, 44); tx = M + 116; }
+  if (logo) {
+    // Measure how wide the logo actually lands (a square logo is far narrower than a
+    // wide one) and start the company name just after it — no fixed reserved column.
+    const boxW = 104, boxH = 46;
+    const sc = Math.min(boxW / logo.w, boxH / logo.h);
+    d.image(logo, M, y - 4, boxW, boxH);
+    tx = M + logo.w * sc + 14;
+  }
   d.text(tx, y + 16, brand.company || "Company", { size: 17, bold: true });
   if (brand.tagline) d.text(tx, y + 3, brand.tagline, { size: 8.5, gray: 0.45 });
   d.right(right, y + 16, "SALARY SLIP", { size: 13, bold: true, rgb: accent });
@@ -340,7 +347,7 @@ function buildPayslipPdf(slip = {}, brand = {}, employee = {}) {
 
   // ---------- signature & stamp ----------
   const sigY = Math.max(y - 80, 156);
-  if (stampImg) d.image(stampImg, M + innerW - 130, sigY + 2, 100, 100);
+  if (stampImg) d.image(stampImg, M + 172, sigY - 4, 94, 94);   // immediately right of the signature block
   if (sigImg) d.image(sigImg, M, sigY + 26, 128, 44);
   d.line(M, sigY + 20, M + 150, sigY + 20, 0.6);
   d.text(M, sigY + 7, (sig && sig.name) || "Authorised signatory", { size: 9, bold: true });

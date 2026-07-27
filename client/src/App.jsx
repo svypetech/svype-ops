@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · direct-send-v1";
+const APP_BUILD = "Build 27 Jul 2026 · filestore-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -211,6 +211,68 @@ function download(name, text) { const a = document.createElement("a"); a.href = 
 function readFile(file) {
   return new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file); });
 }
+
+
+// Works with both shapes: a legacy inline data URL, or a stored file reference.
+const fileRef = (o, k) => {
+  const raw = o && typeof o[k] === "string" ? o[k] : null;
+  return {
+    fileId: o && o[k + "FileId"],
+    mime: (o && o[k + "Mime"]) || (raw ? (/^data:([^;,]+)/.exec(raw) || [])[1] : null),
+    img: raw && raw.startsWith("data:image") ? raw : null,
+    file: raw && !raw.startsWith("data:image") ? raw : null,
+  };
+};
+// ===== File storage =====
+// Uploaded files are kept in their own server table, not inside the shared data
+// document. The document only holds a small id, so saving a record never re-uploads
+// every file in the company (that is what was timing the server out).
+async function uploadFile(dataUrl, name) {
+  const m = /^data:([^;,]+)?(;base64)?,/i.exec(dataUrl || "");
+  if (!m) return null;
+  const r = await apiReq("POST", "/files", {
+    name: name || "file",
+    mime: m[1] || "application/octet-stream",
+    data: dataUrl.slice(dataUrl.indexOf(",") + 1),
+  });
+  return { fileId: r.id, mime: m[1] || "application/octet-stream", size: r.size };
+}
+const fileUrl = (id) => `/api/files/${id}`;
+async function fetchStoredBlob(fileId) {
+  const res = await fetch(fileUrl(fileId), { headers: getChatToken() ? { Authorization: "Bearer " + getChatToken() } : {} });
+  if (!res.ok) throw new Error("File not found on the server.");
+  return await res.blob();
+}
+// Opens either a stored file (by id) or a legacy inline data URL.
+async function openStored(ref, name) {
+  try {
+    if (ref && ref.fileId) {
+      const blob = await fetchStoredBlob(ref.fileId);
+      const url = URL.createObjectURL(blob);
+      const w = window.open(url, "_blank");
+      if (!w) { const a = document.createElement("a"); a.href = url; a.download = name || "file"; document.body.appendChild(a); a.click(); a.remove(); }
+      setTimeout(()=>URL.revokeObjectURL(url), 60000);
+      return;
+    }
+    openDataUrl((ref && (ref.file || ref.img || ref.data)) || null, name);
+  } catch (e) {
+    alert(e.message || "Couldn't open this file.");
+  }
+}
+// A small preview for images, whether stored or inline.
+function StoredImg({ d, className }) {
+  const [src, setSrc] = useState(d?.img || null);
+  useEffect(() => {
+    let url = null, dead = false;
+    if (!d?.img && d?.fileId && String(d.mime || "").startsWith("image/")) {
+      fetchStoredBlob(d.fileId).then(b => { if (dead) return; url = URL.createObjectURL(b); setSrc(url); }).catch(()=>{});
+    }
+    return () => { dead = true; if (url) URL.revokeObjectURL(url); };
+  }, [d?.fileId, d?.img]);
+  if (!src) return null;
+  return <img src={src} className={className}/>;
+}
+
 // Open a stored data URL (PDF/image/etc.) in a new tab.
 function openDataUrl(dataUrl, name) {
   if (!dataUrl) { alert("This document has no stored file — it was uploaded before an earlier fix and only its name was saved. Please ask HR to re-upload it."); return; }
@@ -579,6 +641,9 @@ export default function App() {
   // setup screen and creating an account on an already-initialised system.
   const showSetup = serverHasFounders === false && !localHasFounders;
   if (showSetup) return <FirstRunSetup data={data} brand={brand} onCreate={(u)=>{ update("users", [...(data.users||[]), u], `Created first ${u.role} account "${u.username}"`); }}/>;
+  if (session && session.mustChange) return <SetPassword session={session} data={data} brand={brand} update={update}
+    onDone={(u)=>setSession(u)}
+    onSignOut={()=>{ setSession(null); try { setChatToken(null); localStorage.removeItem("svype_session"); } catch {} }}/>;
   if (!session) return <Login data={data} brand={brand}
     onHydrate={(d)=>{ if (d.token) setChatToken(d.token); if (d.doc) { initSaveState(d.doc, +d.rev||0); setData({ ...SEED, ...d.doc }); } if (d.brand) setBrand(d.brand); }}
     onLogin={(u)=>{ identifyForChat(u); setSession(u); setTab("dash"); }}/>;
@@ -642,6 +707,7 @@ export default function App() {
 
       <SaveStatus/>
       <main className="flex-1 min-w-0 overflow-y-auto">
+        <ErrorBoundary key={active}>
         <div className="sticky top-0 z-30 flex items-center gap-3 px-4 py-2.5 bg-white border-b border-slate-200">
           <button onClick={()=>setNavOpen(true)} className="lg:hidden text-slate-600"><Menu size={22}/></button>
           {!isEmp ? <GlobalSearch data={data} go={setTab}/> : <div className="font-semibold text-sm text-slate-700">Team Portal</div>}
@@ -710,6 +776,7 @@ export default function App() {
             {active==="vault" && <Vault {...props}/>}
           </>)}
         </div>
+        </ErrorBoundary>
       </main>
     </div>
   );
@@ -787,6 +854,29 @@ function FirstRunSetup({ data, brand, onCreate }) {
 }
 
 /* ---------------- login (username + password) ---------------- */
+
+// A render error used to blank the whole screen with no clue what happened. This shows
+// what broke and lets the person carry on working elsewhere.
+class ErrorBoundary extends React.Component {
+  constructor(p) { super(p); this.state = { err: null }; }
+  static getDerivedStateFromError(err) { return { err }; }
+  componentDidCatch(err, info) { try { console.error("Svype OS error:", err, info); } catch {} }
+  render() {
+    if (!this.state.err) return this.props.children;
+    return (<div className="p-6">
+      <div className="max-w-lg mx-auto bg-white border border-rose-200 rounded-2xl p-6 text-center">
+        <div className="w-11 h-11 rounded-full bg-rose-100 text-rose-600 grid place-items-center text-xl font-bold mx-auto">!</div>
+        <div className="font-semibold text-slate-900 mt-3">This screen hit a problem</div>
+        <p className="text-sm text-slate-500 mt-1">Nothing has been lost — your saved data is safe. Please screenshot the detail below and send it over.</p>
+        <pre className="text-xs text-left bg-slate-50 border border-slate-200 rounded-lg p-3 mt-3 overflow-auto max-h-40 whitespace-pre-wrap">{String(this.state.err && (this.state.err.stack || this.state.err.message || this.state.err))}</pre>
+        <div className="flex gap-2 justify-center mt-4">
+          <Btn onClick={()=>this.setState({ err:null })}><ChevronLeft size={15}/>Go back</Btn>
+          <Btn variant="ghost" onClick={()=>window.location.reload()}>Reload the portal</Btn>
+        </div>
+      </div>
+    </div>);
+  }
+}
 function SaveStatus() {
   // BLOCKING save dialog: while a save is in flight the whole screen is locked —
   // nothing else can be done until the server confirms. Brief green tick on success.
@@ -812,6 +902,36 @@ function SaveStatus() {
     <div className={card}><div className="w-10 h-10 rounded-full bg-rose-100 text-rose-600 grid place-items-center text-xl font-bold">!</div><div className="font-semibold text-rose-600">Could not save</div><div className="text-xs text-slate-500 max-w-[240px]">Your last change didn't reach the server. Check your connection, then try again.</div><Btn onClick={()=>setShow(false)}>Close</Btn></div></div>);
   return (<div className={wrap} style={{background:"rgba(15,23,42,.25)"}}>
     <div className={card}><div className="w-10 h-10 rounded-full bg-emerald-500 text-white grid place-items-center"><Check size={22}/></div><div className="font-semibold text-emerald-600">Saved</div></div></div>);
+}
+function SetPassword({ session, data, brand, update, onDone, onSignOut }) {
+  const [p1, setP1] = useState(""); const [p2, setP2] = useState("");
+  const [err, setErr] = useState(""); const [busy, setBusy] = useState(false);
+  const save = async () => {
+    if (p1.length < 6) { setErr("Please use at least 6 characters."); return; }
+    if (p1 !== p2) { setErr("The two passwords don't match."); return; }
+    setBusy(true); setErr("");
+    try {
+      const uname = String(session.username || "").toLowerCase();
+      const users = (data.users || []).map(u => String(u.username||"").toLowerCase() === uname ? { ...u, password: p1, mustChange: false } : u);
+      await update("users", users, `${session.username} set their own password`);
+      onDone({ ...session, password: p1, mustChange: false });
+    } catch { setErr("Couldn't save your new password — check your connection and try again."); setBusy(false); }
+  };
+  return (<div className="min-h-screen grid place-items-center bg-slate-100 px-4">
+    <div className="w-full max-w-sm bg-white rounded-2xl shadow-xl p-7">
+      <div className="text-lg font-bold tracking-tight">Set your own password</div>
+      <p className="text-sm text-slate-500 mt-1 mb-5">Welcome, {session.username}. The password you were given is temporary — choose one only you know.</p>
+      <div className="space-y-3">
+        <div><span className="text-xs font-medium text-slate-500 mb-1 block">New password</span>
+          <input type="password" value={p1} autoFocus autoComplete="new-password" onChange={e=>{setP1(e.target.value);setErr("");}} className={inputCls} placeholder="at least 6 characters"/></div>
+        <div><span className="text-xs font-medium text-slate-500 mb-1 block">Confirm new password</span>
+          <input type="password" value={p2} autoComplete="new-password" onChange={e=>{setP2(e.target.value);setErr("");}} onKeyDown={e=>e.key==="Enter"&&save()} className={inputCls} placeholder="type it again"/></div>
+        {err && <div className="text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{err}</div>}
+        <Btn onClick={save} disabled={busy}>{busy?<Loader2 size={15} className="animate-spin"/>:<Check size={15}/>}{busy?"Saving…":"Save and continue"}</Btn>
+        <button onClick={onSignOut} className="text-xs text-slate-400 hover:text-slate-600 w-full text-center pt-1">Sign out instead</button>
+      </div>
+    </div>
+  </div>);
 }
 function Login({ data, brand, onLogin, onHydrate }) {
   const [u, setU] = useState(""); const [p, setP] = useState(""); const [err, setErr] = useState("");
@@ -1116,15 +1236,25 @@ function checkInOut(mutateData, name, which, onResult, remoteAllowed = false) {
     onResult && onResult({ ok:true, msg:`Checked ${which} · ${officeName}`, office:officeName });
   };
   if (navigator.geolocation) {
-    navigator.geolocation.getCurrentPosition(
-      p=>apply({lat:p.coords.latitude,lng:p.coords.longitude}),
-      ()=>apply(null), // office staff get the location error; WFH proceeds as Remote
-      { enableHighAccuracy:true, timeout:8000, maximumAge:0 }
-    );
+    const ok = (p)=>apply({ lat:p.coords.latitude, lng:p.coords.longitude });
+    const fail = (err)=>{
+      if (remoteAllowed) return apply(null);             // WFH is never blocked
+      const code = err && err.code;
+      let msg = "Couldn't get your location. Please try again.";
+      if (code === 1) msg = "Location is blocked for this site. Tap the padlock / (i) icon next to the web address, allow Location, then try again. On iPhone also check Settings → Privacy → Location Services → Safari.";
+      else if (code === 2) msg = "Your device couldn't work out where it is. On a laptop make sure Wi-Fi is on; on a phone turn on Location/GPS, then try again.";
+      else if (code === 3) msg = "Getting your location took too long. Step near a window or switch on Wi-Fi, then try again.";
+      onResult && onResult({ ok:false, msg });
+    };
+    // First a quick precise fix; if that fails, retry with a longer, lower-accuracy
+    // attempt — laptops indoors routinely fail the strict one.
+    navigator.geolocation.getCurrentPosition(ok, () => {
+      navigator.geolocation.getCurrentPosition(ok, fail, { enableHighAccuracy:false, timeout:20000, maximumAge:120000 });
+    }, { enableHighAccuracy:true, timeout:10000, maximumAge:0 });
   } else if (remoteAllowed) {
     apply(null); // WFH: no location available — check in as Remote
   } else {
-    onResult && onResult({ ok:false, msg:"This device can't share location, so check-in isn't available here." });
+    onResult && onResult({ ok:false, msg:"This browser can't share location. Please use Safari or Chrome, or ask HR to mark you present." });
   }
 }
 function CheckInCard({ data, mutateData, me }) {
@@ -1209,7 +1339,7 @@ function EmpProfile({ data, update, me }) {
     <div className="flex items-center gap-4 mb-6"><div className="w-14 h-14 rounded-2xl bg-sky-100 text-sky-700 grid place-items-center font-bold text-xl">{me.name[0]}</div><div><div className="text-lg font-bold text-slate-900">{me.name}</div><div className="text-sm text-slate-500">{me.role} · {me.dept}</div></div></div>
     <div className="grid sm:grid-cols-2 gap-4 mb-6">{[["Email",me.email],["Phone",me.phone],["CNIC",me.cnic],["Salary",fmt(me.salary)],["Joined",me.joined],["Status",me.status],["Check-in policy", me.remoteAllowed?"Anywhere (WFH)":"Office only"], ...(me.onNotice?[["Employment","On notice period"],["Notice given",me.noticeGivenOn||"—"],["Last working day",me.lastWorkingDay||"—"]]:[])].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-xs text-slate-500">{k}</div><div className="font-medium mt-0.5">{v||"—"}</div></div></Card>))}</div>
     <div className="text-xs uppercase tracking-wider text-slate-500 mb-2 font-medium">My documents</div>
-    <Card><div className="p-4">{(!me.docs||me.docs.length===0)?<Empty msg="No documents on file"/>:<div className="grid sm:grid-cols-3 gap-3">{me.docs.map(d=>(<button key={d.id} onClick={()=>openDataUrl(d.file||d.img, d.name)} className="text-left bg-slate-50 border border-slate-200 rounded-lg overflow-hidden hover:border-sky-400 hover:shadow-sm transition">{d.img?<img src={d.img} className="w-full h-32 object-cover"/>:<div className="h-32 grid place-items-center text-slate-400"><FileText/></div>}<div className="p-2 text-xs truncate flex items-center gap-1"><span className="text-sky-600">↗</span>{d.name}{d.expiry&&<span className="block text-slate-400">exp {d.expiry}</span>}</div></button>))}</div>}</div></Card>
+    <Card><div className="p-4">{(!me.docs||me.docs.length===0)?<Empty msg="No documents on file"/>:<div className="grid sm:grid-cols-3 gap-3">{me.docs.map(d=>(<button key={d.id} onClick={()=>openStored(d, d.name)} className="text-left bg-slate-50 border border-slate-200 rounded-lg overflow-hidden hover:border-sky-400 hover:shadow-sm transition">{(d.img||(d.fileId&&String(d.mime||"").startsWith("image/")))?<StoredImg d={d} className="w-full h-32 object-cover"/>:<div className="h-32 grid place-items-center text-slate-400"><FileText/></div>}<div className="p-2 text-xs truncate flex items-center gap-1"><span className="text-sky-600">↗</span>{d.name}{d.expiry&&<span className="block text-slate-400">exp {d.expiry}</span>}</div></button>))}</div>}</div></Card>
     {req!==null && <Modal title="Request a profile change" onClose={()=>setReq(null)}><Area label="What needs updating?" value={req} onChange={e=>setReq(e.target.value)} placeholder="e.g. New phone number, updated CNIC scan"/><Btn onClick={submit}><Check size={15}/>Send to HR</Btn></Modal>}
     {cert && <Modal title="Request a certificate / letter" onClose={()=>setCert(null)}>
       <Select label="What do you need?" options={["Salary Certificate","Experience Certificate","Employment Verification","Appointment Letter","Other"]} value={cert.type} onChange={e=>setCert({...cert,type:e.target.value})}/>
@@ -1349,11 +1479,21 @@ function EmpExpenses({ data, update, me }) {
   const [f, setF] = useState({ desc:"", amount:"", receipt:null });
   const [err, setErr] = useState("");
   const mine = data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===me.name);
-  const onReceipt = async (file) => { if (file) { const isImg=file.type.startsWith("image/"); setF({ ...f, receipt: isImg ? await readImage(file, 1400, true, 0.8) : await readFile(file), receiptName:file.name, receiptIsImg:isImg }); setErr(""); } };
+  const onReceipt = async (file) => {
+    if (!file) return;
+    if (file.size > 20*1024*1024) { setErr("That file is over 20 MB — please compress it first."); return; }
+    const isImg = file.type.startsWith("image/");
+    const dataUrl = isImg ? await readImage(file, 1600, true, 0.82) : await readFile(file);
+    try {
+      const stored = await uploadFile(dataUrl, file.name);        // stored outside the data record
+      setF({ ...f, receipt:null, receiptFileId:stored.fileId, receiptMime:stored.mime, receiptName:file.name, receiptIsImg:isImg });
+      setErr("");
+    } catch { setErr("Couldn't upload the receipt — check your connection and try again."); }
+  };
   const submit = () => {
     if (!f.desc || !f.amount) { setErr("Please add a description and amount."); return; }
     if (!f.receipt) { setErr("A photo of the bill/receipt is required to submit a claim."); return; }
-    update("payables", [{ id:uid(), vendor:me.name, desc:"Reimbursement: "+f.desc, amount:+f.amount, due:today(), status:"Pending", kind:"reimbursement", settled:false, receipt:f.receipt, receiptName:f.receiptName }, ...data.payables], `${me.name} submitted an expense claim`);
+    update("payables", [{ id:uid(), vendor:me.name, desc:"Reimbursement: "+f.desc, amount:+f.amount, due:today(), status:"Pending", kind:"reimbursement", settled:false, receipt:f.receipt, receiptFileId:f.receiptFileId, receiptMime:f.receiptMime, receiptName:f.receiptName }, ...data.payables], `${me.name} submitted an expense claim`);
     setF({ desc:"", amount:"", receipt:null }); setErr("");
   };
   return (<>
@@ -1364,12 +1504,12 @@ function EmpExpenses({ data, update, me }) {
         <Field label="Amount (PKR)" type="number" value={f.amount} onChange={e=>setF({...f,amount:e.target.value})}/>
         <div><span className="text-xs text-slate-500 mb-1 block">Receipt / bill photo <span className="text-rose-500">*required</span></span>
           <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500"><Paperclip size={15}/>{f.receipt?"Receipt attached":"Attach receipt / bill"}<input type="file" accept="image/*,application/pdf" className="hidden" onChange={e=>onReceipt(e.target.files[0])}/></label>
-          {f.receipt && (f.receiptIsImg!==false ? <button onClick={()=>openDataUrl(f.receipt, f.receiptName)} className="block mt-2"><img src={f.receipt} className="h-28 rounded-lg border border-slate-200 object-cover"/></button> : <button onClick={()=>openDataUrl(f.receipt, f.receiptName)} className="mt-2 flex items-center gap-2 text-sm text-sky-600 hover:underline"><FileText size={15}/>{f.receiptName||"Attached file"} ↗</button>)}
+          {(f.receipt||f.receiptFileId) && <button onClick={()=>openStored(fileRef(f,"receipt"), f.receiptName)} className="mt-2 flex items-center gap-2 text-sm text-sky-600 hover:underline"><FileText size={15}/>{f.receiptName||"Attached file"} ↗</button>}
         </div>
         {err && <div className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{err}</div>}
         <Btn onClick={submit}><Check size={15}/>Submit claim</Btn>
       </div></Card>
-      <Card><Table cols={["Description","Amount","Status"]}>{mine.length===0?<tr><td colSpan={3}><Empty msg="No claims submitted"/></td></tr>:mine.map(p=>(<Row key={p.id}><Td className="font-medium"><div className="flex items-center gap-2">{p.receipt&&<button onClick={()=>openDataUrl(p.receipt, p.receiptName||"receipt")} title="Open receipt"><img src={p.receipt} className="w-8 h-8 rounded object-cover border border-slate-200 hover:ring-2 hover:ring-sky-400"/></button>}{p.desc.replace("Reimbursement: ","")}</div></Td><Td>{fmt(p.amount)}</Td><Td><Pill s={p.status}/></Td></Row>))}</Table></Card>
+      <Card><Table cols={["Description","Amount","Status"]}>{mine.length===0?<tr><td colSpan={3}><Empty msg="No claims submitted"/></td></tr>:mine.map(p=>(<Row key={p.id}><Td className="font-medium"><div className="flex items-center gap-2">{(p.receipt||p.receiptFileId)&&<button onClick={()=>openStored(fileRef(p,"receipt"), p.receiptName||"receipt")} title="Open receipt" className="w-8 h-8 rounded border border-slate-200 grid place-items-center overflow-hidden hover:ring-2 hover:ring-sky-400"><StoredImg d={fileRef(p,"receipt")} className="w-8 h-8 object-cover"/></button>}{p.desc.replace("Reimbursement: ","")}</div></Td><Td>{fmt(p.amount)}</Td><Td><Pill s={p.status}/></Td></Row>))}</Table></Card>
     </div></>);
 }
 
@@ -2045,7 +2185,7 @@ function UsersAccess({ data, update }) {
   const [edit, setEdit] = useState(null);
   const [reset, setReset] = useState(null);
   const linkedName = (u) => u.role!=="employee" ? ROLES[u.role] : (data.employees.find(e=>e.id===u.empId)?.name || "— unlinked —");
-  const blank = { username:"", password:"", role:"employee", empId:"", active:true };
+  const blank = { username:"", password:"", role:"employee", empId:"", active:true, mustChange:true };
   const save = (u) => {
     const uname = u.username.trim().toLowerCase();
     if (!uname || !u.password) return;
@@ -2054,7 +2194,7 @@ function UsersAccess({ data, update }) {
     else setUsers([...users, { ...u, username:uname, id:uid() }], `Created login "${uname}" (${u.role})`);
     setEdit(null);
   };
-  const doReset = () => { setUsers(users.map(x=>x.id===reset.id?{...x,password:reset.password}:x), `Reset password for ${reset.username}`); setReset(null); };
+  const doReset = () => { setUsers(users.map(x=>x.id===reset.id?{...x,password:reset.password,mustChange:true}:x), `Reset password for ${reset.username}`); setReset(null); };
   const toggle = (u) => setUsers(users.map(x=>x.id===u.id?{...x,active:!x.active}:x), `${u.active?"Deactivated":"Reactivated"} ${u.username}`);
   const unlinkedEmps = data.employees.filter(e=>e.status==="Active" && !users.some(u=>u.empId===e.id));
   return (<>
@@ -2075,7 +2215,9 @@ function UsersAccess({ data, update }) {
 
     {edit && <Modal title={edit.id?"Edit user":"Create user"} onClose={()=>setEdit(null)}>
       <Field label="Username" value={edit.username} onChange={e=>setEdit({...edit,username:e.target.value})} placeholder="e.g. qasim"/>
-      <Field label="Password" value={edit.password} onChange={e=>setEdit({...edit,password:e.target.value})} placeholder="set a password"/>
+      <Field label="Password" value={edit.password} onChange={e=>setEdit({...edit,password:e.target.value})} placeholder="set a starting password"/>
+      <label className="flex items-start gap-2 text-sm text-slate-700 cursor-pointer"><input type="checkbox" checked={edit.mustChange!==false} onChange={e=>setEdit({...edit,mustChange:e.target.checked})} className="mt-0.5"/>
+        <span>Ask them to set their own password at first sign-in<div className="text-xs text-slate-400">Recommended — what you type above becomes a one-time code, and only they know their real password afterwards.</div></span></label>
       <Select label="Role" options={["employee","hr","admin"]} value={edit.role} onChange={e=>setEdit({...edit,role:e.target.value, empId: e.target.value==="employee"?edit.empId:""})}/>
       {edit.role==="employee" && <label className="block"><span className="text-xs text-slate-500 mb-1 block">Which staff member is this login for?</span>
         <select value={edit.empId} onChange={e=>setEdit({...edit,empId:e.target.value})} className={inputCls}>
@@ -2089,6 +2231,7 @@ function UsersAccess({ data, update }) {
     </Modal>}
 
     {reset && <Modal title={`Reset password · ${reset.username}`} onClose={()=>setReset(null)}>
+      <p className="text-xs text-slate-500">This becomes a one-time code — they will be asked to set their own password the next time they sign in.</p>
       <Field label="New password" value={reset.password} onChange={e=>setReset({...reset,password:e.target.value})} placeholder="enter new password"/>
       <Btn onClick={()=>reset.password&&doReset()}><Check size={15}/>Set new password</Btn>
     </Modal>}
@@ -2231,7 +2374,26 @@ function Employees({ data, update, mutateData }) {
   </>);
 }
 function EmployeeForm({ edit, setEdit, save }) {
-  const addDocs = async (files) => { const arr = [...(edit.docs||[])]; for (const f of files) { const isImg = f.type.startsWith("image/"); arr.push({ id:uid(), name:f.name, type:isImg?"image":"file", img: isImg ? await readImage(f, 1400, true, 0.8) : null, file: isImg ? null : await readFile(f), expiry:"", date:today() }); } setEdit({ ...edit, docs: arr }); };
+  const [upErr, setUpErr] = useState("");
+  const [uploading, setUploading] = useState(false);
+  const addDocs = async (files) => {
+    setUpErr(""); setUploading(true);
+    const arr = [...(edit.docs||[])];
+    try {
+      for (const f of files) {
+        if (f.size > 20 * 1024 * 1024) { setUpErr(`${f.name} is over 20 MB — please compress it first.`); continue; }
+        const isImg = f.type.startsWith("image/");
+        const dataUrl = isImg ? await readImage(f, 1600, true, 0.82) : await readFile(f);
+        const stored = await uploadFile(dataUrl, f.name);          // straight to file storage
+        if (!stored) { setUpErr(`Couldn't read ${f.name}.`); continue; }
+        arr.push({ id:uid(), name:f.name, type:isImg?"image":"file", fileId:stored.fileId, mime:stored.mime, size:stored.size, expiry:"", date:today() });
+      }
+      setEdit({ ...edit, docs: arr });
+    } catch (e) {
+      setUpErr(e.message || "Upload failed — check your connection and try again.");
+    }
+    setUploading(false);
+  };
   const setDocExpiry = (id, v) => setEdit({ ...edit, docs: edit.docs.map(d=>d.id===id?{...d,expiry:v}:d) });
   return <Modal title={edit.id?"Edit employee":"Add employee"} onClose={()=>setEdit(null)}>
     <Field label="Full name" value={edit.name} onChange={e=>setEdit({...edit,name:e.target.value})}/>
@@ -2243,8 +2405,9 @@ function EmployeeForm({ edit, setEdit, save }) {
     <Select label="Status" options={["Active","Inactive"]} value={edit.status} onChange={e=>setEdit({...edit,status:e.target.value})}/>
     <div className="grid grid-cols-2 gap-3"><Field label="Bank name" value={edit.bankName||""} onChange={e=>setEdit({...edit,bankName:e.target.value})} placeholder="e.g. Meezan Bank"/><Field label="Account number / IBAN" value={edit.account||""} onChange={e=>setEdit({...edit,account:e.target.value})}/></div>
     <div><span className="text-xs text-slate-500 mb-1 block">Documents (set an expiry to get reminders)</span>
-      <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500"><Paperclip size={15}/> Upload files<input type="file" multiple accept="image/*,.pdf" className="hidden" onChange={e=>addDocs([...e.target.files])}/></label>
-      {(edit.docs||[]).length>0 && <div className="mt-2 space-y-2">{edit.docs.map(d=>(<div key={d.id} className="bg-slate-50 border border-slate-200 rounded px-2 py-2"><div className="flex items-center justify-between text-xs"><button onClick={()=>openDataUrl(d.file||d.img, d.name)} className="truncate text-sky-600 hover:underline flex items-center gap-1"><span>↗</span>{d.name}</button><button onClick={()=>setEdit({...edit,docs:edit.docs.filter(x=>x.id!==d.id)})} className="text-slate-400 hover:text-rose-500"><X size={13}/></button></div><div className="flex items-center gap-2 mt-1"><span className="text-xs text-slate-400">Expiry</span><input type="date" value={d.expiry||""} onChange={e=>setDocExpiry(d.id,e.target.value)} className="bg-white border border-slate-300 rounded px-2 py-1 text-xs outline-none focus:border-sky-500"/></div></div>))}</div>}
+      <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500">{uploading?<Loader2 size={15} className="animate-spin"/>:<Paperclip size={15}/>}{uploading?"Uploading…":"Upload files"}<input type="file" multiple accept="image/*,.pdf" className="hidden" disabled={uploading} onChange={e=>addDocs([...e.target.files])}/></label>
+      {upErr && <div className="mt-2 text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{upErr}</div>}
+      {(edit.docs||[]).length>0 && <div className="mt-2 space-y-2">{edit.docs.map(d=>(<div key={d.id} className="bg-slate-50 border border-slate-200 rounded px-2 py-2"><div className="flex items-center justify-between text-xs"><button onClick={()=>openStored(d, d.name)} className="truncate text-sky-600 hover:underline flex items-center gap-1"><span>↗</span>{d.name}</button><button onClick={()=>setEdit({...edit,docs:edit.docs.filter(x=>x.id!==d.id)})} className="text-slate-400 hover:text-rose-500"><X size={13}/></button></div><div className="flex items-center gap-2 mt-1"><span className="text-xs text-slate-400">Expiry</span><input type="date" value={d.expiry||""} onChange={e=>setDocExpiry(d.id,e.target.value)} className="bg-white border border-slate-300 rounded px-2 py-1 text-xs outline-none focus:border-sky-500"/></div></div>))}</div>}
     </div>
     <Btn onClick={()=>save(edit)}><Check size={15}/>Save</Btn>
   </Modal>;
@@ -2260,7 +2423,7 @@ function EmployeeProfile({ emp, data, onBack, onEdit }) {
     <div className="flex flex-wrap items-start justify-between gap-3 mb-6"><div className="flex items-center gap-4"><div className="w-14 h-14 rounded-2xl bg-sky-100 text-sky-700 grid place-items-center font-bold text-xl shrink-0">{emp.name[0]}</div><div><h2 className="text-xl font-bold tracking-tight text-slate-900">{emp.name}</h2><p className="text-sm text-slate-500">{emp.role} · {emp.dept}</p></div></div><Btn variant="ghost" onClick={onEdit}><Edit3 size={15}/>Edit</Btn></div>
     <div className="flex gap-1 mb-5 border-b border-slate-200 overflow-x-auto">{tabs.map(([k,l])=>(<button key={k} onClick={()=>setT(k)} className={`px-4 py-2 text-sm border-b-2 -mb-px whitespace-nowrap ${t===k?"border-sky-600 text-sky-700 font-medium":"border-transparent text-slate-500 hover:text-slate-800"}`}>{l}</button>))}</div>
     {t==="overview" && <div className="grid sm:grid-cols-2 gap-4">{[["Email",emp.email],["Phone",emp.phone],["CNIC",emp.cnic],["Salary",fmt(emp.salary)],["Provident fund",(emp.pf||0)+"%"],["Joined",emp.joined],["Bank",emp.bankName],["Account / IBAN",emp.account]].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-xs text-slate-500">{k}</div><div className="font-medium mt-0.5">{v||"—"}</div></div></Card>))}</div>}
-    {t==="docs" && <Card><div className="p-4">{(!emp.docs||emp.docs.length===0)?<Empty msg="No documents on file."/>:<div className="grid sm:grid-cols-3 gap-3">{emp.docs.map(d=>{const dd=d.expiry?daysUntil(d.expiry):null;return(<button key={d.id} onClick={()=>openDataUrl(d.file||d.img, d.name)} className="text-left bg-slate-50 border border-slate-200 rounded-lg overflow-hidden hover:border-sky-400 hover:shadow-sm transition">{d.img?<img src={d.img} className="w-full h-32 object-cover"/>:<div className="h-32 grid place-items-center text-slate-400"><FileText/></div>}<div className="p-2 text-xs"><div className="truncate flex items-center gap-1"><span className="text-sky-600">↗</span>{d.name}</div>{d.expiry&&<div className={dd<=30?"text-rose-600":"text-slate-400"}>exp {d.expiry}{dd<=30?` · ${dd<0?"expired":dd+"d"}`:""}</div>}</div></button>);})}</div>}</div></Card>}
+    {t==="docs" && <Card><div className="p-4">{(!emp.docs||emp.docs.length===0)?<Empty msg="No documents on file."/>:<div className="grid sm:grid-cols-3 gap-3">{emp.docs.map(d=>{const dd=d.expiry?daysUntil(d.expiry):null;return(<button key={d.id} onClick={()=>openStored(d, d.name)} className="text-left bg-slate-50 border border-slate-200 rounded-lg overflow-hidden hover:border-sky-400 hover:shadow-sm transition">{(d.img||(d.fileId&&String(d.mime||"").startsWith("image/")))?<StoredImg d={d} className="w-full h-32 object-cover"/>:<div className="h-32 grid place-items-center text-slate-400"><FileText/></div>}<div className="p-2 text-xs"><div className="truncate flex items-center gap-1"><span className="text-sky-600">↗</span>{d.name}</div>{d.expiry&&<div className={dd<=30?"text-rose-600":"text-slate-400"}>exp {d.expiry}{dd<=30?` · ${dd<0?"expired":dd+"d"}`:""}</div>}</div></button>);})}</div>}</div></Card>}
     {t==="payroll" && <Card><Table cols={["Month","Basic","Net","Status"]}>{slips.length===0?<tr><td colSpan={4}><Empty msg="No payroll history"/></td></tr>:slips.map(p=>(<Row key={p.id}><Td>{p.month}</Td><Td>{fmt(p.basic)}</Td><Td className="font-semibold">{fmt(netPay(p))}</Td><Td><Pill s={p.paid?"Paid":"Pending"}/></Td></Row>))}</Table></Card>}
     {t==="advances" && <Card><Table cols={["Date","Total","Installment","Remaining","Status"]}>{advs.length===0?<tr><td colSpan={5}><Empty msg="No advances"/></td></tr>:advs.map(a=>(<Row key={a.id}><Td className="text-slate-500">{a.date}</Td><Td>{fmt(a.total)}</Td><Td>{fmt(a.installment)}</Td><Td>{fmt(a.remaining)}</Td><Td><Pill s={a.status}/></Td></Row>))}</Table></Card>}
     {t==="letters" && <Card><Table cols={["Type","Date"]}>{empLetters.length===0?<tr><td colSpan={2}><Empty msg="No letters issued"/></td></tr>:empLetters.map(l=>(<Row key={l.id}><Td>{l.docType||l.type}</Td><Td className="text-slate-500">{l.date}</Td></Row>))}</Table></Card>}
@@ -2403,8 +2566,8 @@ function Payroll({ data, patch, update, brand }) {
           <Select label="Payment method" options={["Bank transfer","Cheque","Cash","Wise / online"]} value={bulkPay.method} onChange={e=>setBulkPay({...bulkPay,method:e.target.value})}/>
           <div><span className="text-xs text-slate-500 mb-1 block">Payment proof (optional — applied to all)</span>
             <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500"><Paperclip size={15}/>{bulkPay.proof?"Change screenshot":"Attach screenshot"}
-              <input type="file" accept="image/*" className="hidden" onChange={async e=>{ const f=e.target.files[0]; if(f){ const img=await readImage(f,1200,true,0.8); setBulkPay(b=>({...b, proof:img})); } }}/></label>
-            {bulkPay.proof && <img src={bulkPay.proof} className="mt-2 h-24 rounded-lg border border-slate-200 object-cover"/>}
+              <input type="file" accept="image/*" className="hidden" onChange={async e=>{ const f=e.target.files[0]; if(f){ const img=await readImage(f,1400,true,0.82); try { const st=await uploadFile(img,"payment-proof.jpg"); setBulkPay(b=>({...b, proof:{fileId:st.fileId, mime:st.mime}})); } catch { setBulkPay(b=>({...b, proof:img})); } } }}/></label>
+            {bulkPay.proof && <StoredImg d={typeof bulkPay.proof==="string"?{img:bulkPay.proof}:{...bulkPay.proof}} className="mt-2 h-24 rounded-lg border border-slate-200 object-cover"/>}
           </div>
           {chosen.length!==unpaid.length && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">{chosen.length-unpaid.length} already-paid slip(s) in your selection will be left untouched.</div>}
           <Btn onClick={doBulkPay}><Check size={15}/>Mark {unpaid.length} paid</Btn>
@@ -2469,7 +2632,7 @@ function PayrollPaidModal({ rec, brand, email, employee, onClose, onSave }) {
       setSending(false);
     }
   };
-  const onImg = async (f) => { if (f) setProof(await readImage(f, 1000)); };
+  const onImg = async (f) => { if (!f) return; const d = await readImage(f, 1400, true, 0.82); try { const st = await uploadFile(d, "payment-proof.jpg"); setProof({ fileId: st.fileId, mime: st.mime }); } catch { setProof(d); } };
   const slipLines = () => {
     const L = [];
     L.push(`Basic: ${fmt(rec.basic)}`);
@@ -2498,7 +2661,7 @@ function PayrollPaidModal({ rec, brand, email, employee, onClose, onSave }) {
     <Select label="Payment method" options={["Bank transfer","Cheque","Cash","Wise / online"]} value={method} onChange={e=>setMethod(e.target.value)}/>
     <div><span className="text-xs text-slate-500 mb-1 block">Payment proof (transfer screenshot or cheque photo)</span>
       <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500"><Paperclip size={15}/>{proof?"Proof attached":"Attach screenshot / cheque"}<input type="file" accept="image/*" className="hidden" onChange={e=>onImg(e.target.files[0])}/></label>
-      {proof && <img src={proof} className="mt-2 h-32 rounded-lg border border-slate-200 object-cover"/>}
+      {proof && <StoredImg d={typeof proof==="string"?{img:proof}:{...proof}} className="mt-2 h-32 rounded-lg border border-slate-200 object-cover"/>}
     </div>
     <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
       <div className="text-xs font-medium text-slate-600 mb-1 flex items-center gap-1.5"><Mail size={13}/>Email {email?`→ ${email}`:"(no email on file)"}</div>
@@ -3255,13 +3418,13 @@ function Payables({ data, update, patch, brand }) {
     <Ledger noun="payable" title="Payables" sub={`Owed · ${fmt(rows.filter(r=>r.status!=="Paid").reduce((s,r)=>s+ +r.amount,0))} · approved vendor bills land here as unpaid until you mark them paid`} rows={rows} setRows={setRows}
       blank={()=>({vendor:"",desc:"",amount:"",due:today(),status:"Pending"})}
       cols={["Vendor","Description","Amount","Due","Status"]}
-      render={r=>(<><Td className="font-medium">{r.vendor}</Td><Td className="text-slate-500"><div className="flex items-center gap-2">{r.receipt&&<button onClick={(e)=>{e.stopPropagation();openDataUrl(r.receipt, (r.desc||"receipt").replace(/[^a-z0-9]+/gi,"-"));}} title="Open receipt" className="shrink-0"><img src={r.receipt} className="w-8 h-8 rounded object-cover border border-slate-200 hover:ring-2 hover:ring-sky-400"/></button>}{r.desc}{r.payVia==="salary"&&<span className="text-xs text-sky-600">→ {r.payMonth} salary</span>}{r.kind==="vendorbill"&&<span className="text-xs text-slate-400">vendor bill</span>}</div></Td><Td>{fmt(r.amount)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
+      render={r=>(<><Td className="font-medium">{r.vendor}</Td><Td className="text-slate-500"><div className="flex items-center gap-2">{(r.receipt||r.receiptFileId)&&<button onClick={(e)=>{e.stopPropagation();openStored(fileRef(r,"receipt"), r.receiptName||"receipt");}} title="Open receipt" className="shrink-0 w-8 h-8 rounded border border-slate-200 grid place-items-center hover:ring-2 hover:ring-sky-400 overflow-hidden"><StoredImg d={fileRef(r,"receipt")} className="w-8 h-8 object-cover"/><FileText size={13} className="text-slate-400"/></button>}{r.desc}{r.payVia==="salary"&&<span className="text-xs text-sky-600">→ {r.payMonth} salary</span>}{r.kind==="vendorbill"&&<span className="text-xs text-slate-400">vendor bill</span>}</div></Td><Td>{fmt(r.amount)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
       extraActions={r=> r.kind==="reimbursement" && r.status!=="Approved" && r.status!=="Paid" ? <button onClick={()=>openApprove(r)} title="Approve reimbursement" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button> : (r.kind==="vendorbill" && r.status!=="Paid" ? <button onClick={()=>markVendorPaid(r)} title="Mark vendor bill as paid" className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Mark paid</button> : null)}
       fields={(e,s)=>(<><Field label="Vendor" value={e.vendor} onChange={ev=>s({...e,vendor:ev.target.value})}/><Field label="Description" value={e.desc} onChange={ev=>s({...e,desc:ev.target.value})}/><Field label="Amount (PKR)" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Field label="Due" type="date" value={e.due} onChange={ev=>s({...e,due:ev.target.value})}/><Select label="Status" options={["Pending","Approved","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>
     {appr && <Modal title={`Approve reimbursement · ${appr.vendor}`} onClose={()=>setAppr(null)}>
       <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm flex justify-between"><span className="text-slate-500">Amount</span><b>{fmt(appr.amount)}</b></div>
-      {appr.receipt && <div><span className="text-xs text-slate-500 mb-1 block">Attached receipt / invoice — tap to open full size</span>
-        <button onClick={()=>openDataUrl(appr.receipt, appr.receiptName||"receipt")} className="block">{appr.receipt.startsWith("data:image")?<img src={appr.receipt} className="h-40 rounded-lg border border-slate-200 object-cover hover:ring-2 hover:ring-sky-400"/>:<span className="flex items-center gap-2 text-sm text-sky-600 hover:underline"><FileText size={15}/>{appr.receiptName||"Attached file"} ↗</span>}</button></div>}
+      {(appr.receipt||appr.receiptFileId) && <div><span className="text-xs text-slate-500 mb-1 block">Attached receipt / invoice — tap to open full size</span>
+        <button onClick={()=>openStored(fileRef(appr,"receipt"), appr.receiptName||"receipt")} className="block text-left"><StoredImg d={fileRef(appr,"receipt")} className="h-40 rounded-lg border border-slate-200 object-cover hover:ring-2 hover:ring-sky-400"/><span className="flex items-center gap-2 text-sm text-sky-600 hover:underline mt-1"><FileText size={15}/>{appr.receiptName||"Open attachment"} ↗</span></button></div>}
       <Select label="How should this be paid?" options={["salary","direct"]} value={appr.mode} onChange={e=>setAppr({...appr,mode:e.target.value})}/>
       {appr.mode==="salary"
         ? <Select label="Add to which month's salary?" options={months} value={appr.month} onChange={e=>setAppr({...appr,month:e.target.value})}/>
@@ -3468,12 +3631,50 @@ function Vault({ data, patch }) {
   </>);
 }
 
+function StorageCard() {
+  const [info, setInfo] = useState(null);
+  const [busy, setBusy] = useState("");
+  const [msg, setMsg] = useState(null);
+  const check = async () => {
+    setBusy("check"); setMsg(null);
+    try { setInfo(await apiReq("GET", "/files/_/state-size")); }
+    catch (e) { setMsg({ ok:false, text:e.message || "Couldn't measure storage." }); }
+    setBusy("");
+  };
+  useEffect(() => { check(); }, []);
+  const cleanup = async () => {
+    if (!confirm("Move every uploaded file out of the main data record into file storage?\n\nThis is safe — the files stay available exactly as before, they just stop being copied on every save.")) return;
+    setBusy("move"); setMsg(null);
+    try {
+      const r = await apiReq("POST", "/files/migrate-state", {});
+      setMsg({ ok:true, text:`Moved ${r.moved} file(s). The main record went from ${r.beforeMb} MB to ${r.afterMb} MB. Reloading…` });
+      setTimeout(()=>window.location.reload(), 2500);
+    } catch (e) { setMsg({ ok:false, text:e.message || "Cleanup failed." }); }
+    setBusy("");
+  };
+  const heavy = info && info.docMb >= 3;
+  return (<Card><div className="p-5 space-y-3">
+    <div className="font-semibold text-sm">Storage health</div>
+    {info ? (<div className="text-sm text-slate-600 space-y-1">
+      <div className="flex justify-between"><span className="text-slate-500">Main data record</span><b className={heavy?"text-rose-600":"text-emerald-600"}>{info.docMb} MB</b></div>
+      <div className="flex justify-between"><span className="text-slate-500">Files in storage</span><b>{info.files} ({info.filesMb} MB)</b></div>
+    </div>) : <div className="text-sm text-slate-400">Checking…</div>}
+    {heavy && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">The main record is large because uploaded files are stored inside it. Every save has to send all of it — that is what made saving fail and the server restart. Run the cleanup below; it only needs doing once.</div>}
+    {info && !heavy && <div className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">Healthy — uploads are kept out of the main record, so saves stay fast.</div>}
+    <div className="flex flex-wrap gap-2">
+      <Btn onClick={cleanup} disabled={!!busy}>{busy==="move"?<Loader2 size={15} className="animate-spin"/>:<Check size={15}/>}Move uploaded files to storage</Btn>
+      <Btn variant="ghost" onClick={check} disabled={!!busy}>Re-check</Btn>
+    </div>
+    {msg && <div className={`text-xs rounded-lg px-3 py-2 ${msg.ok?"bg-emerald-50 border border-emerald-200 text-emerald-700":"bg-rose-50 border border-rose-200 text-rose-700"}`}>{msg.text}</div>}
+  </div></Card>);
+}
 function Backup({ data, brand, restore, wipe }) {
   const [msg, setMsg] = useState("");
   const [confirm, setConfirm] = useState(false);
   const doExport = () => { download(`svype-backup-${today()}.json`, JSON.stringify({ db:data, brand })); setMsg("Backup downloaded."); };
   const doImport = (file) => { if(!file) return; const r=new FileReader(); r.onload=()=>{ try{ const obj=JSON.parse(r.result); restore(obj.db, obj.brand); setMsg("Backup restored successfully."); }catch{ setMsg("That file couldn't be read — make sure it's a Svype backup."); } }; r.readAsText(file); };
   return (<>
+    <div className="mb-5"><StorageCard/></div>
     <Head title="Backup & Data" sub="Your data lives in this browser — download a backup regularly, or restore from one"/>
     <div className="grid sm:grid-cols-2 gap-5">
       <Card><div className="p-5"><div className="font-semibold text-sm mb-1">Download backup</div><p className="text-sm text-slate-500 mb-4">Saves all your data (employees, clients, finance, documents, settings) to a single file you can keep safe.</p><Btn onClick={doExport}><Download size={15}/>Download backup file</Btn></div></Card>
