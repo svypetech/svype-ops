@@ -139,4 +139,61 @@ router.post("/identify", async (req, res) => {
   res.json({ token: sign(u), user: pub(u) });
 });
 
+// ===== Portal bootstrap & login (public — no token required) =====
+// The app's own accounts live inside the shared state document, but GET /api/state
+// requires a token. A brand-new browser has no token yet, so it could not read the
+// account list — which made correct passwords look wrong and left the login screen
+// with no logo. These two endpoints give a fresh device exactly what it needs and
+// nothing more (the brand, and a verified login), without ever shipping credentials.
+async function readAppState() {
+  const r = await pool.query("SELECT doc, brand, rev FROM app_state WHERE id=1");
+  if (!r.rowCount) return { doc: {}, brand: null, rev: 0 };
+  return { doc: r.rows[0].doc || {}, brand: r.rows[0].brand || null, rev: +r.rows[0].rev || 0 };
+}
+
+// Public: just the branding for the login screen (company name, logo, colours).
+router.get("/bootstrap", async (req, res) => {
+  try {
+    const { doc, brand } = await readAppState();
+    const users = Array.isArray(doc.users) ? doc.users : [];
+    const hasFounders = users.some(u => u && (u.role === "admin" || u.role === "hr"));
+    res.json({ hasFounders, brand });
+  } catch {
+    res.json({ hasFounders: true, brand: null });
+  }
+});
+
+// Public: verify a portal login SERVER-side against the shared document, then hand
+// back a token plus the data, so a new device is fully signed in immediately.
+router.post("/portal-login", async (req, res) => {
+  const { username, password } = req.body || {};
+  try {
+    const { doc, brand, rev } = await readAppState();
+    const users = Array.isArray(doc.users) ? doc.users : [];
+    const uname = String(username || "").trim().toLowerCase();
+    const u = users.find(x => x && String(x.username || "").trim().toLowerCase() === uname);
+    if (!u || u.password !== password) return res.status(401).json({ error: "Incorrect username or password." });
+    if (u.active === false) return res.status(403).json({ error: "This account has been deactivated. Contact HR." });
+    if (u.role === "employee" && u.empId) {
+      const emp = (doc.employees || []).find(e => e.id === u.empId);
+      if (emp && emp.status !== "Active") return res.status(403).json({ error: "Your employee profile is inactive. Contact HR." });
+    }
+    // Issue a token (shadow user row) so this device can read and write shared state.
+    const existing = await pool.query("SELECT * FROM users WHERE lower(username)=lower($1)", [u.username]);
+    let row = existing.rows[0];
+    if (!row) {
+      const ins = await pool.query(
+        "INSERT INTO users (username, password, role, active) VALUES (lower($1),'-',$2,TRUE) RETURNING *",
+        [u.username, ["admin", "hr", "employee"].includes(u.role) ? u.role : "employee"]
+      );
+      row = ins.rows[0];
+    }
+    const { password: _pw, ...safeUser } = u;   // never send the password back
+    await logAudit(u.username, "Signed in");
+    res.json({ token: sign(row), user: safeUser, doc, brand, rev });
+  } catch (e) {
+    res.status(500).json({ error: "Could not reach the account store. Please try again." });
+  }
+});
+
 module.exports = router;

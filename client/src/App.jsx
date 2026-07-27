@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · responsive-v1";
+const APP_BUILD = "Build 27 Jul 2026 · login-fix-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -332,8 +332,11 @@ function generateRetainerInvoices(db, force){
     if (r.status !== "Active") return r;
     const cyc = r.billing === "Postpaid" ? post : pre;
     const { key, label, issue, due } = cyc;
-    if (r.lastGenCycle === key) return r;                  // already generated for this cycle
-    if (inv.some(i => i.retainerId === r.id && i.monthKey === key)) return { ...r, lastGenCycle:key };
+    // The only duplicate guard is whether an invoice for this client + cycle actually
+    // EXISTS. (The old `lastGenCycle` marker also blocked generation, which silently
+    // skipped clients whose invoices had been deleted — prepaid clients kept getting
+    // skipped because their upcoming-month cycle was still stamped as "generated".)
+    if (inv.some(i => i.retainerId === r.id && i.monthKey === key)) return r;
     const base = +r.amount || 0, carry = +r.carry || 0;
     inv.push({ id: uid(), retainerId: r.id, client: r.client, number: `RET-${key.replace("-", "")}-${inv.length + 1}`, monthKey: key, month: label, billing: r.billing||"Prepaid", base, carry, total: base + carry, currency: r.currency || "PKR", status: "Unpaid", paidAmount: 0, account: "", date: issue, due, paidDate: "" });
     changed = true; return { ...r, carry: 0, lastGenCycle: key };
@@ -470,7 +473,15 @@ export default function App() {
     setData(merged);
     if (!d && serverFounders === false) DB.set("svype_db", merged); // only seed empty doc on a genuine fresh install
     const b = await DB.get("svype_brand", null);
-    if (b) setBrand(b); else if (serverFounders === false) { await DB.set("svype_brand", SEED_BRAND); setNeedsSetup(true); }
+    if (b) setBrand(b);
+    else {
+      // No token on this device yet (brand-new browser): fetch just the public brand
+      // so the login screen still shows the company logo and colours.
+      let pubBrand = null;
+      try { const bs = await apiReq("GET", "/auth/bootstrap"); pubBrand = bs?.brand || null; } catch {}
+      if (pubBrand) setBrand(pubBrand);
+      else if (serverFounders === false) { await DB.set("svype_brand", SEED_BRAND); setNeedsSetup(true); }
+    }
     try {
       const s = localStorage.getItem("svype_session");
       if (s && !getChatToken()) await identifyForChat(JSON.parse(s));
@@ -541,7 +552,9 @@ export default function App() {
   // setup screen and creating an account on an already-initialised system.
   const showSetup = serverHasFounders === false && !localHasFounders;
   if (showSetup) return <FirstRunSetup data={data} brand={brand} onCreate={(u)=>{ update("users", [...(data.users||[]), u], `Created first ${u.role} account "${u.username}"`); }}/>;
-  if (!session) return <Login data={data} brand={brand} onLogin={(u)=>{ identifyForChat(u); setSession(u); setTab("dash"); }}/>;
+  if (!session) return <Login data={data} brand={brand}
+    onHydrate={(d)=>{ if (d.token) setChatToken(d.token); if (d.doc) { initSaveState(d.doc, +d.rev||0); setData({ ...SEED, ...d.doc }); } if (d.brand) setBrand(d.brand); }}
+    onLogin={(u)=>{ identifyForChat(u); setSession(u); setTab("dash"); }}/>;
   if (needsSetup && role !== "employee") return <BrandSetup brand={brand} saveBrand={saveBrand} done={()=>setNeedsSetup(false)} />;
 
   const isEmp = role === "employee";
@@ -769,21 +782,39 @@ function SaveStatus() {
   return (<div className={wrap} style={{background:"rgba(15,23,42,.25)"}}>
     <div className={card}><div className="w-10 h-10 rounded-full bg-emerald-500 text-white grid place-items-center"><Check size={22}/></div><div className="font-semibold text-emerald-600">Saved</div></div></div>);
 }
-function Login({ data, brand, onLogin }) {
+function Login({ data, brand, onLogin, onHydrate }) {
   const [u, setU] = useState(""); const [p, setP] = useState(""); const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const [now, setNow] = useState(new Date());
   useEffect(() => { const iv = setInterval(()=>setNow(new Date()), 1000); return ()=>clearInterval(iv); }, []);
-  const submit = () => {
-    setBusy(true);
-    const user = (data.users||[]).find(x=>x.username.toLowerCase()===u.trim().toLowerCase() && x.password===p);
-    if (!user) { setErr("Incorrect username or password."); setBusy(false); return; }
-    if (!user.active) { setErr("This account has been deactivated. Contact HR."); setBusy(false); return; }
-    if (user.role === "employee" && user.empId) {
-      const emp = data.employees.find(e=>e.id===user.empId);
-      if (emp && emp.status !== "Active") { setErr("Your employee profile is inactive. Contact HR."); setBusy(false); return; }
+  const submit = async () => {
+    setBusy(true); setErr("");
+    const uname = u.trim();
+    // 1) If this device already holds the account list, check locally (instant).
+    const user = (data.users||[]).find(x=>x.username.toLowerCase()===uname.toLowerCase() && x.password===p);
+    if (user) {
+      if (!user.active) { setErr("This account has been deactivated. Contact HR."); setBusy(false); return; }
+      if (user.role === "employee" && user.empId) {
+        const emp = data.employees.find(e=>e.id===user.empId);
+        if (emp && emp.status !== "Active") { setErr("Your employee profile is inactive. Contact HR."); setBusy(false); return; }
+      }
+      onLogin(user); return;
     }
-    onLogin(user);
+    // 2) Otherwise ask the server. A brand-new browser has no account list yet — this
+    //    is what used to make correct passwords look wrong on a new phone or PC.
+    try {
+      const res = await fetch("/api/auth/portal-login", {
+        method:"POST", headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ username: uname, password: p }),
+      });
+      const d = await res.json().catch(()=>({}));
+      if (!res.ok) { setErr(d.error || "Incorrect username or password."); setBusy(false); return; }
+      onHydrate && onHydrate(d);      // store the token + load the shared data
+      onLogin(d.user);
+    } catch {
+      setErr("Couldn't reach the server. Check your internet connection and try again.");
+      setBusy(false);
+    }
   };
   const accent = brand.accent || "#0284c7";
   const readouts = [
@@ -883,7 +914,7 @@ const inputCls = "w-full bg-white border border-slate-300 rounded-lg px-3 py-2 t
 const Field = ({ label, ...p }) => (<label className="block"><span className="text-xs text-slate-500 mb-1 block">{label}</span><input {...p} className={inputCls}/></label>);
 const Area = ({ label, ...p }) => (<label className="block"><span className="text-xs text-slate-500 mb-1 block">{label}</span><textarea {...p} rows={3} className={inputCls+" resize-y"}/></label>);
 const Select = ({ label, options, ...p }) => (<label className="block"><span className="text-xs text-slate-500 mb-1 block">{label}</span><select {...p} className={inputCls}>{options.map(o=><option key={o} value={o}>{o||"—"}</option>)}</select></label>);
-const Table = ({ cols, children }) => (<div className="overflow-x-auto"><table className="w-full text-sm" style={{minWidth: Math.max(480, cols.length*110)}}><thead><tr className="text-left text-slate-500 text-xs uppercase tracking-wider border-b border-slate-200 bg-slate-50">{cols.map(c=><th key={c} className="px-4 py-3 font-medium">{c}</th>)}</tr></thead><tbody>{children}</tbody></table></div>);
+const Table = ({ cols, children }) => (<div className="overflow-x-auto"><table className="w-full text-sm" style={{minWidth: Math.max(480, cols.length*110)}}><thead><tr className="text-left text-slate-500 text-xs uppercase tracking-wider border-b border-slate-200 bg-slate-50">{cols.map((c,ci)=><th key={ci} className="px-4 py-3 font-medium">{c}</th>)}</tr></thead><tbody>{children}</tbody></table></div>);
 const Row = ({ children, onClick }) => <tr onClick={onClick} className={`border-b border-slate-100 last:border-0 hover:bg-slate-50 ${onClick?"cursor-pointer":""}`}>{children}</tr>;
 const Td = ({ children, className="" }) => <td className={`px-4 py-3 ${className}`}>{children}</td>;
 const RowActions = ({ onEdit, onDelete, children }) => {
@@ -895,6 +926,46 @@ const RowActions = ({ onEdit, onDelete, children }) => {
     {onDelete&&confirming&&<span className="flex items-center gap-1 bg-rose-50 border border-rose-200 rounded-lg px-2 py-1"><span className="text-xs text-rose-600">Delete?</span><button onClick={()=>{ setConfirming(false); onDelete(); }} className="text-xs font-medium text-white bg-rose-600 hover:bg-rose-700 rounded px-2 py-0.5">Yes</button><button onClick={()=>setConfirming(false)} className="text-xs text-slate-500 hover:text-slate-700 px-1">No</button></span>}
   </div>);
 };
+
+// ===== Batch selection =====
+// Shared multi-select for list screens: a checkbox column plus an action bar that
+// appears only when something is selected. Deletes always ask for confirmation.
+function useBatch(rows) {
+  const [sel, setSel] = useState(() => new Set());
+  const ids = (rows || []).map(r => r.id);
+  const idKey = ids.join(",");
+  useEffect(() => {
+    // drop selections for rows that no longer exist (deleted, filtered away)
+    setSel(s => { const keep = new Set([...s].filter(id => ids.includes(id))); return keep.size === s.size ? s : keep; });
+  }, [idKey]);
+  const toggle = (id) => setSel(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  const selected = ids.filter(i => sel.has(i));
+  const allOn = ids.length > 0 && selected.length === ids.length;
+  const toggleAll = () => setSel(allOn ? new Set() : new Set(ids));
+  const clear = () => setSel(new Set());
+  return { has: (id) => sel.has(id), toggle, toggleAll, allOn, clear, selected, count: selected.length };
+}
+const SelBox = ({ on, onChange, title }) => (
+  <input type="checkbox" checked={!!on} onChange={onChange} onClick={e=>e.stopPropagation()} title={title}
+    className="w-4 h-4 align-middle rounded border-slate-300 accent-sky-600 cursor-pointer"/>);
+const SelTd = ({ on, onChange }) => <Td className="w-8"><SelBox on={on} onChange={onChange}/></Td>;
+function BatchBar({ count, noun="item", onDelete, onClear, children }) {
+  const [confirming, setConfirming] = useState(false);
+  useEffect(() => { if (!count) setConfirming(false); }, [count]);
+  if (!count) return null;
+  const many = count > 1 ? "s" : "";
+  return (<div className="flex flex-wrap items-center gap-2 mb-3 bg-sky-50 border border-sky-200 rounded-xl px-4 py-2.5">
+    <span className="text-sm font-medium text-sky-800">{count} {noun}{many} selected</span>
+    <div className="flex-1"/>
+    {children}
+    {onDelete && !confirming && <Btn variant="ghost" onClick={()=>setConfirming(true)}><Trash2 size={15}/>Delete selected</Btn>}
+    {onDelete && confirming && <span className="flex items-center gap-2 bg-white border border-rose-200 rounded-lg px-2.5 py-1.5">
+      <span className="text-xs text-rose-600">Delete {count} {noun}{many}?</span>
+      <button onClick={()=>{ setConfirming(false); onDelete(); }} className="text-xs font-medium text-white bg-rose-600 hover:bg-rose-700 rounded px-2 py-1">Yes, delete</button>
+      <button onClick={()=>setConfirming(false)} className="text-xs text-slate-500 hover:text-slate-700 px-1">Cancel</button></span>}
+    <Btn variant="ghost" onClick={onClear}><X size={15}/>Clear</Btn>
+  </div>);
+}
 const Empty = ({ msg }) => <div className="px-4 py-12 text-center text-slate-400 text-sm">{msg}</div>;
 function ClientInput({ label="Client", clients, value, onChange }) {
   return (<label className="block"><span className="text-xs text-slate-500 mb-1 block">{label}</span>
@@ -1611,7 +1682,7 @@ function Clients({ data, update, patch }) {
     patch({ clients: nextClients, retainers: nextRetainers }, `${status==="Inactive"?"Deactivated":"Reactivated"} client ${c.name}`);
   };
   if (onboard) return <ClientOnboarding data={data} patch={patch} onCancel={()=>setOnboard(false)} onDone={(rec)=>{ setOnboard(false); setOpen(rec.id); }}/>;
-  if (open) { const c = rows.find(r=>r.id===open); if (c) return <ClientProfile c={c} data={data} onBack={()=>setOpen(null)} onEdit={()=>openEdit(c)}/>; }
+  if (open) { const c = rows.find(r=>r.id===open); if (c) return <ClientProfile c={c} data={data} patch={patch} onBack={()=>setOpen(null)} onEdit={()=>openEdit(c)}/>; }
   const isActive = (c)=> (c.status||"Active")==="Active";
   const filtered = rows.filter(c=> show==="all" ? true : show==="active" ? isActive(c) : !isActive(c));
   const activeCount = rows.filter(isActive).length;
@@ -1636,7 +1707,43 @@ function Clients({ data, update, patch }) {
     </Modal>}
   </>);
 }
-function ClientProfile({ c, data, onBack, onEdit }) {
+function ClientRetainerCard({ c, data, patch }) {
+  const rets = (data.retainers||[]).filter(r=>r.client===c.name);
+  const [edit, setEdit] = useState(null);
+  const blank = () => ({ client:c.name, whatsapp:c.whatsapp||"", amount:"", currency:c.currency||"PKR", billing:"Prepaid", billingDay:1, status:"Active", carry:0 });
+  const save = () => {
+    const e = edit;
+    if (!e.amount) { alert("Enter the monthly retainer amount."); return; }
+    const list = data.retainers || [];
+    const next = e.id ? list.map(r=>r.id===e.id?e:r) : [...list, { ...e, id:uid(), carry:+e.carry||0 }];
+    patch({ retainers: next }, e.id ? `Updated retainer for ${c.name}` : `Added retainer for ${c.name}`);
+    setEdit(null);
+  };
+  return (<Card><div className="p-5">
+    <div className="flex items-center justify-between mb-3">
+      <div className="font-semibold text-sm">Retainer</div>
+      {rets.length===0 && <Btn variant="ghost" onClick={()=>setEdit(blank())}><Plus size={15}/>Add retainer</Btn>}
+    </div>
+    {rets.length===0 ? <div className="text-sm text-slate-400">No retainer for this client yet.</div> :
+      <div className="space-y-2">{rets.map(r=>{
+        const cyc = r.billing==="Postpaid" ? currentMonthInfo() : nextMonthInfo();
+        return (<div key={r.id} className="flex flex-wrap items-center justify-between gap-2 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2.5">
+          <div><div className="text-sm font-medium">{fmt(r.amount, r.currency)}<span className="text-slate-400 font-normal">/month</span></div>
+            <div className="text-xs text-slate-500 mt-0.5">{r.billing==="Postpaid"?"Postpaid":"Prepaid"} · next invoice covers {cyc.label} · {r.status}{+r.carry?` · ${fmt(r.carry,r.currency)} carried forward`:""}</div></div>
+          <Btn variant="ghost" onClick={()=>setEdit(r)}><Edit3 size={15}/>Edit retainer</Btn>
+        </div>);})}
+      </div>}
+    {edit && <Modal title={edit.id?`Edit retainer · ${c.name}`:`Add retainer · ${c.name}`} onClose={()=>setEdit(null)}>
+      <div className="grid grid-cols-2 gap-3"><Field label="Monthly amount" type="number" value={edit.amount} onChange={e=>setEdit({...edit,amount:e.target.value})}/><Select label="Currency" options={CURRENCIES} value={edit.currency} onChange={e=>setEdit({...edit,currency:e.target.value})}/></div>
+      <Select label="Billing type" options={["Prepaid — pays for the upcoming month","Postpaid — pays after the month ends"]} value={edit.billing==="Postpaid"?"Postpaid — pays after the month ends":"Prepaid — pays for the upcoming month"} onChange={e=>setEdit({...edit,billing:e.target.value.startsWith("Postpaid")?"Postpaid":"Prepaid"})}/>
+      <Field label="WhatsApp (for sending invoices)" value={edit.whatsapp} onChange={e=>setEdit({...edit,whatsapp:e.target.value})}/>
+      <div className="grid grid-cols-2 gap-3"><Field label="Carried forward" type="number" value={edit.carry} onChange={e=>setEdit({...edit,carry:e.target.value})}/><Select label="Status" options={["Active","Paused"]} value={edit.status} onChange={e=>setEdit({...edit,status:e.target.value})}/></div>
+      <Btn onClick={save}><Check size={15}/>Save retainer</Btn>
+      <p className="text-xs text-slate-400">Invoices are never created automatically — press “Generate now” in Retainers when you want them.</p>
+    </Modal>}
+  </div></Card>);
+}
+function ClientProfile({ c, data, patch, onBack, onEdit }) {
   const inv = data.invoices.filter(i=>i.client===c.name);
   const ret = data.retainers.filter(r=>r.client===c.name);
   const prop = data.proposals.filter(p=>p.client===c.name);
@@ -1649,6 +1756,7 @@ function ClientProfile({ c, data, onBack, onEdit }) {
     <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
       {[["Invoices",inv.length],["Retainers",ret.length],["Proposals",prop.length],["Hours logged",hrs]].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-2xl font-bold text-slate-900">{v}</div><div className="text-xs text-slate-500 mt-0.5">{k}</div></div></Card>))}
     </div>
+    <div className="mb-6"><ClientRetainerCard c={c} data={data} patch={patch}/></div>
     {c.onboarding && <Card><div className="p-5">
       <div className="flex items-center justify-between mb-3"><div className="font-semibold text-sm">Onboarding record</div><span className="text-xs text-slate-400">completed {c.onboardedOn}</span></div>
       <div className="grid md:grid-cols-2 gap-x-8 gap-y-4">{OB_STEPS.map(st=>{
@@ -1781,6 +1889,7 @@ function Employees({ data, update, mutateData }) {
     setEdit(null);
   };
   const filtered = rows.filter(r=>r.name.toLowerCase().includes(q.toLowerCase()));
+  const be = useBatch(filtered);
   const found = lookup ? rows.find(r=>r.name.toLowerCase().includes(lookup.toLowerCase())) : null;
   if (open) { const emp = rows.find(r=>r.id===open); if (emp) return <EmployeeProfile emp={emp} data={data} onBack={()=>setOpen(null)} onEdit={()=>{ setEdit(emp); setOpen(null); }} />; }
   return (<>
@@ -1791,8 +1900,9 @@ function Employees({ data, update, mutateData }) {
       {lookup && (found ? <div className="mt-3 bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm flex flex-wrap gap-x-6 gap-y-1"><span><span className="text-slate-500">Name:</span> <b>{found.name}</b></span><span><span className="text-slate-500">Bank:</span> {found.bankName||"—"}</span><span><span className="text-slate-500">Account / IBAN:</span> <b>{found.account||"— not on file —"}</b></span></div> : <div className="mt-3 text-sm text-slate-400">No employee matches that name.</div>)}
     </div></Card>
     <div className="relative my-4 max-w-xs"><Search size={15} className="absolute left-3 top-2.5 text-slate-400"/><input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search name" className={inputCls+" pl-9"}/></div>
-    <Card><Table cols={["Name","Role","Account / IBAN","Salary","Status",""]}>{filtered.length===0?<tr><td colSpan={6}><Empty msg="No employees"/></td></tr>:filtered.map(e=>(
-      <Row key={e.id} onClick={()=>setOpen(e.id)}><Td><div className="font-medium">{e.name}</div><div className="text-xs text-slate-400">{e.email}</div></Td><Td className="text-slate-500">{e.role}</Td><Td className="text-slate-500">{e.account||"—"}</Td><Td className="text-slate-500">{fmt(e.salary)}</Td><Td><Pill s={e.status}/></Td><Td><RowActions onEdit={()=>setEdit(e)} onDelete={()=>mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(r=>r.id!==e.id) }), `Removed employee ${e.name}`)}/></Td></Row>))}</Table></Card>
+    <BatchBar count={be.count} noun="employee" onClear={be.clear} onDelete={()=>{ const ids=new Set(be.selected); mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(x=>!ids.has(x.id)) }), `Removed ${ids.size} employee(s)`); be.clear(); }}/>
+    <Card><Table cols={[<SelBox key="a" on={be.allOn} onChange={be.toggleAll} title="Select all"/>,"Name","Role","Account / IBAN","Salary","Status",""]}>{filtered.length===0?<tr><td colSpan={7}><Empty msg="No employees"/></td></tr>:filtered.map(e=>(
+      <Row key={e.id} onClick={()=>setOpen(e.id)}><SelTd on={be.has(e.id)} onChange={()=>be.toggle(e.id)}/><Td><div className="font-medium">{e.name}</div><div className="text-xs text-slate-400">{e.email}</div></Td><Td className="text-slate-500">{e.role}</Td><Td className="text-slate-500">{e.account||"—"}</Td><Td className="text-slate-500">{fmt(e.salary)}</Td><Td><Pill s={e.status}/></Td><Td><RowActions onEdit={()=>setEdit(e)} onDelete={()=>mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(r=>r.id!==e.id) }), `Removed employee ${e.name}`)}/></Td></Row>))}</Table></Card>
     {edit && <EmployeeForm edit={edit} setEdit={setEdit} save={save}/>}
   </>);
 }
@@ -2448,20 +2558,19 @@ function Retainers({ data, update, patch, brand, go }) {
   const rets = data.retainers, invs = data.retainerInvoices, clients = data.clients;
   const accounts = (data.bankAccounts||[]).map(a=>({ id:a.id, name:a.label }));
   const [view, setView] = useState("invoices");
+  const bc = useBatch(data.retainers);
+  const bi = useBatch(data.retainerInvoices);
   const [edit, setEdit] = useState(null); const [pay, setPay] = useState(null); const [manual, setManual] = useState(null); const [extend, setExtend] = useState(null);
   const saveExtend = () => { patch({ retainerInvoices: invs.map(i=>i.id===extend.id?{...i, due: extend.due, dueExtended:true}:i) }, `Extended due date for ${extend.client} (${extend.number})`); setExtend(null); };
   const clearUnpaid = () => {
     const unpaid = invs.filter(i=>i.status!=="Paid" && i.status!=="Partial");
     const openRecv = (data.receivables||[]).filter(r=>r.status!=="Paid");
     if (!unpaid.length && !openRecv.length) { alert("Nothing to clear — no unpaid invoices and no open receivables."); return; }
-    if (!confirm(`This will delete:\n\n• ${unpaid.length} unpaid retainer invoice(s)\n• ${openRecv.length} open receivable entr(ies)\n\nPaid and partially-paid records are kept (they are your record of money received). Nothing will regenerate afterwards. Continue?`)) return;
+    if (!confirm(`This will delete:\n\n• ${unpaid.length} unpaid retainer invoice(s)\n• ${openRecv.length} open receivable entr(ies)\n\nPaid and partially-paid records are kept (they are your record of money received). Nothing regenerates on its own — you can re-create them any time with Generate now. Continue?`)) return;
     const keepIds = new Set(invs.filter(i=>i.status==="Paid"||i.status==="Partial").map(i=>i.id));
-    // stamp each affected retainer's cycle marker so nothing regenerates for that cycle
-    const cycles = {}; unpaid.forEach(i=>{ if(i.retainerId) cycles[i.retainerId]=i.monthKey; });
     const keepRecvIds = new Set(openRecv.map(r=>r.id));
     patch({
       retainerInvoices: invs.filter(i=>keepIds.has(i.id)),
-      retainers: rets.map(r=>cycles[r.id]?{...r,lastGenCycle:cycles[r.id]}:r),
       receivables: (data.receivables||[]).filter(r=>!keepRecvIds.has(r.id)),
     }, `Cleared ${unpaid.length} unpaid invoices and ${openRecv.length} open receivables`);
   };
@@ -2477,7 +2586,7 @@ function Retainers({ data, update, patch, brand, go }) {
   const runGeneration = (db) => {
     const after = generateRetainerInvoices(db, true); // only ever runs when you click
     if (after !== db) patch({ retainerInvoices: after.retainerInvoices, retainers: after.retainers }, `Generated retainer invoices`);
-    else alert("Invoices for the current cycle have already been generated for every client.");
+    else alert("Nothing new to generate — every active client already has an invoice for their billing period.\n\nPrepaid clients are billed for the upcoming month, postpaid clients for the month just finished.");
   };
   const genDue = () => {
     const missing = rets.filter(r=>r.status==="Active" && r.billing!=="Prepaid" && r.billing!=="Postpaid");
@@ -2520,12 +2629,25 @@ function Retainers({ data, update, patch, brand, go }) {
     <Head title="Retainers" sub="Invoices are created only when you click Generate now (never on refresh). Issued 1st, due 5th of next month." action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>go("accounts")}><Landmark size={15}/>Accounts</Btn><Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn></div>}/>
     <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="invoices"?"primary":"ghost"} onClick={()=>setView("invoices")}>Invoices</Btn><Btn variant={view==="clients"?"primary":"ghost"} onClick={()=>setView("clients")}>Clients</Btn>{view==="invoices" && <><Btn variant="ghost" onClick={genDue}><Repeat size={15}/>Generate now</Btn><Btn variant="ghost" onClick={newManual}><Plus size={15}/>Create invoice</Btn><Btn variant="ghost" onClick={clearUnpaid}><X size={15}/>Clear unpaid & receivables</Btn></>}</div>
     {view==="clients" ? (
-      <Card><Table cols={["Client","WhatsApp","Monthly","Carried fwd","Status",""]}>{rets.length===0?<tr><td colSpan={6}><Empty msg="No retainer clients yet"/></td></tr>:rets.map(r=>(
-        <Row key={r.id}><Td className="font-medium">{r.client}</Td><Td className="text-slate-500">{r.whatsapp||"—"}</Td><Td>{fmt(r.amount,r.currency)}</Td><Td className={+r.carry?"text-amber-600 font-medium":"text-slate-400"}>{r.carry?fmt(r.carry,r.currency):"—"}</Td><Td><Pill s={r.status}/></Td><Td><RowActions onEdit={()=>setEdit(r)} onDelete={()=>update("retainers",rets.filter(x=>x.id!==r.id))}/></Td></Row>))}</Table></Card>
+      <>
+      <BatchBar count={bc.count} noun="client" onClear={bc.clear} onDelete={()=>{ const ids=new Set(bc.selected); update("retainers", rets.filter(x=>!ids.has(x.id)), `Removed ${ids.size} retainer client(s)`); bc.clear(); }}/>
+      <Card><Table cols={[<SelBox key="a" on={bc.allOn} onChange={bc.toggleAll} title="Select all"/>,"Client","Billing","Monthly","Carried fwd","Status",""]}>{rets.length===0?<tr><td colSpan={7}><Empty msg="No retainer clients yet"/></td></tr>:rets.map(r=>{
+        const cyc = r.billing==="Postpaid" ? currentMonthInfo() : nextMonthInfo();
+        return (<Row key={r.id}><SelTd on={bc.has(r.id)} onChange={()=>bc.toggle(r.id)}/><Td className="font-medium">{r.client}<div className="text-xs text-slate-400">{r.whatsapp||"no WhatsApp"}</div></Td>
+        <Td>{r.billing==="Postpaid"
+          ? <span className="text-xs px-2 py-0.5 rounded-full bg-violet-100 text-violet-700">Postpaid</span>
+          : <span className="text-xs px-2 py-0.5 rounded-full bg-sky-100 text-sky-700">Prepaid</span>}
+          <div className="text-xs text-slate-400 mt-0.5">bills {cyc.label}</div></Td>
+        <Td>{fmt(r.amount,r.currency)}</Td><Td className={+r.carry?"text-amber-600 font-medium":"text-slate-400"}>{r.carry?fmt(r.carry,r.currency):"—"}</Td><Td><Pill s={r.status}/></Td>
+        <Td><div className="flex items-center gap-1 justify-end"><button onClick={()=>setEdit(r)} className="text-xs text-sky-600 hover:underline whitespace-nowrap">Edit retainer</button><RowActions onDelete={()=>update("retainers",rets.filter(x=>x.id!==r.id))}/></div></Td></Row>);})}</Table></Card>
+      </>
     ) : (
-      <Card><Table cols={["Invoice","Client","Period","Due","Total","Status",""]}>{invs.length===0?<tr><td colSpan={7}><Empty msg="No invoices yet — generate this month or create one"/></td></tr>:[...invs].reverse().map(i=>(
-        <Row key={i.id}><Td className="font-medium">{i.number}</Td><Td className="text-slate-500">{i.client}</Td><Td className="text-slate-500">{i.month}{i.billing&&<div className="text-xs text-slate-400">{i.billing}</div>}</Td><Td className="text-slate-500">{i.due||"—"}{i.dueExtended&&<div className="text-xs text-amber-600">extended</div>}{i.sendOn?<div className="text-xs text-slate-400">send {i.sendOn}</div>:null}</Td><Td>{fmt(i.total,i.currency)}{i.status==="Partial"&&<div className="text-xs text-orange-600">received {fmt(i.paidAmount,i.currency)}</div>}{i.status==="Paid"&&i.account&&<div className="text-xs text-slate-400">{i.account}</div>}</Td><Td><Pill s={i.status}/></Td>
+      <>
+      <BatchBar count={bi.count} noun="invoice" onClear={bi.clear} onDelete={()=>{ const ids=new Set(bi.selected); patch({ retainerInvoices: invs.filter(x=>!ids.has(x.id)) }, `Deleted ${ids.size} retainer invoice(s)`); bi.clear(); }}/>
+      <Card><Table cols={[<SelBox key="a" on={bi.allOn} onChange={bi.toggleAll} title="Select all"/>,"Invoice","Client","Period","Due","Total","Status",""]}>{invs.length===0?<tr><td colSpan={8}><Empty msg="No invoices yet — generate this month or create one"/></td></tr>:[...invs].reverse().map(i=>(
+        <Row key={i.id}><SelTd on={bi.has(i.id)} onChange={()=>bi.toggle(i.id)}/><Td className="font-medium">{i.number}</Td><Td className="text-slate-500">{i.client}</Td><Td className="text-slate-500">{i.month}{i.billing&&<div className="text-xs text-slate-400">{i.billing}</div>}</Td><Td className="text-slate-500">{i.due||"—"}{i.dueExtended&&<div className="text-xs text-amber-600">extended</div>}{i.sendOn?<div className="text-xs text-slate-400">send {i.sendOn}</div>:null}</Td><Td>{fmt(i.total,i.currency)}{i.status==="Partial"&&<div className="text-xs text-orange-600">received {fmt(i.paidAmount,i.currency)}</div>}{i.status==="Paid"&&i.account&&<div className="text-xs text-slate-400">{i.account}</div>}</Td><Td><Pill s={i.status}/></Td>
         <Td><RowActions onDelete={()=>{ const parent=rets.find(r=>r.id===i.retainerId); patch({ retainerInvoices:invs.filter(x=>x.id!==i.id), retainers: parent?rets.map(r=>r.id===parent.id?{...r,lastGenCycle: i.monthKey||r.lastGenCycle}:r):rets }, `Deleted invoice ${i.number}`); }}><button onClick={()=>openInvoicePDF(i, brand)} title="Download PDF invoice" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Download size={14}/></button><button onClick={()=>sendWA(i)} title="Send on WhatsApp" className="p-1.5 rounded text-slate-400 hover:text-green-600 hover:bg-slate-100"><Send size={14}/></button>{i.status!=="Paid" && <button onClick={()=>setExtend({ id:i.id, client:i.client, number:i.number, due:i.due||today() })} title="Extend due date" className="p-1.5 rounded text-slate-400 hover:text-amber-600 hover:bg-slate-100"><CalendarClock size={15}/></button>}{i.status!=="Paid" && <button onClick={()=>setPay(i)} title="Mark as paid" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button>}</RowActions></Td></Row>))}</Table></Card>
+      </>
     )}
     {edit && <Modal title={edit.id?"Edit retainer client":"Add retainer client"} onClose={()=>setEdit(null)}>
       <ClientInput clients={clients} label="Client name" value={edit.client} onChange={e=>onClient(e.target.value)}/>
@@ -2580,12 +2702,15 @@ function PayModal({ inv, accounts, onClose, onConfirm, onManageAccounts }) {
     <Btn onClick={()=>onConfirm({ received, accountName, carryChoice, overChoice })}><Check size={15}/>{shortfall>0?"Record partial payment":"Mark as paid"}</Btn>
   </Modal>);
 }
-function Ledger({ title, sub, rows, setRows, blank, fields, cols, render, extraActions }) {
+function Ledger({ title, sub, rows, setRows, blank, fields, cols, render, extraActions, noun="record" }) {
   const [edit,setEdit]=useState(null);
+  const b = useBatch(rows);
   const save=r=>{setRows(r.id?rows.map(x=>x.id===r.id?r:x):[...rows,{...r,id:uid()}]);setEdit(null);};
+  const delSelected=()=>{ const ids=new Set(b.selected); setRows(rows.filter(x=>!ids.has(x.id))); b.clear(); };
   return (<>
     <Head title={title} sub={sub} action={<Btn onClick={()=>setEdit(blank())}><Plus size={15}/>Add</Btn>}/>
-    <Card><Table cols={[...cols,""]}>{rows.length===0?<tr><td colSpan={cols.length+1}><Empty msg="Nothing here yet"/></td></tr>:rows.map(r=>(<Row key={r.id}>{render(r)}<Td><RowActions onEdit={()=>setEdit(r)} onDelete={()=>setRows(rows.filter(x=>x.id!==r.id))}>{extraActions?extraActions(r):null}</RowActions></Td></Row>))}</Table></Card>
+    <BatchBar count={b.count} noun={noun} onDelete={delSelected} onClear={b.clear}/>
+    <Card><Table cols={[<SelBox key="a" on={b.allOn} onChange={b.toggleAll} title="Select all"/>,...cols,""]}>{rows.length===0?<tr><td colSpan={cols.length+2}><Empty msg="Nothing here yet"/></td></tr>:rows.map(r=>(<Row key={r.id}><SelTd on={b.has(r.id)} onChange={()=>b.toggle(r.id)}/>{render(r)}<Td><RowActions onEdit={()=>setEdit(r)} onDelete={()=>setRows(rows.filter(x=>x.id!==r.id))}>{extraActions?extraActions(r):null}</RowActions></Td></Row>))}</Table></Card>
     {edit && <Modal title={edit.id?"Edit":"Add"} onClose={()=>setEdit(null)}>{fields(edit,setEdit)}<Btn onClick={()=>save(edit)}><Check size={15}/>Save</Btn></Modal>}
   </>);
 }
@@ -2601,7 +2726,7 @@ function Invoices({ data, update, patch }) {
       update("invoices", r);
     }
   };
-  return <Ledger title="Invoices & Receipts" sub="Billing to clients · marking an invoice Paid creates a receipt in the Receipts tab" rows={rows} setRows={setRows}
+  return <Ledger noun="invoice" title="Invoices & Receipts" sub="Billing to clients · marking an invoice Paid creates a receipt in the Receipts tab" rows={rows} setRows={setRows}
     blank={()=>({client:"",number:"INV-"+(1000+rows.length+1),amount:"",currency:"PKR",date:today(),status:"Draft",type:"Invoice"})}
     cols={["Number","Client","Type","Amount","Date","Status"]}
     render={r=>(<><Td className="font-medium">{r.number}</Td><Td className="text-slate-500">{r.client}</Td><Td className="text-slate-500">{r.type}</Td><Td>{fmt(r.amount,r.currency)}</Td><Td className="text-slate-500">{r.date}</Td><Td><Pill s={r.status}/></Td></>)}
@@ -2665,7 +2790,7 @@ function Payables({ data, update, patch, brand }) {
     setAppr(null);
   };
   return (<>
-    <Ledger title="Payables" sub={`Owed · ${fmt(rows.filter(r=>r.status!=="Paid").reduce((s,r)=>s+ +r.amount,0))} · approved vendor bills land here as unpaid until you mark them paid`} rows={rows} setRows={setRows}
+    <Ledger noun="payable" title="Payables" sub={`Owed · ${fmt(rows.filter(r=>r.status!=="Paid").reduce((s,r)=>s+ +r.amount,0))} · approved vendor bills land here as unpaid until you mark them paid`} rows={rows} setRows={setRows}
       blank={()=>({vendor:"",desc:"",amount:"",due:today(),status:"Pending"})}
       cols={["Vendor","Description","Amount","Due","Status"]}
       render={r=>(<><Td className="font-medium">{r.vendor}</Td><Td className="text-slate-500"><div className="flex items-center gap-2">{r.receipt&&<button onClick={(e)=>{e.stopPropagation();openDataUrl(r.receipt, (r.desc||"receipt").replace(/[^a-z0-9]+/gi,"-"));}} title="Open receipt" className="shrink-0"><img src={r.receipt} className="w-8 h-8 rounded object-cover border border-slate-200 hover:ring-2 hover:ring-sky-400"/></button>}{r.desc}{r.payVia==="salary"&&<span className="text-xs text-sky-600">→ {r.payMonth} salary</span>}{r.kind==="vendorbill"&&<span className="text-xs text-slate-400">vendor bill</span>}</div></Td><Td>{fmt(r.amount)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
@@ -2686,7 +2811,7 @@ function Payables({ data, update, patch, brand }) {
 }
 function Receivables({ data, update }) {
   const rows=data.receivables, setRows=r=>update("receivables",r); const clients=data.clients;
-  return <Ledger title="Receivables" sub={`Expected · ${fmt(rows.filter(r=>r.status!=="Paid").reduce((s,r)=>s+ +r.amount,0))}`} rows={rows} setRows={setRows}
+  return <Ledger noun="receivable" title="Receivables" sub={`Expected · ${fmt(rows.filter(r=>r.status!=="Paid").reduce((s,r)=>s+ +r.amount,0))}`} rows={rows} setRows={setRows}
     blank={()=>({client:"",desc:"",amount:"",due:today(),status:"Outstanding"})}
     cols={["Client","Description","Amount","Due","Status"]}
     render={r=>(<><Td className="font-medium">{r.client}</Td><Td className="text-slate-500">{r.desc}</Td><Td>{fmt(r.amount)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
@@ -2708,6 +2833,12 @@ function Requests({ data, update, mutateData, go }) {
   ].sort((a,b)=>(b.date||"").localeCompare(a.date||""));
   const isOpen = (r)=> r.kind==="leave" ? r.status==="Pending" : r.kind==="cert" ? (r.status!=="Done"&&r.status!=="Declined") : r.status==="Pending";
   const filtered = rows.filter(r=>(kind==="all"||r.kind===kind) && (st==="all" ? true : st==="open" ? isOpen(r) : !isOpen(r)));
+  // Batch actions apply to certificate/profile requests — the ones that pile up as
+  // duplicates. Leave and expense decisions stay one-by-one on purpose.
+  const bq = useBatch(filtered.filter(r=>r.kind==="cert").map(r=>({ id:r.key })));
+  const bqIds = () => new Set(bq.selected.map(k=>k.slice(1)));
+  const bulkDone = async () => { const ids=bqIds(); await mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).map(r=>ids.has(r.id)?{...r,status:"Done",decidedOn:today()}:r) }), `Marked ${ids.size} request(s) done`); bq.clear(); };
+  const bulkDelete = async () => { const ids=bqIds(); await mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).filter(r=>!ids.has(r.id)) }), `Deleted ${ids.size} request(s)`); bq.clear(); };
   const openCount = rows.filter(isOpen).length;
   const KINDS = [["all","All"],["leave","Leave"],["cert","Certificates"],["reimb","Expense claims"]];
   const kindPill = (k)=> k==="leave"?"bg-sky-100 text-sky-700":k==="cert"?"bg-violet-100 text-violet-700":"bg-amber-100 text-amber-700";
@@ -2718,8 +2849,12 @@ function Requests({ data, update, mutateData, go }) {
       <div className="flex-1"/>
       {[["open","Awaiting"],["decided","Handled"],["all","All"]].map(([k,l])=><Btn key={k} variant={st===k?"primary":"ghost"} onClick={()=>setSt(k)}>{l}</Btn>)}
     </div>
-    <Card><Table cols={["Employee","Request","Details","Date","Status",""]}>{filtered.length===0?<tr><td colSpan={6}><Empty msg={st==="open"?"Nothing awaiting action — all caught up":"No requests here yet"}/></td></tr>:filtered.map(r=>(
+    <BatchBar count={bq.count} noun="request" onClear={bq.clear} onDelete={bulkDelete}>
+      <Btn variant="ghost" onClick={bulkDone}><Check size={15}/>Mark done</Btn>
+    </BatchBar>
+    <Card><Table cols={[<SelBox key="a" on={bq.allOn} onChange={bq.toggleAll} title="Select all certificate requests"/>,"Employee","Request","Details","Date","Status",""]}>{filtered.length===0?<tr><td colSpan={7}><Empty msg={st==="open"?"Nothing awaiting action — all caught up":"No requests here yet"}/></td></tr>:filtered.map(r=>(
       <Row key={r.key}>
+        <Td className="w-8">{r.kind==="cert" ? <SelBox on={bq.has(r.key)} onChange={()=>bq.toggle(r.key)}/> : <span className="text-slate-300 text-xs">—</span>}</Td>
         <Td className="font-medium">{r.employee}</Td>
         <Td><span className={`text-xs px-2 py-0.5 rounded-full ${kindPill(r.kind)}`}>{r.title}</span></Td>
         <Td className="text-slate-500 text-xs max-w-[260px]">{r.details||"—"}</Td>
