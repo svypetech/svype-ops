@@ -253,52 +253,54 @@ class Doc {
 function buildPayslipPdf(slip = {}, brand = {}, employee = {}) {
   const d = new Doc();
   const accent = hexRgb(brand.accent);
+  const soft = [Math.round(accent[0]*0.12+236), Math.round(accent[1]*0.12+240), Math.round(accent[2]*0.12+244)].map(v=>Math.min(v,250));
   const right = PAGE_W - M, innerW = right - M;
   const cur = slip.currency || "PKR";
+  const WHITE = [255,255,255];
 
   const logo = parseImage(brand.logo);
-  const sig = brand.payslipSignature || null;          // { img, name, role }
+  const sig = brand.payslipSignature || null;
   const sigImg = parseImage(sig && sig.img);
   const stampImg = parseImage(brand.payslipStamp);
 
-  // ---------- header ----------
-  let y = PAGE_H - M - 30;
+  // ================= header =================
+  let y = PAGE_H - 46;
   let tx = M;
   if (logo) {
-    // Measure how wide the logo actually lands (a square logo is far narrower than a
-    // wide one) and start the company name just after it — no fixed reserved column.
-    const boxW = 104, boxH = 46;
-    const sc = Math.min(boxW / logo.w, boxH / logo.h);
-    d.image(logo, M, y - 4, boxW, boxH);
-    tx = M + logo.w * sc + 14;
+    const bw = 108, bh = 54, sc = Math.min(bw / logo.w, bh / logo.h);
+    d.image(logo, M, y - 40, bw, bh);
+    tx = M + logo.w * sc + 16;
   }
-  d.text(tx, y + 16, brand.company || "Company", { size: 17, bold: true });
-  if (brand.tagline) d.text(tx, y + 3, brand.tagline, { size: 8.5, gray: 0.45 });
-  d.right(right, y + 16, "SALARY SLIP", { size: 13, bold: true, rgb: accent });
-  d.right(right, y + 3, slip.month || "", { size: 9, gray: 0.4 });
-  y -= 12;
-  d.band(M, y, innerW, 2.2, accent);
-  y -= 28;
+  d.text(tx, y - 8, brand.company || "Company", { size: 21, bold: true });
+  if (brand.tagline) d.text(tx, y - 23, brand.tagline, { size: 9, gray: 0.45 });
 
-  // ---------- details ----------
-  const boxH = 62;
-  d.rect(M, y - boxH + 14, innerW, boxH, 0.972);
-  d.frame(M, y - boxH + 14, innerW, boxH, 0.9);
-  const half = innerW / 2 - 100;
-  const pair = (x, yy, k, v) => {
-    d.text(x + 10, yy, k, { size: 8.5, gray: 0.45 });
-    d.text(x + 92, yy, fit(v || "-", 9.5, true, half), { size: 9.5, bold: true });
+  // title bar, full bleed
+  const barY = PAGE_H - 142, barH = 34;
+  d.band(0, barY, PAGE_W, barH, accent);
+  d.text(M, barY + 12, "SALARY SLIP", { size: 12.5, bold: true, rgb: WHITE });
+  d.right(right, barY + 12, (slip.month || "").toUpperCase(), { size: 11, bold: true, rgb: WHITE });
+  y = barY - 26;
+
+  // ================= who / when =================
+  const panelH = 84;
+  d.rect(M, y - panelH, innerW, panelH, 0.968);
+  d.band(M, y - panelH, 3, panelH, accent);          // accent spine
+  const colX = M + innerW / 2 + 4;
+  const labW = 96;
+  const row = (x, yy, k, v) => {
+    d.text(x + 14, yy, k.toUpperCase(), { size: 7.5, gray: 0.5 });
+    d.text(x + labW, yy, fit(v || "-", 10, true, innerW / 2 - labW - 20), { size: 10, bold: true });
   };
-  const col2 = M + innerW / 2 - 4;
-  pair(M, y, "Employee", slip.employee);
-  pair(M, y - 17, "Designation", [employee.role, employee.dept].filter(Boolean).join(" / "));
-  pair(M, y - 34, "Account / IBAN", employee.account);
-  pair(col2, y, "Pay period", slip.month);
-  pair(col2, y - 17, "Issue date", prettyDate(slip.date || new Date()));
-  pair(col2, y - 34, "Payment date", slip.paid ? prettyDate(slip.paidOn) : "Pending");
-  y -= boxH + 18;
+  let ry = y - 22;
+  row(M, ry, "Employee", slip.employee);
+  row(M, ry - 22, "Designation", [employee.role, employee.dept].filter(Boolean).join(" / "));
+  row(M, ry - 44, "Account / IBAN", employee.account);
+  row(colX - 14, ry, "Pay period", slip.month);
+  row(colX - 14, ry - 22, "Issue date", prettyDate(slip.date || new Date()));
+  row(colX - 14, ry - 44, "Payment", slip.paid ? `${prettyDate(slip.paidOn)}${slip.payMethod ? ` · ${slip.payMethod}` : ""}` : "Pending");
+  y -= panelH + 30;
 
-  // ---------- earnings | deductions ----------
+  // ================= earnings | deductions =================
   const plus = [["Basic salary", +slip.basic || 0]];
   if (+slip.allowances) plus.push(["Allowances", +slip.allowances]);
   if (+slip.reimbursements) plus.push(["Reimbursements", +slip.reimbursements]);
@@ -310,62 +312,74 @@ function buildPayslipPdf(slip = {}, brand = {}, employee = {}) {
   const gross = plus.reduce((t, [, v]) => t + v, 0);
   const totalDed = minus.reduce((t, [, v]) => t + v, 0);
 
-  const gap = 14, colW = (innerW - gap) / 2;
+  const gap = 18, colW = (innerW - gap) / 2, rowH = 21;
   const rowsMax = Math.max(plus.length, minus.length || 1);
-  const colH = 30 + rowsMax * 16 + 26;
+  const colH = Math.max(232, 36 + rowsMax * rowH + 34);   // stretches so the page stays full
   const drawCol = (x, title, rows, total, totalLabel) => {
-    d.frame(x, y - colH, colW, colH, 0.88);
-    d.band(x, y - 22, colW, 22, accent);
-    d.text(x + 10, y - 15, title, { size: 9, bold: true, rgb: [255, 255, 255] });
-    let ry = y - 42;
-    if (!rows.length) { d.text(x + 10, ry, "None", { size: 9.5, gray: 0.5 }); ry -= 16; }
-    rows.forEach(([k, v]) => {
-      d.text(x + 10, ry, fit(k, 9.5, false, colW - 105), { size: 9.5 });
-      d.right(x + colW - 10, ry, money(v, cur), { size: 9.5 });
-      ry -= 16;
+    d.rect(x, y - colH, colW, colH, 0.995);
+    d.frame(x, y - colH, colW, colH, 0.86);
+    d.band(x, y - 28, colW, 28, accent);
+    d.text(x + 14, y - 19, title, { size: 9.5, bold: true, rgb: WHITE });
+    let cy = y - 50;
+    if (!rows.length) { d.text(x + 14, cy, "None", { size: 10, gray: 0.5 }); cy -= rowH; }
+    rows.forEach(([k, v], i) => {
+      if (i % 2 === 1) d.rect(x + 1, cy - 6, colW - 2, rowH, 0.978);
+      d.text(x + 14, cy, fit(k, 10, false, colW - 118), { size: 10 });
+      d.right(x + colW - 14, cy, money(v, cur), { size: 10 });
+      cy -= rowH;
     });
-    d.line(x + 8, y - colH + 24, x + colW - 8, y - colH + 24, 0.85);
-    d.text(x + 10, y - colH + 10, totalLabel, { size: 9.5, bold: true });
-    d.right(x + colW - 10, y - colH + 10, money(total, cur), { size: 9.5, bold: true });
+    d.band(x + 1, y - colH + 1, colW - 2, 30, soft);
+    d.line(x, y - colH + 31, x + colW, y - colH + 31, 0.86);
+    d.text(x + 14, y - colH + 12, totalLabel, { size: 10, bold: true });
+    d.right(x + colW - 14, y - colH + 12, money(total, cur), { size: 10.5, bold: true });
   };
   drawCol(M, "EARNINGS", plus, gross, "Total earnings");
   drawCol(M + colW + gap, "DEDUCTIONS", minus, totalDed, "Total deductions");
-  y -= colH + 20;
+  y -= colH + 28;
 
-  // ---------- net pay ----------
+  // ================= net pay =================
   const net = gross - totalDed;
-  d.band(M, y - 30, innerW, 40, accent);
-  d.text(M + 14, y - 5, "NET PAY", { size: 11, bold: true, rgb: [255, 255, 255] });
-  d.right(right - 14, y - 9, money(net, cur), { size: 17, bold: true, rgb: [255, 255, 255] });
-  y -= 46;
-  d.text(M, y, `Amount in words: ${amountInWords(net)} Rupees Only`, { size: 8.5, gray: 0.4 });
-  y -= 13;
-  if (slip.paid) {
-    d.text(M, y, `Paid on ${prettyDate(slip.paidOn)}${slip.payMethod ? ` via ${slip.payMethod}` : ""}.`, { size: 8.5, gray: 0.4 });
-    y -= 13;
-  }
+  const nH = 56;
+  d.band(M, y - nH + 16, innerW, nH, accent);
+  d.text(M + 18, y - 8, "NET PAY", { size: 12, bold: true, rgb: WHITE });
+  d.text(M + 18, y - 22, "amount transferred", { size: 7.5, rgb: [235, 242, 250] });
+  d.right(right - 18, y - 14, money(net, cur), { size: 21, bold: true, rgb: WHITE });
+  y -= nH + 14;
+  d.text(M, y, "In words:", { size: 8.5, gray: 0.5 });
+  d.text(M + 48, y, `${amountInWords(net)} Rupees Only`, { size: 8.5, bold: true, gray: 0.25 });
 
-  // ---------- signature & stamp ----------
-  const sigY = Math.max(y - 80, 156);
-  if (stampImg) d.image(stampImg, M + 172, sigY - 4, 94, 94);   // immediately right of the signature block
-  if (sigImg) d.image(sigImg, M, sigY + 26, 128, 44);
-  d.line(M, sigY + 20, M + 150, sigY + 20, 0.6);
-  d.text(M, sigY + 7, (sig && sig.name) || "Authorised signatory", { size: 9, bold: true });
-  d.text(M, sigY - 4, (sig && sig.role) || "Human Resources", { size: 8, gray: 0.45 });
+  // ================= signature & stamp (anchored near the foot) =================
+  const sigY = 226;
+  if (stampImg) d.image(stampImg, M + 60, sigY + 18, 156, 104);
+  if (sigImg) d.image(sigImg, M, sigY + 26, 178, 66);
+  d.line(M, sigY + 20, M + 200, sigY + 20, 0.55);
+  d.text(M, sigY + 6, (sig && sig.name) || "Authorised signatory", { size: 9.5, bold: true });
+  d.text(M, sigY - 6, (sig && sig.role) || "Human Resources", { size: 8, gray: 0.45 });
+  // payment summary opposite the signature
+  const boxX = M + innerW - 210;
+  d.rect(boxX, sigY - 14, 210, 92, 0.972);
+  d.frame(boxX, sigY - 14, 210, 92, 0.9);
+  d.text(boxX + 14, sigY + 62, "PAYMENT DETAILS", { size: 7.5, bold: true, gray: 0.45 });
+  const pRow = (yy, k, v) => { d.text(boxX + 14, yy, k, { size: 8.5, gray: 0.5 }); d.right(boxX + 196, yy, fit(v || "-", 8.5, true, 118), { size: 8.5, bold: true }); };
+  pRow(sigY + 44, "Method", slip.paid ? (slip.payMethod || "-") : "Not yet paid");
+  pRow(sigY + 28, "Paid on", slip.paid ? prettyDate(slip.paidOn) : "-");
+  pRow(sigY + 12, "Account", employee.account || "-");
+  pRow(sigY - 4, "Net paid", money(net, cur));
 
-  // ---------- footer ----------
+  // ================= footer =================
+  const fH = 92;
+  d.band(0, 0, PAGE_W, fH, soft);
+  d.band(0, fH - 2.5, PAGE_W, 2.5, accent);
+  let fy = fH - 22;
   const offices = Array.isArray(brand.offices) ? brand.offices.filter(o => o && o.address) : [];
-  let fy = 86;
-  d.line(M, fy + 16, right, fy + 16, 0.85);
-  d.text(M, fy + 4, "This is a computer-generated salary slip and is valid without a physical signature.", { size: 7.5, gray: 0.5 });
-  fy -= 11;
   offices.forEach(o => {
-    d.text(M, fy, `${o.city ? o.city + ": " : ""}${o.address}`, { size: 7.5, gray: 0.45 });
-    fy -= 10;
+    d.text(M, fy, `${o.city ? o.city + " — " : ""}${o.address}`, { size: 7.8, gray: 0.42 });
+    fy -= 11;
   });
-  const contact = [brand.phone, brand.email, brand.website].filter(Boolean).join("   ·   ");
-  if (contact) d.text(M, fy, contact, { size: 7.5, gray: 0.45 });
-  d.right(right, 40, brand.company || "", { size: 7.5, gray: 0.55 });
+  const contact = [brand.phone, brand.email, brand.website].filter(Boolean).join("    ·    ");
+  if (contact) { d.text(M, fy, contact, { size: 7.8, gray: 0.42 }); fy -= 11; }
+  d.text(M, 16, "This is a computer-generated salary slip and is valid without a physical signature.", { size: 7, gray: 0.55 });
+  d.right(right, 16, brand.company || "", { size: 7, bold: true, gray: 0.5 });
 
   return d.build();
 }

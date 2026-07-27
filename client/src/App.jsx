@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · autoheal-v1";
+const APP_BUILD = "Build 27 Jul 2026 · slip-v3";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -173,6 +173,10 @@ const timeOf = (iso) => iso ? new Date(iso).toLocaleTimeString([], { hour: "2-di
 // A corrected check-in time only counts once HR has approved it. Until then (and if
 // declined) the time that stands is the moment the person actually checked in.
 const effIn = (a) => (a && a.timeReq && a.timeReq.status === "Approved") ? a.timeReq.requested : (a ? a.checkIn : null);
+// Same rule for check-out: a corrected time only counts once HR has approved it.
+const effOut = (a) => (a && a.outReq && a.outReq.status === "Approved") ? a.outReq.requested : (a ? a.checkOut : null);
+// A work-from-home day that has been asked for (or already approved) lifts the geofence.
+const wfhFor = (data, name, date) => (data.wfhRequests || []).find(r => r.employee === name && r.date === date && r.status !== "Rejected");
 const dtOf = (iso) => iso ? new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
 const dayCount = (from, to) => { const a = new Date(from), b = new Date(to); return Math.max(1, Math.round((b - a) / 86400000) + 1); };
 const daysUntil = (d) => Math.round((new Date(d) - new Date()) / 86400000);
@@ -340,6 +344,7 @@ const SEED = {
   vault: [],
   vaultMeta: null,
   todos: [],
+  wfhRequests: [],
 };
 const OFFICE_ADDRESSES = [
   { city: "Islamabad", address: "Floor 1, Nova, Business Square, Gulberg Greens, Islamabad." },
@@ -442,6 +447,8 @@ function adminNotes(data) {
   data.payables.filter(p=>p.kind==="reimbursement" && p.status==="Pending").forEach(p=>out.push({ text:`${p.vendor}: reimbursement to approve`, tab:"payables" }));
   data.leaves.filter(l=>l.status==="Pending").forEach(l=>out.push({ text:`${l.employee}: ${l.type||""} leave ${l.from} → ${l.to} (${dayCount(l.from,l.to)}d) awaiting approval`, tab:"requests" }));
   (data.attendance||[]).filter(a=>a.timeReq && a.timeReq.status==="Pending").forEach(a=>out.push({ text:`${a.employee}: check-in time correction for ${a.date} awaiting approval`, tab:"requests" }));
+  (data.attendance||[]).filter(a=>a.outReq && a.outReq.status==="Pending").forEach(a=>out.push({ text:`${a.employee}: check-out time correction for ${a.date} awaiting approval`, tab:"requests" }));
+  (data.wfhRequests||[]).filter(w=>w.status==="Pending").forEach(w=>out.push({ text:`${w.employee}: work from home on ${w.date} awaiting approval`, tab:"requests" }));
   data.requests.filter(r=>r.status!=="Done").forEach(r=>out.push({ text:`${r.employee}: ${r.type}`, tab:"requests" }));
   data.employees.forEach(e=>(e.docs||[]).forEach(d=>{ if(d.expiry){ const dd=daysUntil(d.expiry); if(dd<=30) out.push({ text:`${e.name}: ${d.name} ${dd<0?"expired":"expires in "+dd+"d"}`, tab:"employees" }); }}));
   return out;
@@ -450,6 +457,8 @@ function empNotes(data, me) {
   const out = [];
   (data.requests||[]).filter(r=>r.employee===me.name && r.status==="Done").slice(0,3).forEach(r=>out.push({ text:`Your ${r.type} is ready — collect it from HR`, tab:"payslips" }));
   (data.attendance||[]).filter(a=>a.employee===me.name && a.timeReq && a.timeReq.status!=="Pending").slice(-3).forEach(a=>out.push({ text:`Your check-in correction for ${a.date} was ${a.timeReq.status==="Approved"?"approved ✓":"declined — the recorded time stands"}`, tab:"attendance" }));
+  (data.attendance||[]).filter(a=>a.employee===me.name && a.outReq && a.outReq.status!=="Pending").slice(-3).forEach(a=>out.push({ text:`Your check-out correction for ${a.date} was ${a.outReq.status==="Approved"?"approved ✓":"declined — the recorded time stands"}`, tab:"attendance" }));
+  (data.wfhRequests||[]).filter(w=>w.employee===me.name && w.status!=="Pending").slice(-3).forEach(w=>out.push({ text:`Your work-from-home request for ${w.date} was ${w.status==="Approved"?"approved ✓":"declined"}`, tab:"attendance" }));
   [...data.leaves].filter(l=>l.employee===me.name && l.status!=="Pending").sort((a,b)=>(b.decidedOn||"").localeCompare(a.decidedOn||"")).slice(0,5).forEach(l=>out.push({ text:`Your ${l.type||""} leave (${l.from} → ${l.to}) was ${l.status==="Approved"?"approved ✓":"declined"}`, tab:"attendance" }));
   data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===me.name && p.status!=="Pending").slice(0,5).forEach(p=>out.push({ text:`Expense claim: ${p.status}`, tab:"expenses" }));
   return out;
@@ -587,6 +596,21 @@ export default function App() {
     } catch {}
     setLoading(false);
   })(); }, []);
+
+
+  // A focused number field changes value when the mouse wheel rolls over it — that is
+  // how a typed 100,000 silently became 99,998. Block it everywhere.
+  useEffect(() => {
+    const onWheel = (e) => {
+      const el = document.activeElement;
+      if (el && el.tagName === "INPUT" && el.type === "number" && (el === e.target || el.contains(e.target))) {
+        e.preventDefault();
+        el.blur();
+      }
+    };
+    document.addEventListener("wheel", onWheel, { passive: false });
+    return () => document.removeEventListener("wheel", onWheel);
+  }, []);
 
   // Anti-staleness: quietly re-fetch the latest data every 60s and whenever the tab regains
   // focus, so a tab left open all day never saves on top of hours-old data.
@@ -1213,7 +1237,8 @@ function DocSheet({ brand, body, signed, setSigned }) {
 }
 
 /* ================= EMPLOYEE PORTAL ================= */
-function checkInOut(mutateData, name, which, onResult, remoteAllowed = false) {
+function checkInOut(mutateData, name, which, onResult, remoteAllowed = false, wfhToday = null) {
+  if (wfhToday) remoteAllowed = true;   // a work-from-home day is never geofenced
   const apply = (loc) => {
     const near = loc ? nearestOffice(loc.lat, loc.lng) : null;
     const atOffice = !!(near && near.distance <= GEOFENCE_RADIUS_M);
@@ -1227,11 +1252,11 @@ function checkInOut(mutateData, name, which, onResult, remoteAllowed = false) {
     }
     // WFH employees are never blocked: tag the office if they happen to be at one,
     // otherwise tag "Remote". Location is still recorded when available.
-    const officeName = atOffice ? near.office : "Remote";
+    const officeName = atOffice ? near.office : (wfhToday ? "Work from home" : "Remote");
     const stampedLoc = loc ? { ...loc, office: officeName, ...(near ? { distance: Math.round(near.distance) } : {}) } : null;
     const now = new Date().toISOString();
     const stamp = which==="in"
-      ? { checkIn:now, location:stampedLoc, office:officeName }
+      ? { checkIn:now, location:stampedLoc, office:officeName, ...(wfhToday ? { wfh:true, wfhReqId:wfhToday.id, status: wfhToday.status==="Approved" ? "Present" : "Requested" } : {}) }
       : { checkOut:now, checkOutLocation:stampedLoc, checkOutOffice:officeName };
     // FUNCTIONAL mutation: recomputed against the freshest data on every save retry, so
     // simultaneous check-ins from many employees merge instead of overwriting each other.
@@ -1275,29 +1300,54 @@ function CheckInCard({ data, mutateData, me }) {
   const minDate = new Date(Date.now() - 7*86400000).toISOString().slice(0,10);
   const sendCorrection = async () => {
     if (!tf.date) { setTerr("Pick the day."); return; }
-    if (!tf.time) { setTerr("Enter the time you actually started."); return; }
-    const iso = new Date(`${tf.date}T${tf.time}`).toISOString();
-    if (isNaN(new Date(iso).getTime())) { setTerr("That time doesn't look right."); return; }
+    if (!tf.inTime && !tf.outTime) { setTerr("Enter the time you started, the time you left, or both."); return; }
+    const iso = (t) => t ? new Date(`${tf.date}T${t}`).toISOString() : null;
+    const inIso = iso(tf.inTime), outIso = iso(tf.outTime);
+    if ((tf.inTime && isNaN(new Date(inIso).getTime())) || (tf.outTime && isNaN(new Date(outIso).getTime()))) { setTerr("That time doesn't look right."); return; }
+    if (inIso && outIso && new Date(outIso) <= new Date(inIso)) { setTerr("The leaving time has to be after the starting time."); return; }
     setTbusy(true); setTerr("");
     try {
       await mutateData((cur)=>{
         const list = cur.attendance || [];
-        const req = { requested: iso, reason: (tf.reason||"").trim(), status:"Pending", submittedAt: new Date().toISOString() };
+        const meta = { reason:(tf.reason||"").trim(), status:"Pending", submittedAt:new Date().toISOString() };
+        const patchRec = (rec) => ({
+          ...rec,
+          ...(inIso ? { timeReq: { ...meta, requested: inIso } } : {}),
+          ...(outIso ? { outReq: { ...meta, requested: outIso } } : {}),
+        });
         const existing = list.find(x=>x.employee===me.name && x.date===tf.date);
-        if (existing) return { ...cur, attendance: list.map(x=>x===existing ? { ...x, timeReq: req } : x) };
-        // No attendance at all for that day (they forgot entirely). Create a placeholder
-        // that does NOT count as present until HR approves it.
-        return { ...cur, attendance: [...list, { id:uid(), employee:me.name, date:tf.date, status:"Requested", checkIn:null, checkOut:null, viaRequest:true, timeReq:req }] };
-      }, `${me.name} requested a check-in time for ${tf.date}`);
+        if (existing) return { ...cur, attendance: list.map(x=>x===existing ? patchRec(x) : x) };
+        // No attendance for that day at all — a placeholder that does NOT count as
+        // present until HR approves it.
+        return { ...cur, attendance: [...list, patchRec({ id:uid(), employee:me.name, date:tf.date, status:"Requested", checkIn:null, checkOut:null, viaRequest:true })] };
+      }, `${me.name} requested an attendance time correction for ${tf.date}`);
       setTf(null);
       setTsent("Sent to HR. Your attendance stays as recorded until they approve it.");
       setTimeout(()=>setTsent(""), 8000);
     } catch { setTerr("Couldn't reach the server — please try again."); }
     setTbusy(false);
   };
+  // ---- work from home for a specific day ----
+  const [wf, setWf] = useState(null); const [werr, setWerr] = useState(""); const [wbusy, setWbusy] = useState(false);
+  const myWfh = wfhFor(data, me.name, today());
+  const sendWfh = async () => {
+    if (!wf.date) { setWerr("Pick the day."); return; }
+    if (!(wf.reason||"").trim()) { setWerr("Please tell HR why you're working from home."); return; }
+    setWbusy(true); setWerr("");
+    try {
+      await mutateData((cur)=>({ ...cur, wfhRequests: [...(cur.wfhRequests||[]), {
+        id: uid(), employee: me.name, date: wf.date, reason: wf.reason.trim(),
+        status: "Pending", requestedOn: today(),
+      }] }), `${me.name} requested to work from home on ${wf.date}`);
+      setWf(null);
+      setTsent("Work-from-home request sent to HR. You can check in and out from anywhere on that day — it reaches the attendance sheet once HR approves.");
+      setTimeout(()=>setTsent(""), 10000);
+    } catch { setWerr("Couldn't reach the server — please try again."); }
+    setWbusy(false);
+  };
   const doAction = (which) => {
     setBusy(true); setMsg(null);
-    checkInOut(mutateData, me.name, which, (res)=>{ setBusy(false); setMsg(res); }, !!me.remoteAllowed);
+    checkInOut(mutateData, me.name, which, (res)=>{ setBusy(false); setMsg(res); }, !!me.remoteAllowed, myWfh || null);
   };
   return (<Card><div className="p-5">
     <div className="flex items-center gap-2 text-sm font-semibold mb-3"><Clock size={16} className="text-sky-600"/>Today · {new Date().toLocaleDateString()}</div>
@@ -1311,14 +1361,31 @@ function CheckInCard({ data, mutateData, me }) {
     {a?.timeReq?.status==="Approved" && <div className="mt-3 text-xs rounded-lg px-3 py-2 bg-emerald-50 border border-emerald-200 text-emerald-700">HR approved your check-in time of {timeOf(a.timeReq.requested)}.</div>}
     {a?.timeReq?.status==="Rejected" && <div className="mt-3 text-xs rounded-lg px-3 py-2 bg-rose-50 border border-rose-200 text-rose-700">HR declined the correction — the recorded time stands.</div>}
     {tsent && <div className="mt-3 text-xs rounded-lg px-3 py-2 bg-emerald-50 border border-emerald-200 text-emerald-700">{tsent}</div>}
-    <button onClick={()=>{ setTf({ date: today(), time:"", reason:"" }); setTerr(""); }} className="mt-3 text-xs text-sky-600 hover:underline">Forgot to check in on time? Send a correction to HR →</button>
-    {tf && <Modal title="Correct my check-in time" onClose={()=>{setTf(null);setTerr("");}}>
-      <p className="text-xs text-slate-500">Tell HR the time you actually started. This is a request — until HR approves it, your attendance stays exactly as recorded.</p>
+    {a?.outReq?.status==="Pending" && <div className="mt-3 text-xs rounded-lg px-3 py-2 bg-amber-50 border border-amber-200 text-amber-700">Check-out correction to {timeOf(a.outReq.requested)} sent — waiting for HR approval.</div>}
+    {a?.outReq?.status==="Approved" && <div className="mt-3 text-xs rounded-lg px-3 py-2 bg-emerald-50 border border-emerald-200 text-emerald-700">HR approved your check-out time of {timeOf(a.outReq.requested)}.</div>}
+    {myWfh && <div className={`mt-3 text-xs rounded-lg px-3 py-2 ${myWfh.status==="Approved"?"bg-emerald-50 border border-emerald-200 text-emerald-700":"bg-sky-50 border border-sky-200 text-sky-700"}`}>
+      {myWfh.status==="Approved" ? "Working from home today — approved by HR. Check in and out as normal." : "Work-from-home request sent for today. You can check in and out from anywhere; it reaches the attendance sheet once HR approves."}
+    </div>}
+    <div className="mt-3 flex flex-wrap gap-3">
+      <button onClick={()=>{ setTf({ date: today(), inTime:"", outTime:"", reason:"" }); setTerr(""); }} className="text-xs text-sky-600 hover:underline">Forgot to check in or out? Send a correction →</button>
+      {!myWfh && !me.remoteAllowed && <button onClick={()=>{ setWf({ date: today(), reason:"" }); setWerr(""); }} className="text-xs text-sky-600 hover:underline">Working from home? Request it →</button>}
+    </div>
+    {wf && <Modal title="Work from home request" onClose={()=>{setWf(null);setWerr("");}}>
+      <p className="text-xs text-slate-500">HR has to approve working from home. You can check in and out from anywhere on that day straight away — the day only lands on the attendance sheet once HR approves it.</p>
+      <Field label="Day" type="date" value={wf.date} min={today()} onChange={e=>{setWf({...wf,date:e.target.value});setWerr("");}}/>
+      <Area label="Reason" value={wf.reason} onChange={e=>{setWf({...wf,reason:e.target.value});setWerr("");}}/>
+      {werr && <div className="text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{werr}</div>}
+      <Btn onClick={sendWfh} disabled={wbusy}>{wbusy?<Loader2 size={15} className="animate-spin"/>:<Check size={15}/>}{wbusy?"Sending…":"Send to HR for approval"}</Btn>
+    </Modal>}
+    {tf && <Modal title="Correct my attendance times" onClose={()=>{setTf(null);setTerr("");}}>
+      <p className="text-xs text-slate-500">Tell HR the times you actually started and/or finished — for example if you left the office but only checked out once you got home. This is a request: your attendance stays exactly as recorded until HR approves it.</p>
+      <Field label="Day" type="date" value={tf.date} min={minDate} max={today()} onChange={e=>{setTf({...tf,date:e.target.value});setTerr("");}}/>
       <div className="grid grid-cols-2 gap-3">
-        <Field label="Day" type="date" value={tf.date} min={minDate} max={today()} onChange={e=>{setTf({...tf,date:e.target.value});setTerr("");}}/>
-        <Field label="Time I actually started" type="time" value={tf.time} onChange={e=>{setTf({...tf,time:e.target.value});setTerr("");}}/>
+        <Field label="Time I actually started" type="time" value={tf.inTime} onChange={e=>{setTf({...tf,inTime:e.target.value});setTerr("");}}/>
+        <Field label="Time I actually left" type="time" value={tf.outTime} onChange={e=>{setTf({...tf,outTime:e.target.value});setTerr("");}}/>
       </div>
-      <Area label="Why the check-in was late or missed" value={tf.reason} onChange={e=>setTf({...tf,reason:e.target.value})}/>
+      <p className="text-xs text-slate-400 -mt-1">Fill in whichever one is wrong — you can send both together.</p>
+      <Area label="Why the time was late or missed" value={tf.reason} onChange={e=>setTf({...tf,reason:e.target.value})}/>
       {terr && <div className="text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{terr}</div>}
       <Btn onClick={sendCorrection} disabled={tbusy}>{tbusy?<Loader2 size={15} className="animate-spin"/>:<Check size={15}/>}{tbusy?"Sending…":"Send to HR for approval"}</Btn>
     </Modal>}
@@ -1413,7 +1480,7 @@ function EmpAttendance({ data, update, mutateData, me }) {
           {a.timeReq && a.timeReq.status==="Approved" && <div className="text-xs text-emerald-600">corrected ✓ (checked in {timeOf(a.checkIn)})</div>}
           {a.timeReq && a.timeReq.status==="Rejected" && <div className="text-xs text-rose-500">correction declined</div>}
         </Td>
-        <Td className="text-slate-500">{timeOf(a.checkOut)||"—"}</Td>
+        <Td className="text-slate-500">{timeOf(effOut(a))||"—"}{a.outReq?.status==="Pending"&&<div className="text-xs text-amber-600">correction pending</div>}</Td>
         <Td>{(!a.timeReq || a.timeReq.status==="Rejected")
           ? <button onClick={()=>{setTf({ id:a.id, date:a.date, time:"", reason:"" });setTerr("");}} className="text-xs text-sky-600 hover:underline whitespace-nowrap">Correct time</button>
           : <span className="text-xs text-slate-300">—</span>}</Td></Row>))}</Table></Card>
@@ -2452,25 +2519,26 @@ function Attendance({ data, update, mutateData }) {
   const mark = (emp,status)=>{ mutateData((cur)=>{ const list=cur.attendance||[]; const ex=list.find(a=>a.employee===emp&&a.date===today()); return { ...cur, attendance: ex?list.map(a=>a===ex?{...a,status,markedBy:"HR",markedOn:new Date().toISOString()}:a):[...list,{id:uid(),employee:emp,date:today(),status,markedBy:"HR",markedOn:new Date().toISOString()}] }; }, `Marked ${emp} ${status}`); };
   const bh = useBatch(data.attendance||[]);
   const [busyTime,setBusyTime]=useState(null);
-  const decideTime = async (id,sv)=>{
+  const decideTime = async (id,sv,field="timeReq")=>{
     const rec=(data.attendance||[]).find(x=>x.id===id); setBusyTime(id);
     try { await mutateData((cur)=>({ ...cur, attendance:(cur.attendance||[]).flatMap(x=>{
         if (x.id!==id) return [x];
-        if (sv==="Rejected" && x.viaRequest && !x.checkIn) return [];
-        const timeReq={ ...x.timeReq, status:sv, decidedOn:today() };
-        if (sv==="Approved" && x.viaRequest) return [{ ...x, timeReq, status:"Present", office:x.office||"Added by HR approval" }];
-        return [{ ...x, timeReq }];
+        if (sv==="Rejected" && x.viaRequest && !x.checkIn && !x.checkOut) return [];
+        const upd={ ...x, [field]:{ ...x[field], status:sv, decidedOn:today() } };
+        if (sv==="Approved" && x.viaRequest) return [{ ...upd, status:"Present", office:x.office||"Added by HR approval" }];
+        return [upd];
       }) }), `Check-in correction ${sv.toLowerCase()} for ${rec?.employee} (${rec?.date}) — they have been notified`); }
     finally { setBusyTime(null); }
   };
-  const TimeReqActions = ({ a }) => {
-    if (!a || !a.timeReq) return null;
+  const TimeReqActions = ({ a, field="timeReq", label="check-in" }) => {
+    if (!a || !a[field]) return null;
+    const rq = a[field];
     if (busyTime===a.id) return <div className="text-xs text-slate-500 flex items-center gap-1"><Loader2 size={11} className="animate-spin"/>Processing…</div>;
-    if (a.timeReq.status==="Pending") return (<div className="text-xs text-amber-600">
-      wants {timeOf(a.timeReq.requested)}{a.timeReq.reason?` · ${a.timeReq.reason}`:""}
-      <div className="flex gap-1 mt-1"><button onClick={()=>decideTime(a.id,"Approved")} className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Approve</button><button onClick={()=>decideTime(a.id,"Rejected")} className="px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 hover:bg-rose-200">Decline</button></div>
+    if (rq.status==="Pending") return (<div className="text-xs text-amber-600">
+      {label} → {timeOf(rq.requested)}{rq.reason?` · ${rq.reason}`:""}
+      <div className="flex gap-1 mt-1"><button onClick={()=>decideTime(a.id,"Approved",field)} className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Approve</button><button onClick={()=>decideTime(a.id,"Rejected",field)} className="px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 hover:bg-rose-200">Decline</button></div>
     </div>);
-    if (a.timeReq.status==="Approved") return <div className="text-xs text-emerald-600">corrected{a.checkIn?` · was ${timeOf(a.checkIn)}`:""}</div>;
+    if (rq.status==="Approved") return <div className="text-xs text-emerald-600">{label} corrected</div>;
     return <div className="text-xs text-slate-400">correction declined</div>;
   };
   const [busyLeave,setBusyLeave]=useState(null);
@@ -2482,7 +2550,7 @@ function Attendance({ data, update, mutateData }) {
     <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="attendance"?"primary":"ghost"} onClick={()=>setView("attendance")}>Today's attendance</Btn><Btn variant={view==="history"?"primary":"ghost"} onClick={()=>setView("history")}>Check-in/out log</Btn><Btn variant={view==="leave"?"primary":"ghost"} onClick={()=>setView("leave")}>Leave requests</Btn></div>
     {view==="attendance"?(
       <Card><Table cols={["Employee","Today","In / Out","Office","Location",""]}>{data.employees.filter(e=>e.status==="Active").map(e=>{const a=data.attendance.find(x=>x.employee===e.name&&x.date===today());const ll=locLink(a?.location);const lo=locLink(a?.checkOutLocation);return(
-        <Row key={e.id}><Td className="font-medium">{e.name}</Td><Td>{a?<span className="text-xs text-slate-600">{a.status}<div className="text-xs text-slate-400">{a.markedBy?"set by HR":a.checkIn?"checked in":""}</div></span>:<span className="text-slate-400 text-xs">Not marked</span>}</Td><Td className="text-xs text-slate-500">{effIn(a)?timeOf(effIn(a)):"—"} / {a?.checkOut?timeOf(a.checkOut):"—"}<TimeReqActions a={a}/></Td><Td className="text-xs text-slate-600">{a?.office||a?.checkOutOffice||"—"}</Td><Td className="text-xs"><div className="flex flex-col gap-0.5">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>in</a>:null}{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>out</a>:null}{!ll&&!lo&&<span className="text-slate-400">—</span>}</div></Td>
+        <Row key={e.id}><Td className="font-medium">{e.name}</Td><Td>{a?<span className="text-xs text-slate-600">{a.status}<div className="text-xs text-slate-400">{a.markedBy?"set by HR":a.checkIn?"checked in":""}</div></span>:<span className="text-slate-400 text-xs">Not marked</span>}</Td><Td className="text-xs text-slate-500">{effIn(a)?timeOf(effIn(a)):"—"} / {effOut(a)?timeOf(effOut(a)):"—"}<TimeReqActions a={a}/><TimeReqActions a={a} field="outReq" label="check-out"/>{a?.wfh&&<div className="text-xs text-indigo-600">work from home{a.status==="Requested"?" · awaiting approval":""}</div>}</Td><Td className="text-xs text-slate-600">{a?.office||a?.checkOutOffice||"—"}</Td><Td className="text-xs"><div className="flex flex-col gap-0.5">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>in</a>:null}{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>out</a>:null}{!ll&&!lo&&<span className="text-slate-400">—</span>}</div></Td>
         <Td><div className="flex gap-1 justify-end">{MARK_STYLES.map(({ st, on:onCls, off:offCls })=>{
           const on = a?.status===st;
           return <button key={st} onClick={()=>mark(e.name,st)} title={on?`Already marked ${st.toLowerCase()} — click to re-confirm`:`Set ${st.toLowerCase()} — this overrides whatever the employee did`}
@@ -2490,7 +2558,7 @@ function Attendance({ data, update, mutateData }) {
     ):view==="history"?(
       <><BatchBar count={bh.count} noun="record" onClear={bh.clear} onDelete={()=>{ const ids=new Set(bh.selected); update("attendance", (data.attendance||[]).filter(x=>!ids.has(x.id)), `Deleted ${ids.size} attendance record(s)`); bh.clear(); }}/>
       <Card><Table cols={[<SelBox key="a" on={bh.allOn} onChange={bh.toggleAll} title="Select all"/>,"Date","Employee","Office","Check-in","Check-out","In loc","Out loc"]}>{history.length===0?<tr><td colSpan={8}><Empty msg="No attendance recorded yet"/></td></tr>:history.map(a=>{const ll=locLink(a.location);const lo=locLink(a.checkOutLocation);return(
-        <Row key={a.id}><SelTd on={bh.has(a.id)} onChange={()=>bh.toggle(a.id)}/><Td className="text-slate-500 whitespace-nowrap">{a.date}</Td><Td className="font-medium">{a.employee}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td><Td className="text-slate-500">{effIn(a)?timeOf(effIn(a)):"—"}<TimeReqActions a={a}/></Td><Td className="text-slate-500">{a.checkOut?timeOf(a.checkOut):"—"}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td><Td className="text-xs">{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td></Row>);})}</Table></Card></>
+        <Row key={a.id}><SelTd on={bh.has(a.id)} onChange={()=>bh.toggle(a.id)}/><Td className="text-slate-500 whitespace-nowrap">{a.date}</Td><Td className="font-medium">{a.employee}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td><Td className="text-slate-500">{effIn(a)?timeOf(effIn(a)):"—"}<TimeReqActions a={a}/><TimeReqActions a={a} field="outReq" label="check-out"/>{a?.wfh&&<div className="text-xs text-indigo-600">work from home{a.status==="Requested"?" · awaiting approval":""}</div>}</Td><Td className="text-slate-500">{effOut(a)?timeOf(effOut(a)):"—"}{a.outReq?.status==="Pending"&&<div className="text-xs text-amber-600">check-out correction pending</div>}{a.outReq?.status==="Approved"&&<div className="text-xs text-emerald-600">corrected · was {a.checkOut?timeOf(a.checkOut):"—"}</div>}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td><Td className="text-xs">{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td></Row>);})}</Table></Card></>
     ):(
       <Card><Table cols={["Employee","Type & reason","From","To","Days","Balance left","Status",""]}>{data.leaves.length===0?<tr><td colSpan={8}><Empty msg="No leave requests"/></td></tr>:data.leaves.map(l=>(
         <Row key={l.id}><Td className="font-medium">{l.employee}</Td><Td className="text-slate-500">{l.type}{l.reason&&<div className="text-xs text-slate-400 max-w-[200px] truncate">{l.reason}</div>}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td className="text-xs text-slate-500">{LEAVE_POLICY[l.type]?`${Math.max(0,leaveLeft(data,l.employee,l.type))} left`:"—"}</Td><Td><Pill s={l.status}/></Td>
@@ -2515,6 +2583,12 @@ function Payroll({ data, patch, update, brand }) {
       ? { ...x, paid:true, payMethod:bulkPay.method, proof:bulkPay.proof||x.proof, paidOn:today() } : x),
       `Marked ${ids.size} salary slip(s) paid`);
     bp.clear(); setBulkPay(null);
+  };
+  const withAllowance = data.payroll.filter(p => +p.allowances > 0);
+  const clearAllowances = () => {
+    const total = withAllowance.reduce((t,p)=>t + (+p.allowances||0), 0);
+    if (!confirm(`Remove the automatic allowance from ${withAllowance.length} salary slip(s)?\n\nThese were created by an older version that added 10% automatically. Removing it lowers those slips by ${fmt(total)} in total. Nothing else changes — you can still add increases manually with a reason.`)) return;
+    update("payroll", data.payroll.map(p => +p.allowances > 0 ? { ...p, allowances: 0 } : p), `Removed automatic allowance from ${withAllowance.length} slip(s)`);
   };
   const [runAsk, setRunAsk] = useState(null);
   const askRun = () => {
@@ -2556,6 +2630,10 @@ function Payroll({ data, patch, update, brand }) {
   const empAcct = (name) => data.employees.find(e=>e.name===name)?.account || "";
   return (<>
     <Head title="Payroll & Salary Slips" sub={`${month} · base salary + your adjustments − deductions (no automatic allowance)${pendingReimb?` · ${fmt(pendingReimb)} reimbursements queued`:""}`} action={<Btn onClick={askRun}><Wallet size={15}/>Run payroll · {month}</Btn>}/>
+    {withAllowance.length>0 && <div className="mb-3 flex flex-wrap items-center gap-3 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
+      <div className="text-sm text-amber-800 flex-1">{withAllowance.length} salary slip(s) still carry an automatic 10% allowance added by an older version. New payroll runs no longer add it.</div>
+      <Btn variant="ghost" onClick={clearAllowances}><X size={15}/>Remove automatic allowance</Btn>
+    </div>}
     <BatchBar count={bp.count} noun="salary slip" onClear={bp.clear}
       onDelete={()=>{ const ids=new Set(bp.selected); update("payroll", data.payroll.filter(x=>!ids.has(x.id)), `Deleted ${ids.size} salary slip(s)`); bp.clear(); }}>
       <Btn variant="ghost" onClick={()=>setBulkPay({ method:"Bank transfer", proof:null })}><Check size={15}/>Mark paid</Btn>
@@ -3458,18 +3536,33 @@ function Requests({ data, update, mutateData, go }) {
   const [st, setSt] = useState("open");        // open | decided | all
   const [busyId, setBusyId] = useState(null);
   const setReqStatus = async (id,sv)=>{ setBusyId("R"+id); try { await mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).map(r=>r.id===id?{...r,status:sv,decidedOn:today()}:r) }), `Request marked ${sv}`); } finally { setBusyId(null); } };
-  const setTimeReq = async (id,sv)=>{
+  const setWfh = async (id,sv)=>{
+    const w = (data.wfhRequests||[]).find(x=>x.id===id);
+    setBusyId("W"+id);
+    try { await mutateData((cur)=>({
+      ...cur,
+      wfhRequests:(cur.wfhRequests||[]).map(x=>x.id===id?{...x,status:sv,decidedOn:today()}:x),
+      // Approving puts the day on the attendance sheet; declining takes the pending row off it.
+      attendance:(cur.attendance||[]).flatMap(x=>{
+        if (x.wfhReqId !== id) return [x];
+        if (sv==="Rejected") return x.checkIn ? [{ ...x, status:"Requested" }] : [];
+        return [{ ...x, status:"Present", office:x.office||"Work from home" }];
+      }),
+    }), `Work from home ${sv.toLowerCase()} for ${w?.employee} (${w?.date}) — they have been notified`); }
+    finally { setBusyId(null); }
+  };
+  const setTimeReq = async (id,sv,field="timeReq")=>{
     const a = (data.attendance||[]).find(x=>x.id===id);
-    setBusyId("T"+id);
+    setBusyId((field==="outReq"?"O":"T")+id);
     try { await mutateData((cur)=>({ ...cur, attendance:(cur.attendance||[]).flatMap(x=>{
         if (x.id !== id) return [x];
         // A claim for a day they never checked in at all: approving marks them present,
         // declining removes the placeholder so attendance stays clean (the decision is
         // still recorded in the activity log).
-        if (sv === "Rejected" && x.viaRequest && !x.checkIn) return [];
-        const timeReq = { ...x.timeReq, status:sv, decidedOn:today() };
-        if (sv === "Approved" && x.viaRequest) return [{ ...x, timeReq, status:"Present", office: x.office || "Added by HR approval" }];
-        return [{ ...x, timeReq }];
+        if (sv === "Rejected" && x.viaRequest && !x.checkIn && !x.checkOut && !(field==="timeReq" ? x.outReq : x.timeReq)) return [];
+        const upd = { ...x, [field]: { ...x[field], status:sv, decidedOn:today() } };
+        if (sv === "Approved" && x.viaRequest) return [{ ...upd, status:"Present", office: x.office || "Added by HR approval" }];
+        return [upd];
       }) }),
       `Check-in correction ${sv.toLowerCase()} for ${a?.employee} (${a?.date}) — they have been notified`); } finally { setBusyId(null); }
   };
@@ -3480,7 +3573,9 @@ function Requests({ data, update, mutateData, go }) {
     ...(data.leaves||[]).map(l=>({ key:"L"+l.id, id:l.id, kind:"leave", employee:l.employee, title:`${l.type||"Leave"} leave`, details:`${l.from} → ${l.to} · ${dayCount(l.from,l.to)}d${l.reason?` · ${l.reason}`:""}`, date:l.requestedOn||l.from, status:l.status, decidedOn:l.decidedOn })),
     ...(data.requests||[]).map(r=>({ key:"R"+r.id, id:r.id, kind:"cert", employee:r.employee, title:r.type, details:r.note||"", date:r.date, status:r.status, decidedOn:r.decidedOn })),
     ...(data.payables||[]).filter(p=>p.kind==="reimbursement").map(p=>({ key:"P"+p.id, id:p.id, kind:"reimb", employee:p.vendor, title:"Expense claim", details:`${fmt(p.amount)}${p.note?` · ${p.note}`:""}`, date:p.date, status:p.status, decidedOn:p.decidedOn })),
-    ...(data.attendance||[]).filter(a=>a.timeReq).map(a=>({ key:"T"+a.id, id:a.id, kind:"time", employee:a.employee, title:"Check-in time correction", details:`${a.date}: ${a.checkIn?`recorded ${timeOf(a.checkIn)}`:"no check-in recorded"} → asking for ${timeOf(a.timeReq.requested)}${a.timeReq.reason?` · ${a.timeReq.reason}`:""}`, date:a.date, status:a.timeReq.status, decidedOn:a.timeReq.decidedOn })),
+    ...(data.attendance||[]).filter(a=>a.timeReq).map(a=>({ key:"T"+a.id, id:a.id, kind:"time", field:"timeReq", employee:a.employee, title:"Check-in time correction", details:`${a.date}: ${a.checkIn?`recorded ${timeOf(a.checkIn)}`:"no check-in recorded"} → asking for ${timeOf(a.timeReq.requested)}${a.timeReq.reason?` · ${a.timeReq.reason}`:""}`, date:a.date, status:a.timeReq.status, decidedOn:a.timeReq.decidedOn })),
+    ...(data.attendance||[]).filter(a=>a.outReq).map(a=>({ key:"O"+a.id, id:a.id, kind:"time", field:"outReq", employee:a.employee, title:"Check-out time correction", details:`${a.date}: ${a.checkOut?`recorded ${timeOf(a.checkOut)}`:"no check-out recorded"} → asking for ${timeOf(a.outReq.requested)}${a.outReq.reason?` · ${a.outReq.reason}`:""}`, date:a.date, status:a.outReq.status, decidedOn:a.outReq.decidedOn })),
+    ...(data.wfhRequests||[]).map(w=>({ key:"W"+w.id, id:w.id, kind:"wfh", employee:w.employee, title:"Work from home", details:`${w.date}${w.reason?` · ${w.reason}`:""}`, date:w.date, status:w.status, decidedOn:w.decidedOn })),
   ].sort((a,b)=>(b.date||"").localeCompare(a.date||""));
   const isOpen = (r)=> r.kind==="leave" ? r.status==="Pending" : r.kind==="cert" ? (r.status!=="Done"&&r.status!=="Declined") : r.status==="Pending";
   const filtered = rows.filter(r=>(kind==="all"||r.kind===kind) && (st==="all" ? true : st==="open" ? isOpen(r) : !isOpen(r)));
@@ -3491,8 +3586,8 @@ function Requests({ data, update, mutateData, go }) {
   const bulkDone = async () => { const ids=bqIds(); await mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).map(r=>ids.has(r.id)?{...r,status:"Done",decidedOn:today()}:r) }), `Marked ${ids.size} request(s) done`); bq.clear(); };
   const bulkDelete = async () => { const ids=bqIds(); await mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).filter(r=>!ids.has(r.id)) }), `Deleted ${ids.size} request(s)`); bq.clear(); };
   const openCount = rows.filter(isOpen).length;
-  const KINDS = [["all","All"],["leave","Leave"],["time","Time corrections"],["cert","Certificates"],["reimb","Expense claims"]];
-  const kindPill = (k)=> k==="leave"?"bg-sky-100 text-sky-700":k==="cert"?"bg-violet-100 text-violet-700":k==="time"?"bg-teal-100 text-teal-700":"bg-amber-100 text-amber-700";
+  const KINDS = [["all","All"],["leave","Leave"],["wfh","Work from home"],["time","Time corrections"],["cert","Certificates"],["reimb","Expense claims"]];
+  const kindPill = (k)=> k==="leave"?"bg-sky-100 text-sky-700":k==="cert"?"bg-violet-100 text-violet-700":k==="time"?"bg-teal-100 text-teal-700":k==="wfh"?"bg-indigo-100 text-indigo-700":"bg-amber-100 text-amber-700";
   return (<>
     <Head title="HR Requests" sub={`Every request your team sends — leave, certificates, expense claims · ${openCount} awaiting action`}/>
     <div className="flex flex-wrap gap-2 mb-4">
@@ -3512,7 +3607,8 @@ function Requests({ data, update, mutateData, go }) {
         <Td className="text-slate-500 whitespace-nowrap">{r.date}</Td>
         <Td><Pill s={r.status}/>{r.decidedOn&&<div className="text-xs text-slate-400 mt-0.5">{r.decidedOn}</div>}</Td>
         <Td>{busyId===r.key ? <span className="flex items-center gap-1.5 justify-end text-xs text-slate-500"><Loader2 size={13} className="animate-spin"/>Processing…</span>
-          : r.kind==="time" && r.status==="Pending" ? <div className="flex gap-1 justify-end"><button disabled={!!busyId} onClick={()=>setTimeReq(r.id,"Approved")} title="Approve corrected time" className="p-1.5 rounded text-emerald-600 hover:bg-slate-100 disabled:opacity-40"><Check size={15}/></button><button disabled={!!busyId} onClick={()=>setTimeReq(r.id,"Rejected")} title="Decline — keep the recorded time" className="p-1.5 rounded text-rose-500 hover:bg-slate-100 disabled:opacity-40"><X size={15}/></button></div>
+          : r.kind==="time" && r.status==="Pending" ? <div className="flex gap-1 justify-end"><button disabled={!!busyId} onClick={()=>setTimeReq(r.id,"Approved",r.field)} title="Approve corrected time" className="p-1.5 rounded text-emerald-600 hover:bg-slate-100 disabled:opacity-40"><Check size={15}/></button><button disabled={!!busyId} onClick={()=>setTimeReq(r.id,"Rejected",r.field)} title="Decline — keep the recorded time" className="p-1.5 rounded text-rose-500 hover:bg-slate-100 disabled:opacity-40"><X size={15}/></button></div>
+          : r.kind==="wfh" && r.status==="Pending" ? <div className="flex gap-1 justify-end"><button disabled={!!busyId} onClick={()=>setWfh(r.id,"Approved")} title="Approve work from home" className="p-1.5 rounded text-emerald-600 hover:bg-slate-100 disabled:opacity-40"><Check size={15}/></button><button disabled={!!busyId} onClick={()=>setWfh(r.id,"Rejected")} title="Decline" className="p-1.5 rounded text-rose-500 hover:bg-slate-100 disabled:opacity-40"><X size={15}/></button></div>
           : r.kind==="leave" && r.status==="Pending" ? <div className="flex gap-1 justify-end"><button disabled={!!busyId} onClick={()=>setLeave(r.id,"Approved")} title="Approve" className="p-1.5 rounded text-emerald-600 hover:bg-slate-100 disabled:opacity-40"><Check size={15}/></button><button disabled={!!busyId} onClick={()=>setLeave(r.id,"Rejected")} title="Decline" className="p-1.5 rounded text-rose-500 hover:bg-slate-100 disabled:opacity-40"><X size={15}/></button></div>
           : r.kind==="cert" ? <RowActions onDelete={()=>delReq(r.id)}>{r.status!=="Done"&&<button disabled={!!busyId} onClick={()=>setReqStatus(r.id,"Done")} title="Mark done" className="p-1.5 rounded text-emerald-600 hover:bg-slate-100 disabled:opacity-40"><Check size={15}/></button>}</RowActions>
           : r.kind==="reimb" && r.status==="Pending" ? <button onClick={()=>go("payables")} className="text-xs text-sky-600 hover:underline whitespace-nowrap">Review in Payables</button>
