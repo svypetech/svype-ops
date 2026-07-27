@@ -14,6 +14,8 @@ const chat = require("./routes/chat");
 const state = require("./routes/state");
 const payslip = require("./routes/payslip");
 const files = require("./routes/files");
+const backup = require("./routes/backup");
+const { startBackupSchedule } = require("./lib/backupJob");
 const ai = require("./routes/ai");
 const { crud } = require("./routes/crud");
 
@@ -31,6 +33,7 @@ app.use("/api/chat", chat);
 app.use("/api/state", state);
 app.use("/api/payslip", payslip);
 app.use("/api/files", files);
+app.use("/api/backup", backup);
 app.use("/api/ai", ai);
 
 // generic CRUD modules
@@ -111,5 +114,6 @@ init()
     // Heal an oversized data record automatically, just after the port is open so a
     // slow cleanup can never delay or block start-up.
     setTimeout(() => { try { files.autoTidyOnBoot(); } catch (e) { console.error("auto-tidy skipped:", e.message); } }, 3000);
+    try { startBackupSchedule(); } catch (e) { console.error("backup schedule skipped:", e.message); }
   }))
   .catch((e) => { console.error("DB init failed:", e); process.exit(1); });

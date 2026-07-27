@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · slip-v3";
+const APP_BUILD = "Build 27 Jul 2026 · nightly-backup-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -3774,13 +3774,63 @@ function StorageCard() {
     {msg && <div className={`text-xs rounded-lg px-3 py-2 ${msg.ok?"bg-emerald-50 border border-emerald-200 text-emerald-700":"bg-rose-50 border border-rose-200 text-rose-700"}`}>{msg.text}</div>}
   </div></Card>);
 }
-function Backup({ data, brand, restore, wipe }) {
+function NightlyBackupCard({ data, patch }) {
+  const cfg = { enabled:true, time:"23:59", to:"", ...(data.backupConfig||{}) };
+  const [f, setF] = useState(cfg);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const [status, setStatus] = useState(null);
+  useEffect(() => { apiReq("GET","/backup/status").then(setStatus).catch(()=>{}); }, []);
+  const save = (next) => { setF(next); patch({ backupConfig:{ ...next } }, "Updated nightly backup settings"); };
+  const sendNow = async () => {
+    setBusy(true); setMsg(null);
+    try {
+      const r = await apiReq("POST","/backup/run-now",{});
+      setMsg({ ok:true, text:`Backup emailed to ${r.to} — ${r.filename} (${r.sizeMb} MB). Check your inbox.` });
+      apiReq("GET","/backup/status").then(setStatus).catch(()=>{});
+    } catch (e) { setMsg({ ok:false, text:e.message || "The backup couldn't be sent." }); }
+    setBusy(false);
+  };
+  const emailReady = status ? status.emailReady : true;
+  return (<Card><div className="p-5 space-y-3">
+    <div className="flex items-start justify-between gap-3">
+      <div><div className="font-semibold text-sm">Nightly email backup</div>
+        <p className="text-xs text-slate-500 mt-0.5">A full copy of your data is emailed every night, so you always have an off-site record.</p></div>
+      <label className="flex items-center gap-2 text-xs text-slate-600 whitespace-nowrap cursor-pointer">
+        <input type="checkbox" checked={f.enabled!==false} onChange={e=>save({...f, enabled:e.target.checked})}/>{f.enabled!==false?"On":"Off"}</label>
+    </div>
+    <div className="grid sm:grid-cols-2 gap-3">
+      <Field label="Send to" value={f.to} onChange={e=>setF({...f,to:e.target.value})} onBlur={()=>save(f)} placeholder={status?.mailbox || "your@email.com"}/>
+      <Field label="Time (Pakistan)" type="time" value={f.time} onChange={e=>save({...f,time:e.target.value})}/>
+    </div>
+    {!emailReady && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">Set up Settings → Email first — the backup is sent from that mailbox.</div>}
+    {status?.lastSentOn && <div className="text-xs text-slate-500">Last run: {status.lastSentOn}{status.lastResult?` · ${status.lastResult}`:""}</div>}
+    <div className="flex flex-wrap gap-2">
+      <Btn onClick={sendNow} disabled={busy}>{busy?<Loader2 size={15} className="animate-spin"/>:<Send size={15}/>}{busy?"Sending…":"Send a backup now"}</Btn>
+    </div>
+    {msg && <div className={`text-xs rounded-lg px-3 py-2 ${msg.ok?"bg-emerald-50 border border-emerald-200 text-emerald-700":"bg-rose-50 border border-rose-200 text-rose-700"}`}>{msg.text}</div>}
+    <p className="text-xs text-slate-400">The attached file restores with “Restore from backup” below. Large backups arrive zipped — the portal can read those directly.</p>
+  </div></Card>);
+}
+function Backup({ data, brand, restore, wipe, patch }) {
   const [msg, setMsg] = useState("");
   const [confirm, setConfirm] = useState(false);
   const doExport = () => { download(`svype-backup-${today()}.json`, JSON.stringify({ db:data, brand })); setMsg("Backup downloaded."); };
-  const doImport = (file) => { if(!file) return; const r=new FileReader(); r.onload=()=>{ try{ const obj=JSON.parse(r.result); restore(obj.db, obj.brand); setMsg("Backup restored successfully."); }catch{ setMsg("That file couldn't be read — make sure it's a Svype backup."); } }; r.readAsText(file); };
+  const doImport = async (file) => {
+    if (!file) return;
+    try {
+      // Nightly backups arrive gzipped when they are large — read those too.
+      const text = /\.gz$/i.test(file.name)
+        ? await new Response(file.stream().pipeThrough(new DecompressionStream("gzip"))).text()
+        : await file.text();
+      const obj = JSON.parse(text);
+      if (!obj || !obj.db) throw new Error("shape");
+      restore(obj.db, obj.brand);
+      setMsg("Backup restored successfully.");
+    } catch { setMsg("That file could not be read as a Svype OS backup."); }
+  };
   return (<>
-    <div className="mb-5"><StorageCard/></div>
+    <div className="mb-5 grid lg:grid-cols-2 gap-5"><StorageCard/><NightlyBackupCard data={data} patch={patch}/></div>
     <Head title="Backup & Data" sub="Your data lives in this browser — download a backup regularly, or restore from one"/>
     <div className="grid sm:grid-cols-2 gap-5">
       <Card><div className="p-5"><div className="font-semibold text-sm mb-1">Download backup</div><p className="text-sm text-slate-500 mb-4">Saves all your data (employees, clients, finance, documents, settings) to a single file you can keep safe.</p><Btn onClick={doExport}><Download size={15}/>Download backup file</Btn></div></Card>
