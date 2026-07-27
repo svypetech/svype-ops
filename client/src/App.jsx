@@ -3,7 +3,7 @@ import {
   LayoutDashboard, Users, CalendarCheck, Wallet, UserPlus, FolderOpen,
   FileText, ArrowDownCircle, ArrowUpCircle, ScrollText, Plus, Trash2,
   Edit3, X, Check, LogOut, Search, Download, Building2, Loader2, Settings,
-  Upload, PenTool, Stamp, ChevronLeft, FileSignature, Receipt, Paperclip,
+  Upload, PenTool, Stamp, ChevronLeft, FileSignature, Receipt, Briefcase, Paperclip,
   Repeat, Send, Landmark, Menu, Megaphone, Inbox, UserCircle, Clock, MapPin, CalendarClock, Lock, Eye, EyeOff, Copy,
   Contact, History, Database, HandCoins, Bell, Mail, MessageSquare, Hash
 } from "lucide-react";
@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · receipt-fix-v1";
+const APP_BUILD = "Build 27 Jul 2026 · freelance-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -345,6 +345,7 @@ const SEED = {
   vaultMeta: null,
   todos: [],
   wfhRequests: [],
+  gigs: [],
 };
 const OFFICE_ADDRESSES = [
   { city: "Islamabad", address: "Floor 1, Nova, Business Square, Gulberg Greens, Islamabad." },
@@ -449,6 +450,7 @@ function adminNotes(data) {
   (data.attendance||[]).filter(a=>a.timeReq && a.timeReq.status==="Pending").forEach(a=>out.push({ text:`${a.employee}: check-in time correction for ${a.date} awaiting approval`, tab:"requests" }));
   (data.attendance||[]).filter(a=>a.outReq && a.outReq.status==="Pending").forEach(a=>out.push({ text:`${a.employee}: check-out time correction for ${a.date} awaiting approval`, tab:"requests" }));
   (data.wfhRequests||[]).filter(w=>w.status==="Pending").forEach(w=>out.push({ text:`${w.employee}: work from home on ${w.date} awaiting approval`, tab:"requests" }));
+  (data.payables||[]).filter(p=>p.kind==="reimbursement" && p.status==="Pending" && (p.appeals||[]).length>0).forEach(p=>out.push({ text:`${p.vendor} appealed a rejected claim: ${p.desc.replace("Reimbursement: ","")}`, tab:"payables" }));
   data.requests.filter(r=>r.status!=="Done").forEach(r=>out.push({ text:`${r.employee}: ${r.type}`, tab:"requests" }));
   data.employees.forEach(e=>(e.docs||[]).forEach(d=>{ if(d.expiry){ const dd=daysUntil(d.expiry); if(dd<=30) out.push({ text:`${e.name}: ${d.name} ${dd<0?"expired":"expires in "+dd+"d"}`, tab:"employees" }); }}));
   return out;
@@ -459,6 +461,7 @@ function empNotes(data, me) {
   (data.attendance||[]).filter(a=>a.employee===me.name && a.timeReq && a.timeReq.status!=="Pending").slice(-3).forEach(a=>out.push({ text:`Your check-in correction for ${a.date} was ${a.timeReq.status==="Approved"?"approved ✓":"declined — the recorded time stands"}`, tab:"attendance" }));
   (data.attendance||[]).filter(a=>a.employee===me.name && a.outReq && a.outReq.status!=="Pending").slice(-3).forEach(a=>out.push({ text:`Your check-out correction for ${a.date} was ${a.outReq.status==="Approved"?"approved ✓":"declined — the recorded time stands"}`, tab:"attendance" }));
   (data.wfhRequests||[]).filter(w=>w.employee===me.name && w.status!=="Pending").slice(-3).forEach(w=>out.push({ text:`Your work-from-home request for ${w.date} was ${w.status==="Approved"?"approved ✓":"declined"}`, tab:"attendance" }));
+  (data.payables||[]).filter(p=>p.kind==="reimbursement" && p.vendor===me.name && p.status==="Rejected").slice(-3).forEach(p=>out.push({ text:`Your claim "${p.desc.replace("Reimbursement: ","")}" was rejected${p.finalRejected?" (final)":" — you can appeal"}`, tab:"expenses" }));
   [...data.leaves].filter(l=>l.employee===me.name && l.status!=="Pending").sort((a,b)=>(b.decidedOn||"").localeCompare(a.decidedOn||"")).slice(0,5).forEach(l=>out.push({ text:`Your ${l.type||""} leave (${l.from} → ${l.to}) was ${l.status==="Approved"?"approved ✓":"declined"}`, tab:"attendance" }));
   data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===me.name && p.status!=="Pending").slice(0,5).forEach(p=>out.push({ text:`Expense claim: ${p.status}`, tab:"expenses" }));
   return out;
@@ -484,6 +487,7 @@ const NAV = [
   { id:"clients", label:"Clients", icon:Contact },
   { id:"attendance", label:"Attendance & Leave", icon:CalendarCheck },
   { id:"todos", label:"Team To-dos", icon:CalendarCheck },
+  { id:"gigs", label:"Freelance Projects", icon:Briefcase },
   { id:"payroll", label:"Payroll & Slips", icon:Wallet },
   { id:"advances", label:"Advances & Loans", icon:HandCoins },
   { id:"vendorbills", label:"Vendor Bills", icon:Receipt },
@@ -512,7 +516,7 @@ const NAV = [
 // Grouped navigation: each top-level section opens to a page with sub-tabs.
 const NAV_GROUPS = [
   { id:"dash", label:"Dashboard", icon:LayoutDashboard, tabs:["dash"] },
-  { id:"people", label:"People", icon:Users, tabs:["employees","attendance","todos","payroll","advances","recruit","cvbank"] },
+  { id:"people", label:"People", icon:Users, tabs:["employees","attendance","todos","payroll","gigs","advances","recruit","cvbank"] },
   { id:"sales", label:"Clients & Sales", icon:Contact, tabs:["clients","proposals","quotations","retainers","invoices","receipts"] },
   { id:"finance", label:"Finance", icon:Wallet, tabs:["payables","receivables","vendorbills","accounts"] },
   { id:"documents", label:"Documents", icon:FileSignature, tabs:["offers","letters","meetings"] },
@@ -522,7 +526,7 @@ const NAV_GROUPS = [
 // Friendly labels for sub-tabs (override the long sidebar labels inside a section)
 const TAB_LABELS = {
   dash:"Dashboard", chat:"Team Chat", email:"Email (sending)",
-  employees:"Employees", attendance:"Attendance & Leave", todos:"Team To-dos", payroll:"Payroll & Slips", advances:"Advances & Loans", recruit:"Recruitment", cvbank:"CV Bank",
+  employees:"Employees", attendance:"Attendance & Leave", todos:"Team To-dos", gigs:"Freelance Projects", payroll:"Payroll & Slips", advances:"Advances & Loans", recruit:"Recruitment", cvbank:"CV Bank",
   clients:"Clients", proposals:"Proposals", quotations:"Quotations", retainers:"Retainers", invoices:"Invoices", receipts:"Receipts",
   payables:"Payables", receivables:"Receivables", vendorbills:"Vendor Bills", accounts:"Bank Accounts",
   offers:"Offer Letters", letters:"Letters & Certificates", meetings:"Meeting Notes",
@@ -535,6 +539,7 @@ const EMP_NAV = [
   { id:"profile", label:"My Profile", icon:UserCircle },
   { id:"attendance", label:"Attendance & Leave", icon:CalendarCheck },
   { id:"todos", label:"My To-dos", icon:CalendarCheck },
+  { id:"gigs", label:"My Projects", icon:Briefcase },
   { id:"payslips", label:"Payslips", icon:Wallet },
   { id:"timesheet", label:"Daily Work Log", icon:Clock },
   { id:"meetings", label:"Meeting Notes", icon:FileText },
@@ -696,7 +701,7 @@ export default function App() {
     return perms[id] !== false;
   };
   // Employee uses the flat nav; admin uses grouped nav.
-  const canSeeEmp = (n) => true;
+  const canSeeEmp = (n) => n.id !== "gigs" || (me && me.payType === "Freelance");
   const empVisible = EMP_NAV.filter(canSeeEmp);
   // For admins, filter groups to those with at least one visible tab.
   const groups = NAV_GROUPS
@@ -771,6 +776,7 @@ export default function App() {
             {active==="profile" && <EmpProfile {...props}/>}
             {active==="attendance" && <EmpAttendance {...props}/>}
             {active==="todos" && <MyTodos {...props}/>}
+            {active==="gigs" && <MyProjects {...props}/>}
             {active==="payslips" && <EmpPayslips {...props}/>}
             {active==="timesheet" && <EmpTimesheet {...props}/>}
             {active==="meetings" && <EmpMeetings {...props}/>}
@@ -778,6 +784,7 @@ export default function App() {
           </>)) : (<>
             {active==="dash" && <Dashboard {...props}/>}
             {active==="todos" && <TeamTodos {...props}/>}
+            {active==="gigs" && <Gigs {...props}/>}
             {active==="chat" && <TeamChat session={session}/>}
             {active==="employees" && <Employees {...props}/>}
             {active==="users" && <UsersAccess {...props}/>}
@@ -1552,8 +1559,22 @@ function EmpTimesheet({ data, update, me }) {
       <Card><Table cols={["Date","Client","Work","Status",""]}>{mine.length===0?<tr><td colSpan={5}><Empty msg="No work logged yet"/></td></tr>:mine.map(t=>(<Row key={t.id}><Td className="text-slate-500 whitespace-nowrap">{t.date}</Td><Td className="font-medium">{t.client}</Td><Td className="text-slate-600">{t.work||t.note}{t.hours?<span className="text-slate-400 text-xs"> · {t.hours}h</span>:null}</Td><Td><Pill s={t.status==="Completed"?"Done":t.status||"Done"}/></Td><Td><RowActions onEdit={()=>editRow(t)}/></Td></Row>))}</Table></Card>
     </div></>);
 }
-function EmpExpenses({ data, update, me }) {
+function EmpExpenses({ data, update, mutateData, me }) {
   const [f, setF] = useState({ desc:"", amount:"", receipt:null });
+  const [ap, setAp] = useState(null); const [apErr, setApErr] = useState(""); const [apBusy, setApBusy] = useState(false);
+  const sendAppeal = async () => {
+    if (!ap.reason.trim()) { setApErr("Please explain why it should be reconsidered."); return; }
+    setApBusy(true); setApErr("");
+    try {
+      await mutateData((cur)=>({ ...cur, payables:(cur.payables||[]).map(x=>x.id!==ap.id ? x : {
+        ...x, status:"Pending",                       // back to HR for one more look
+        appealCount:(+x.appealCount||0)+1,
+        appeals:[...(x.appeals||[]), { reason:ap.reason.trim(), on:today() }],
+      }) }), `${me.name} appealed a rejected claim: ${ap.desc}`);
+      setAp(null);
+    } catch { setApErr("Couldn't reach the server — please try again."); }
+    setApBusy(false);
+  };
   const [err, setErr] = useState("");
   const mine = data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===me.name);
   const onReceipt = async (file) => {
@@ -1586,7 +1607,28 @@ function EmpExpenses({ data, update, me }) {
         {err && <div className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{err}</div>}
         <Btn onClick={submit}><Check size={15}/>Submit claim</Btn>
       </div></Card>
-      <Card><Table cols={["Description","Amount","Status"]}>{mine.length===0?<tr><td colSpan={3}><Empty msg="No claims submitted"/></td></tr>:mine.map(p=>(<Row key={p.id}><Td className="font-medium"><div className="flex items-center gap-2">{(p.receipt||p.receiptFileId)&&<button onClick={()=>openStored(fileRef(p,"receipt"), p.receiptName||"receipt")} title="Open receipt" className="w-8 h-8 rounded border border-slate-200 grid place-items-center overflow-hidden hover:ring-2 hover:ring-sky-400"><StoredImg d={fileRef(p,"receipt")} className="w-8 h-8 object-cover"/></button>}{p.desc.replace("Reimbursement: ","")}</div></Td><Td>{fmt(p.amount)}</Td><Td><Pill s={p.status}/></Td></Row>))}</Table></Card>
+      <Card><Table cols={["Description","Amount","Status",""]}>{mine.length===0?<tr><td colSpan={4}><Empty msg="No claims submitted"/></td></tr>:mine.map(p=>{
+        const rejected = p.status==="Rejected";
+        const canAppeal = rejected && !p.finalRejected && (+p.appealCount||0)===0;
+        const lastRej = (p.rejections||[])[(p.rejections||[]).length-1];
+        return (<Row key={p.id}>
+          <Td className="font-medium"><div className="flex items-center gap-2">{(p.receipt||p.receiptFileId)&&<button onClick={()=>openStored(fileRef(p,"receipt"), p.receiptName||"receipt")} title="Open receipt" className="w-8 h-8 rounded border border-slate-200 grid place-items-center overflow-hidden hover:ring-2 hover:ring-sky-400"><StoredImg d={fileRef(p,"receipt")} className="w-8 h-8 object-cover"/></button>}{p.desc.replace("Reimbursement: ","")}</div>
+            {lastRej && <div className="text-xs text-rose-600 mt-1">HR: {lastRej.reason}</div>}
+            {(p.appeals||[]).length>0 && <div className="text-xs text-amber-600 mt-0.5">Your appeal: {p.appeals[p.appeals.length-1].reason}</div>}
+          </Td>
+          <Td>{fmt(p.amount)}</Td>
+          <Td><Pill s={p.status}/>{p.finalRejected && <div className="text-xs text-slate-400 mt-0.5">final</div>}{(p.appeals||[]).length>0 && p.status==="Pending" && <div className="text-xs text-amber-600 mt-0.5">under review</div>}</Td>
+          <Td>{canAppeal
+            ? <button onClick={()=>{setAp({ id:p.id, desc:p.desc.replace("Reimbursement: ",""), amount:p.amount, reason:"" });setApErr("");}} className="text-xs text-sky-600 hover:underline whitespace-nowrap">Appeal</button>
+            : p.finalRejected ? <span className="text-xs text-slate-400 whitespace-nowrap">closed</span> : <span className="text-xs text-slate-300">—</span>}</Td>
+        </Row>);})}</Table></Card>
+      {ap && <Modal title="Appeal this decision" onClose={()=>{setAp(null);setApErr("");}}>
+        <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm flex justify-between"><span className="text-slate-500">{ap.desc}</span><b>{fmt(ap.amount)}</b></div>
+        <p className="text-xs text-slate-500">Explain why you think this claim should be reimbursed. HR will look at it once more — if it is rejected again, the decision is final.</p>
+        <Area label="Your explanation" value={ap.reason} onChange={e=>{setAp({...ap,reason:e.target.value});setApErr("");}}/>
+        {apErr && <div className="text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{apErr}</div>}
+        <Btn onClick={sendAppeal} disabled={apBusy}>{apBusy?<Loader2 size={15} className="animate-spin"/>:<Check size={15}/>}{apBusy?"Sending…":"Send appeal to HR"}</Btn>
+      </Modal>}
     </div></>);
 }
 
@@ -2173,6 +2215,8 @@ function Clients({ data, update, patch }) {
       <div className="grid grid-cols-2 gap-3"><Field label="Email" value={edit.email} onChange={e=>setEdit({...edit,email:e.target.value})}/><Field label="WhatsApp" value={edit.whatsapp} onChange={e=>setEdit({...edit,whatsapp:e.target.value})} placeholder="9230..."/></div>
       <div className="grid grid-cols-2 gap-3"><Select label="Default currency" options={CURRENCIES} value={edit.currency} onChange={e=>setEdit({...edit,currency:e.target.value})}/><Field label="Monthly retainer (optional)" type="number" value={edit.retainer} onChange={e=>setEdit({...edit,retainer:e.target.value})} placeholder="leave blank if none"/></div>
       <Select label="Status" options={["Active","Inactive"]} value={edit.status||"Active"} onChange={e=>setEdit({...edit,status:e.target.value})}/>
+      <Select label="Pay type" options={["Salaried (monthly)","Freelance (paid per project)"]} value={edit.payType==="Freelance"?"Freelance (paid per project)":"Salaried (monthly)"} onChange={e=>setEdit({...edit,payType:e.target.value.startsWith("Freelance")?"Freelance":"Salaried"})}/>
+      {edit.payType==="Freelance" && <p className="text-xs text-slate-500 bg-sky-50 border border-sky-200 rounded-lg px-3 py-2 -mt-1">Freelancers are left out of monthly payroll. They are paid per project under People → Freelance Projects, and the salary field above is ignored.</p>}
       <Select label="Employment" options={["Working normally","On notice period"]} value={edit.onNotice?"On notice period":"Working normally"} onChange={e=>setEdit({...edit,onNotice:e.target.value==="On notice period"})}/>
       {edit.onNotice && <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-3">
         <div className="grid grid-cols-2 gap-3">
@@ -2446,7 +2490,7 @@ function Employees({ data, update, mutateData }) {
     {noEmail>0 && <div className="mb-3 text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">{noEmail} active employee(s) have no email address — their salary slips can't be emailed until you add one.</div>}
     <BatchBar count={be.count} noun="employee" onClear={be.clear} onDelete={()=>{ const ids=new Set(be.selected); mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(x=>!ids.has(x.id)) }), `Removed ${ids.size} employee(s)`); be.clear(); }}/>
     <Card><Table cols={[<SelBox key="a" on={be.allOn} onChange={be.toggleAll} title="Select all"/>,"Name","Role","Email","Account / IBAN","Salary","Status",""]}>{filtered.length===0?<tr><td colSpan={8}><Empty msg="No employees"/></td></tr>:filtered.map(e=>(
-      <Row key={e.id} onClick={()=>setOpen(e.id)}><SelTd on={be.has(e.id)} onChange={()=>be.toggle(e.id)}/><Td><div className="font-medium">{e.name}</div>{e.onNotice&&<div className="text-xs text-amber-600 mt-0.5">On notice{e.lastWorkingDay?` · last day ${e.lastWorkingDay}`:""}</div>}</Td><Td className="text-slate-500">{e.role}</Td><Td className="text-xs">{e.email?<span className="text-slate-600">{e.email}</span>:<button onClick={(ev)=>{ev.stopPropagation();setEdit(e);}} className="text-amber-600 hover:underline">add email</button>}</Td><Td className="text-slate-500">{e.account||"—"}</Td><Td className="text-slate-500">{fmt(e.salary)}</Td><Td><Pill s={e.status}/></Td><Td><RowActions onEdit={()=>setEdit(e)} onDelete={()=>mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(r=>r.id!==e.id) }), `Removed employee ${e.name}`)}/></Td></Row>))}</Table></Card>
+      <Row key={e.id} onClick={()=>setOpen(e.id)}><SelTd on={be.has(e.id)} onChange={()=>be.toggle(e.id)}/><Td><div className="font-medium">{e.name}</div>{e.payType==="Freelance"&&<span className="text-xs px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700 mr-1">Freelance</span>}{e.onNotice&&<span className="text-xs text-amber-600 mt-0.5">On notice{e.lastWorkingDay?` · last day ${e.lastWorkingDay}`:""}</span>}</Td><Td className="text-slate-500">{e.role}</Td><Td className="text-xs">{e.email?<span className="text-slate-600">{e.email}</span>:<button onClick={(ev)=>{ev.stopPropagation();setEdit(e);}} className="text-amber-600 hover:underline">add email</button>}</Td><Td className="text-slate-500">{e.account||"—"}</Td><Td className="text-slate-500">{fmt(e.salary)}</Td><Td><Pill s={e.status}/></Td><Td><RowActions onEdit={()=>setEdit(e)} onDelete={()=>mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(r=>r.id!==e.id) }), `Removed employee ${e.name}`)}/></Td></Row>))}</Table></Card>
     {edit && <EmployeeForm edit={edit} setEdit={setEdit} save={save}/>}
   </>);
 }
@@ -2567,6 +2611,115 @@ function Attendance({ data, update, mutateData }) {
   </>);
 }
 
+// ===== Freelance projects =====
+// Freelancers earn per delivered project, never a monthly salary. A project moves
+// In progress -> Delivered -> Approved -> Paid, and only approved work is money owed.
+const GIG_FLOW = ["In progress", "Delivered", "Approved", "Paid"];
+function Gigs({ data, update, brand }) {
+  const rows = data.gigs || [];
+  const freelancers = (data.employees||[]).filter(e=>e.payType==="Freelance" && e.status==="Active");
+  const [edit, setEdit] = useState(null);
+  const [pay, setPay] = useState(null);
+  const [who, setWho] = useState("");
+  const [st, setSt] = useState("open");
+  const blank = () => ({ employee: freelancers[0]?.name || "", client:"", title:"", amount:"", currency:"PKR", startedOn:today(), dueOn:"", status:"In progress", note:"" });
+  const save = (g) => {
+    if (!g.employee) { alert("Choose which freelancer this project is for."); return; }
+    if (!g.title.trim()) { alert("Give the project a title."); return; }
+    if (!+g.amount) { alert("Enter the agreed amount."); return; }
+    update("gigs", g.id ? rows.map(x=>x.id===g.id?g:x) : [{ ...g, id:uid() }, ...rows],
+      g.id ? `Updated project: ${g.title}` : `Added project for ${g.employee}: ${g.title}`);
+    setEdit(null);
+  };
+  const setStatus = (g, status) => update("gigs", rows.map(x=>x.id===g.id?{ ...x, status, ...(status==="Approved"?{approvedOn:today()}:{}) }:x), `${g.title} → ${status}`);
+  const confirmPay = () => {
+    update("gigs", rows.map(x=>x.id===pay.id?{ ...x, status:"Paid", paidOn:pay.date, payMethod:pay.method, proof:pay.proof||null }:x), `Paid ${pay.employee} for ${pay.title}`);
+    setPay(null);
+  };
+  const filtered = rows.filter(g=>(!who||g.employee===who) && (st==="all" ? true : st==="open" ? g.status!=="Paid" : g.status==="Paid"));
+  const owed = rows.filter(g=>g.status==="Approved").reduce((t,g)=>t + (+g.amount||0), 0);
+  const inFlight = rows.filter(g=>g.status==="In progress"||g.status==="Delivered").reduce((t,g)=>t + (+g.amount||0), 0);
+  const paidThisMonth = rows.filter(g=>g.status==="Paid" && (g.paidOn||"").startsWith(monthKey())).reduce((t,g)=>t + (+g.amount||0), 0);
+  const pill = (s2)=> s2==="Paid"?"bg-emerald-100 text-emerald-700":s2==="Approved"?"bg-sky-100 text-sky-700":s2==="Delivered"?"bg-amber-100 text-amber-700":"bg-slate-100 text-slate-600";
+  return (<>
+    <Head title="Freelance Projects" sub="Per-project work — freelancers are paid for approved projects, not a monthly salary"
+      action={<Btn onClick={()=>setEdit(blank())} disabled={!freelancers.length}><Plus size={15}/>Add project</Btn>}/>
+    {!freelancers.length && <div className="mb-4 text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-4 py-3">No freelancers yet. Open People → Employees, add the person, and set their <b>Pay type</b> to “Freelance (paid per project)”.</div>}
+    <div className="grid grid-cols-2 lg:grid-cols-3 gap-4 mb-5">
+      {[["Approved, awaiting payment", fmt(owed), "text-sky-700"],["Work in progress", fmt(inFlight), "text-slate-700"],[`Paid in ${monthLabel().split(" ")[0]}`, fmt(paidThisMonth), "text-emerald-700"]].map(([k,v,c])=>(
+        <Card key={k}><div className="p-4"><div className={`text-xl font-bold ${c}`}>{v}</div><div className="text-xs text-slate-500 mt-0.5">{k}</div></div></Card>))}
+    </div>
+    <div className="flex flex-wrap gap-2 mb-4 items-end">
+      <div className="min-w-44"><Select label="Freelancer" options={["", ...freelancers.map(f=>f.name)]} value={who} onChange={e=>setWho(e.target.value)}/></div>
+      {[["open","Open"],["paid","Paid"],["all","All"]].map(([k,l])=><Btn key={k} variant={st===k?"primary":"ghost"} onClick={()=>setSt(k)}>{l}</Btn>)}
+    </div>
+    <Card><Table cols={["Freelancer","Project","Client","Agreed","Dates","Status",""]}>{filtered.length===0?<tr><td colSpan={7}><Empty msg="No projects here yet"/></td></tr>:filtered.map(g=>(
+      <Row key={g.id}>
+        <Td className="font-medium">{g.employee}</Td>
+        <Td>{g.title}{g.note&&<div className="text-xs text-slate-400 max-w-[220px] truncate">{g.note}</div>}</Td>
+        <Td className="text-slate-500">{g.client||"—"}</Td>
+        <Td className="font-medium">{fmt(g.amount, g.currency)}</Td>
+        <Td className="text-xs text-slate-500 whitespace-nowrap">{g.startedOn||"—"}{g.dueOn?` → ${g.dueOn}`:""}{g.paidOn&&<div className="text-emerald-600">paid {g.paidOn}</div>}</Td>
+        <Td><span className={`text-xs px-2 py-0.5 rounded-full ${pill(g.status)}`}>{g.status}</span></Td>
+        <Td><div className="flex items-center gap-1 justify-end">
+          {g.status==="In progress" && <button onClick={()=>setStatus(g,"Delivered")} className="text-xs text-sky-600 hover:underline whitespace-nowrap">Mark delivered</button>}
+          {g.status==="Delivered" && <button onClick={()=>setStatus(g,"Approved")} className="text-xs text-emerald-600 hover:underline whitespace-nowrap">Approve</button>}
+          {g.status==="Approved" && <button onClick={()=>setPay({ id:g.id, employee:g.employee, title:g.title, amount:g.amount, currency:g.currency, method:"Bank transfer", date:today(), proof:null })} className="text-xs font-medium text-emerald-700 hover:underline whitespace-nowrap">Mark paid</button>}
+          <RowActions onEdit={()=>setEdit(g)} onDelete={()=>update("gigs", rows.filter(x=>x.id!==g.id), `Deleted project ${g.title}`)}/>
+        </div></Td>
+      </Row>))}</Table></Card>
+    {edit && <Modal title={edit.id?"Edit project":"Add project"} onClose={()=>setEdit(null)}>
+      <Select label="Freelancer" options={freelancers.map(f=>f.name)} value={edit.employee} onChange={e=>setEdit({...edit,employee:e.target.value})}/>
+      <Field label="Project title" value={edit.title} onChange={e=>setEdit({...edit,title:e.target.value})}/>
+      <ClientInput data={data} value={edit.client} onChange={v=>setEdit({...edit,client:v})}/>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Agreed amount" type="number" value={edit.amount} onChange={e=>setEdit({...edit,amount:e.target.value})}/>
+        <Select label="Currency" options={CURRENCIES} value={edit.currency} onChange={e=>setEdit({...edit,currency:e.target.value})}/>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Started" type="date" value={edit.startedOn} onChange={e=>setEdit({...edit,startedOn:e.target.value})}/>
+        <Field label="Due" type="date" value={edit.dueOn} onChange={e=>setEdit({...edit,dueOn:e.target.value})}/>
+      </div>
+      <Area label="Scope / notes" value={edit.note} onChange={e=>setEdit({...edit,note:e.target.value})}/>
+      {edit.id && <Select label="Status" options={GIG_FLOW} value={edit.status} onChange={e=>setEdit({...edit,status:e.target.value})}/>}
+      <Btn onClick={()=>save(edit)}><Check size={15}/>Save project</Btn>
+    </Modal>}
+    {pay && <Modal title={`Pay ${pay.employee}`} onClose={()=>setPay(null)}>
+      <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm flex justify-between"><span className="text-slate-500">{pay.title}</span><b>{fmt(pay.amount, pay.currency)}</b></div>
+      <Select label="Payment method" options={["Bank transfer","Cheque","Cash","Wise / online"]} value={pay.method} onChange={e=>setPay({...pay,method:e.target.value})}/>
+      <Field label="Payment date" type="date" value={pay.date} onChange={e=>setPay({...pay,date:e.target.value})}/>
+      <div><span className="text-xs text-slate-500 mb-1 block">Payment proof (optional)</span>
+        <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500"><Paperclip size={15}/>{pay.proof?"Change screenshot":"Attach screenshot"}
+          <input type="file" accept="image/*" className="hidden" onChange={async e=>{ const f=e.target.files[0]; if(f){ const img=await readImage(f,1400,true,0.82); try { const stt=await uploadFile(img,"gig-payment.jpg"); setPay(c=>({...c, proof:{fileId:stt.fileId, mime:stt.mime}})); } catch { setPay(c=>({...c, proof:img})); } } }}/></label>
+        {pay.proof && <StoredImg d={typeof pay.proof==="string"?{img:pay.proof}:{...pay.proof}} className="mt-2 h-24 rounded-lg border border-slate-200 object-cover"/>}
+      </div>
+      <Btn onClick={confirmPay}><Check size={15}/>Record payment</Btn>
+    </Modal>}
+  </>);
+}
+function MyProjects({ data, me }) {
+  const mine = (data.gigs||[]).filter(g=>g.employee===me.name);
+  const earned = mine.filter(g=>g.status==="Paid").reduce((t,g)=>t + (+g.amount||0), 0);
+  const due = mine.filter(g=>g.status==="Approved").reduce((t,g)=>t + (+g.amount||0), 0);
+  const working = mine.filter(g=>g.status==="In progress"||g.status==="Delivered").reduce((t,g)=>t + (+g.amount||0), 0);
+  const pill = (s2)=> s2==="Paid"?"bg-emerald-100 text-emerald-700":s2==="Approved"?"bg-sky-100 text-sky-700":s2==="Delivered"?"bg-amber-100 text-amber-700":"bg-slate-100 text-slate-600";
+  return (<>
+    <Head title="My Projects" sub="You are paid per project — here is where each one stands"/>
+    <div className="grid grid-cols-3 gap-4 mb-5">
+      {[["Paid to me", fmt(earned), "text-emerald-700"],["Approved, awaiting payment", fmt(due), "text-sky-700"],["In progress", fmt(working), "text-slate-700"]].map(([k,v,c])=>(
+        <Card key={k}><div className="p-4"><div className={`text-lg sm:text-xl font-bold ${c}`}>{v}</div><div className="text-xs text-slate-500 mt-0.5">{k}</div></div></Card>))}
+    </div>
+    <Card><Table cols={["Project","Client","Amount","Dates","Status"]}>{mine.length===0?<tr><td colSpan={5}><Empty msg="No projects assigned yet"/></td></tr>:mine.map(g=>(
+      <Row key={g.id}>
+        <Td className="font-medium">{g.title}{g.note&&<div className="text-xs text-slate-400 max-w-[240px] truncate">{g.note}</div>}</Td>
+        <Td className="text-slate-500">{g.client||"—"}</Td>
+        <Td className="font-medium">{fmt(g.amount, g.currency)}</Td>
+        <Td className="text-xs text-slate-500 whitespace-nowrap">{g.startedOn||"—"}{g.dueOn?` → ${g.dueOn}`:""}{g.paidOn&&<div className="text-emerald-600">paid {g.paidOn}{g.payMethod?` · ${g.payMethod}`:""}</div>}</Td>
+        <Td><span className={`text-xs px-2 py-0.5 rounded-full ${pill(g.status)}`}>{g.status}</span></Td>
+      </Row>))}</Table></Card>
+    <p className="text-xs text-slate-400 mt-3">Payment is released once HR approves a delivered project.</p>
+  </>);
+}
 function Payroll({ data, patch, update, brand }) {
   const [slip, setSlip] = useState(null);
   const [payProof, setPayProof] = useState(null);
@@ -2594,7 +2747,7 @@ function Payroll({ data, patch, update, brand }) {
   const askRun = () => {
     const already = data.payroll.filter(p=>p.month===month).map(p=>p.employee);
     const doneSet = new Set(already);
-    const targets = data.employees.filter(e=>e.status==="Active" && !doneSet.has(e.name));
+    const targets = data.employees.filter(e=>e.status==="Active" && e.payType!=="Freelance" && !doneSet.has(e.name));   // freelancers are paid per project
     setRunAsk({ already, targets });
   };
   const doRun = ()=>{
@@ -2670,7 +2823,7 @@ function Payroll({ data, patch, update, brand }) {
             {runAsk.targets.map(e=>(<div key={e.id} className="flex justify-between"><span>{e.name}</span><span className="text-slate-500">{fmt(e.salary)}</span></div>))}
           </div>
           {runAsk.already.length>0 && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">Skipping {runAsk.already.length} employee(s) who already have a slip for {month}: {runAsk.already.slice(0,6).join(", ")}{runAsk.already.length>6?"…":""}</div>}
-          <p className="text-xs text-slate-400">Approved reimbursements and one advance installment are applied only to the people listed above.</p>
+          <p className="text-xs text-slate-400">Approved reimbursements and one advance installment are applied only to the people listed above. Freelancers are never included — they are paid per project.</p>
         </>}
       {runAsk.targets.length>0 && <Btn onClick={doRun}><Check size={15}/>Run payroll for {runAsk.targets.length} employee{runAsk.targets.length>1?"s":""}</Btn>}
     </Modal>}
@@ -3494,6 +3647,18 @@ function Payables({ data, update, patch, brand }) {
     }
   };
   const [appr, setAppr] = useState(null);
+  const [rej, setRej] = useState(null);
+  const openReject = (r)=> setRej({ id:r.id, vendor:r.vendor, amount:r.amount, desc:r.desc, reason:"", appealed:(+r.appealCount||0)>0 });
+  const confirmReject = ()=>{
+    if (!rej.reason.trim()) return;
+    setRows(rows.map(x=>x.id!==rej.id ? x : {
+      ...x, status:"Rejected",
+      rejections:[...(x.rejections||[]), { reason:rej.reason.trim(), on:today() }],
+      // A claim that has already been appealed is closed for good on the next rejection.
+      finalRejected: (+x.appealCount||0) > 0,
+    }), `Rejected claim: ${rej.desc} — ${rej.reason.trim()}`);
+    setRej(null);
+  };
   const months = Array.from({length:6}).map((_,i)=>{ const d=new Date(); d.setMonth(d.getMonth()+i); return d.toLocaleString("default",{month:"long",year:"numeric"}); });
   const openApprove = (r)=> setAppr({ id:r.id, vendor:r.vendor, amount:r.amount, mode:"salary", month: months[0], date: today() });
   const confirmApprove = ()=>{
@@ -3507,12 +3672,25 @@ function Payables({ data, update, patch, brand }) {
     setAppr(null);
   };
   return (<>
-    <Ledger noun="payable" title="Payables" sub={`Owed · ${fmt(rows.filter(r=>r.status!=="Paid").reduce((s,r)=>s+ +r.amount,0))} · approved vendor bills land here as unpaid until you mark them paid`} rows={rows} setRows={setRows}
+    <Ledger noun="payable" title="Payables" sub={`Owed · ${fmt(rows.filter(r=>r.status!=="Paid" && r.status!=="Rejected").reduce((s,r)=>s+ +r.amount,0))} · approved vendor bills land here as unpaid until you mark them paid`} rows={rows} setRows={setRows}
       blank={()=>({vendor:"",desc:"",amount:"",due:today(),status:"Pending"})}
       cols={["Vendor","Description","Amount","Due","Status"]}
-      render={r=>(<><Td className="font-medium">{r.vendor}</Td><Td className="text-slate-500"><div className="flex items-center gap-2">{(r.receipt||r.receiptFileId)&&<button onClick={(e)=>{e.stopPropagation();openStored(fileRef(r,"receipt"), r.receiptName||"receipt");}} title="Open receipt" className="shrink-0 w-8 h-8 rounded border border-slate-200 grid place-items-center hover:ring-2 hover:ring-sky-400 overflow-hidden"><StoredImg d={fileRef(r,"receipt")} className="w-8 h-8 object-cover"/><FileText size={13} className="text-slate-400"/></button>}{r.desc}{r.payVia==="salary"&&<span className="text-xs text-sky-600">→ {r.payMonth} salary</span>}{r.kind==="vendorbill"&&<span className="text-xs text-slate-400">vendor bill</span>}</div></Td><Td>{fmt(r.amount)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
-      extraActions={r=> r.kind==="reimbursement" && r.status!=="Approved" && r.status!=="Paid" ? <button onClick={()=>openApprove(r)} title="Approve reimbursement" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button> : (r.kind==="vendorbill" && r.status!=="Paid" ? <button onClick={()=>markVendorPaid(r)} title="Mark vendor bill as paid" className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Mark paid</button> : null)}
+      render={r=>(<><Td className="font-medium">{r.vendor}</Td><Td className="text-slate-500"><div className="flex flex-col gap-0.5"><div className="flex items-center gap-2">{(r.receipt||r.receiptFileId)&&<button onClick={(e)=>{e.stopPropagation();openStored(fileRef(r,"receipt"), r.receiptName||"receipt");}} title="Open receipt" className="shrink-0 w-8 h-8 rounded border border-slate-200 grid place-items-center hover:ring-2 hover:ring-sky-400 overflow-hidden"><StoredImg d={fileRef(r,"receipt")} className="w-8 h-8 object-cover"/><FileText size={13} className="text-slate-400"/></button>}{r.desc}{r.payVia==="salary"&&<span className="text-xs text-sky-600">→ {r.payMonth} salary</span>}{r.kind==="vendorbill"&&<span className="text-xs text-slate-400">vendor bill</span>}</div>
+        {(r.rejections||[]).length>0 && <div className="text-xs text-rose-600">Rejected: {r.rejections[r.rejections.length-1].reason}{r.finalRejected?" · final":""}</div>}
+        {(r.appeals||[]).length>0 && r.status==="Pending" && <div className="text-xs text-amber-600">Appealed: {r.appeals[r.appeals.length-1].reason}</div>}
+      </div></Td><Td>{fmt(r.amount)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
+      extraActions={r=> r.kind==="reimbursement" && r.status!=="Approved" && r.status!=="Paid" ? <>{r.status!=="Rejected" && <button onClick={()=>openApprove(r)} title="Approve reimbursement" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button>}{!r.finalRejected && <button onClick={()=>openReject(r)} title={r.status==="Rejected"?"Already rejected":"Reject this claim"} className="p-1.5 rounded text-slate-400 hover:text-rose-600 hover:bg-slate-100 disabled:opacity-30" disabled={r.status==="Rejected"}><X size={15}/></button>}</> : (r.kind==="vendorbill" && r.status!=="Paid" ? <button onClick={()=>markVendorPaid(r)} title="Mark vendor bill as paid" className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Mark paid</button> : null)}
       fields={(e,s)=>(<><Field label="Vendor" value={e.vendor} onChange={ev=>s({...e,vendor:ev.target.value})}/><Field label="Description" value={e.desc} onChange={ev=>s({...e,desc:ev.target.value})}/><Field label="Amount (PKR)" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Field label="Due" type="date" value={e.due} onChange={ev=>s({...e,due:ev.target.value})}/><Select label="Status" options={["Pending","Approved","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>
+    {rej && <Modal title={`Reject claim · ${rej.vendor}`} onClose={()=>setRej(null)}>
+      <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm flex justify-between"><span className="text-slate-500">{rej.desc}</span><b>{fmt(rej.amount)}</b></div>
+      <Area label="Reason for rejecting" value={rej.reason} onChange={e=>setRej({...rej,reason:e.target.value})}/>
+      <div className={`text-xs rounded-lg px-3 py-2 ${rej.appealed?"bg-rose-50 border border-rose-200 text-rose-700":"bg-slate-50 border border-slate-200 text-slate-600"}`}>
+        {rej.appealed
+          ? "This claim has already been appealed once. Rejecting now closes it permanently — the employee cannot appeal again."
+          : "The employee will see your reason and may appeal once with an explanation."}
+      </div>
+      <Btn onClick={confirmReject} disabled={!rej.reason.trim()}><X size={15}/>{rej.appealed?"Reject finally":"Reject claim"}</Btn>
+    </Modal>}
     {appr && <Modal title={`Approve reimbursement · ${appr.vendor}`} onClose={()=>setAppr(null)}>
       <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm flex justify-between"><span className="text-slate-500">Amount</span><b>{fmt(appr.amount)}</b></div>
       {(appr.receipt||appr.receiptFileId) && <div><span className="text-xs text-slate-500 mb-1 block">Attached receipt / invoice — tap to open full size</span>
