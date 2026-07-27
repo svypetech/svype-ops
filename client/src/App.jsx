@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · batch-approve-v1";
+const APP_BUILD = "Build 27 Jul 2026 · email-test-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -2038,13 +2038,25 @@ function UsersAccess({ data, update }) {
   </>);
 }
 
-function EmailSettings({ data, patch }) {
+function EmailSettings({ data, patch, brand }) {
   const cur = data.emailConfig || { host:"smtp.gmail.com", port:465, user:"", pass:"", from:"" };
   const [f, setF] = useState(cur);
   const [saved, setSaved] = useState(false);
+  const [testTo, setTestTo] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [result, setResult] = useState(null);
   const save = () => {
-    patch({ emailConfig: { ...f, port:+f.port || 465 } }, "Updated email sending settings");
-    setSaved(true); setTimeout(()=>setSaved(false), 3000);
+    // App passwords are displayed in four groups, so they arrive with spaces in them.
+    patch({ emailConfig: { ...f, pass:(f.pass||"").replace(/\s+/g,""), port:+f.port || 465 } }, "Updated email sending settings");
+    setSaved(true); setResult(null); setTimeout(()=>setSaved(false), 3000);
+  };
+  const sendTest = async () => {
+    setTesting(true); setResult(null);
+    try {
+      const r = await apiReq("POST", "/payslip/test", { to: testTo || f.user, brand });
+      setResult({ ok:true, text:`Sent to ${r.to} from “${r.from}”. Check the inbox — the sample PDF should be attached.` });
+    } catch (e) { setResult({ ok:false, text: e.message || "The test email couldn't be sent." }); }
+    setTesting(false);
   };
   return (<>
     <Head title="Email (sending)" sub="The mailbox the portal sends salary slips from — with the PDF attached"/>
@@ -2056,9 +2068,19 @@ function EmailSettings({ data, patch }) {
         </div>
         <Field label="Mailbox address" value={f.user} onChange={e=>setF({...f,user:e.target.value})} placeholder="accounts@svype.com"/>
         <Field label="App password" type="password" value={f.pass} onChange={e=>setF({...f,pass:e.target.value})} placeholder="16-character app password"/>
-        <Field label="Show as (optional)" value={f.from} onChange={e=>setF({...f,from:e.target.value})} placeholder="Svype Payroll &lt;accounts@svype.com&gt;"/>
+        <Field label="Sender name (optional)" value={f.from} onChange={e=>setF({...f,from:e.target.value})} placeholder="Svype Tech Limited"/>
+        <p className="text-xs text-slate-400 -mt-1">Just the name is fine — emails always go out from the mailbox above.</p>
         <Btn onClick={save}><Check size={15}/>Save email settings</Btn>
-        {saved && <div className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">Saved. Open any salary slip and use “Email with PDF attached”.</div>}
+        {saved && <div className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">Saved. Send yourself a test below before using it on the team.</div>}
+        <div className="border-t border-slate-200 pt-3 mt-1 space-y-2">
+          <div className="text-xs uppercase tracking-wider text-slate-500 font-medium">Test it</div>
+          <div className="flex flex-wrap gap-2 items-end">
+            <div className="flex-1 min-w-48"><Field label="Send a test to" value={testTo} onChange={e=>setTestTo(e.target.value)} placeholder={f.user || "your@email.com"}/></div>
+            <Btn onClick={sendTest} disabled={testing}>{testing?<Loader2 size={15} className="animate-spin"/>:<Send size={15}/>}{testing?"Sending…":"Send test email"}</Btn>
+          </div>
+          {result && <div className={`text-xs rounded-lg px-3 py-2 ${result.ok?"bg-emerald-50 border border-emerald-200 text-emerald-700":"bg-rose-50 border border-rose-200 text-rose-700"}`}>{result.text}</div>}
+          <p className="text-xs text-slate-400">The test signs in for real and attaches a sample payslip PDF — if it arrives, salary slips will send correctly.</p>
+        </div>
       </div></Card>
       <Card><div className="p-5 text-sm text-slate-600 space-y-2">
         <div className="font-semibold text-slate-900">Setting this up with Gmail</div>
