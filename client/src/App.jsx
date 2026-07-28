@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 28 Jul 2026 · reimb-link-v1";
+const APP_BUILD = "Build 28 Jul 2026 · todo-fix-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -1765,6 +1765,14 @@ function TodoCard({ data, mutateData, session, me }) {
   const open = mine.filter(x=>!x.done && x.date === t);
   const doneToday = mine.filter(x=>x.completedOn === t);
   const [text, setText] = useState("");
+  const [editId, setEditId] = useState(null);
+  const [editText, setEditText] = useState("");
+  const saveEdit = async () => {
+    const v = editText.trim();
+    if (!v) { setEditId(null); return; }
+    await mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).map(x=>x.id===editId ? { ...x, text:v } : x) }), null);
+    setEditId(null);
+  };
   const [reasons, setReasons] = useState({});
   const [rErr, setRErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1773,7 +1781,9 @@ function TodoCard({ data, mutateData, session, me }) {
     setText("");
     await mutateData((cur)=>({ ...cur, todos:[...(cur.todos||[]), { id:uid(), owner, text:v, date:t, createdOn:t, done:false, carry:0, reasons:[] }] }), null);
   };
-  const toggle = (task) => mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).map(x=>x.id===task.id ? (x.done ? { ...x, done:false, completedOn:null, date:t } : { ...x, done:true, completedOn:t }) : x) }), task.done?null:`${owner} completed: ${task.text}`);
+  const setDone = (task, done) => mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).map(x=>x.id!==task.id ? x
+    : done ? { ...x, done:true, completedOn:t } : { ...x, done:false, completedOn:null, date:t }) }),
+    done ? `${owner} completed: ${task.text}` : null);
   const del = (task) => mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).filter(x=>x.id!==task.id) }), null);
   const carryAll = async () => {
     if (overdue.some(x=>!(reasons[x.id]||"").trim())) { setRErr("Please give a reason for every task that wasn't completed."); return; }
@@ -1793,17 +1803,22 @@ function TodoCard({ data, mutateData, session, me }) {
     {open.length===0 && doneToday.length===0 && <div className="text-sm text-slate-400 py-2">No tasks yet — plan your day above.</div>}
     <div className="space-y-1">{open.map(x=>(
       <div key={x.id} className="flex items-start gap-2 py-1.5 group">
-        <button onClick={()=>toggle(x)} className="mt-0.5 w-4 h-4 rounded border border-slate-300 hover:border-sky-500 shrink-0" title="Mark completed"/>
-        <div className="flex-1 text-sm text-slate-700">{x.text}
+        <button onClick={()=>setDone(x, true)} className="mt-0.5 w-4 h-4 rounded border border-slate-300 hover:border-sky-500 shrink-0" title="Mark completed"/>
+        <div className="flex-1 text-sm text-slate-700">
+          {editId===x.id
+            ? <input autoFocus value={editText} onChange={e=>setEditText(e.target.value)} onBlur={saveEdit}
+                onKeyDown={e=>{ if(e.key==="Enter") saveEdit(); if(e.key==="Escape") setEditId(null); }} className={inputCls}/>
+            : <span onDoubleClick={()=>{setEditId(x.id);setEditText(x.text);}}>{x.text}</span>}
           {x.carry>0 && <span className="ml-2 text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">carried {x.carry}d</span>}
           {(x.reasons||[]).length>0 && <div className="text-xs text-slate-400 mt-0.5">last reason: {x.reasons[x.reasons.length-1].reason}</div>}
         </div>
-        <button onClick={()=>del(x)} className="opacity-0 group-hover:opacity-100 text-slate-300 hover:text-rose-500"><X size={14}/></button>
+        {editId!==x.id && <button onClick={()=>{setEditId(x.id);setEditText(x.text);}} title="Edit wording" className="opacity-0 group-hover:opacity-100 text-slate-300 hover:text-sky-600"><Edit3 size={14}/></button>}
+        <button onClick={()=>del(x)} title="Delete task" className="opacity-0 group-hover:opacity-100 text-slate-300 hover:text-rose-500"><X size={14}/></button>
       </div>))}
     </div>
     {doneToday.length>0 && <div className="mt-3 pt-3 border-t border-slate-100">
       <div className="text-xs uppercase tracking-wider text-slate-400 mb-1">Completed today</div>
-      {doneToday.map(x=>(<div key={x.id} className="flex items-start gap-2 py-1"><button onClick={()=>toggle(x)} className="mt-0.5 w-4 h-4 rounded bg-emerald-500 text-white grid place-items-center shrink-0" title="Undo"><Check size={11}/></button><div className="flex-1 text-sm text-slate-400 line-through">{x.text}</div></div>))}
+      {doneToday.map(x=>(<div key={x.id} className="flex items-start gap-2 py-1"><button onClick={()=>setDone(x, true)} className="mt-0.5 w-4 h-4 rounded bg-emerald-500 text-white grid place-items-center shrink-0" title="Undo"><Check size={11}/></button><div className="flex-1 text-sm text-slate-400 line-through">{x.text}</div></div>))}
     </div>}
     {overdue.length>0 && <Modal title={`${overdue.length} task(s) from earlier days not completed`} onClose={()=>{}}>
       <p className="text-xs text-slate-500">These will be moved to today's list. Per policy, please give a reason each one wasn't completed — HR and management can see these reasons.</p>
