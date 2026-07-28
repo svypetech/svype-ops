@@ -6,6 +6,14 @@ const router = express.Router();
 
 // List channels the user can see: all 'channel' kind + DMs they're a member of
 router.get("/channels", auth, async (req, res) => {
+  // Everyone shares one company-wide channel. Created on first use; the unique-name
+  // check keeps a race between two people opening the portal at once harmless.
+  try {
+    const has = await pool.query("SELECT 1 FROM channels WHERE kind='channel' AND lower(name)=lower($1)", ["general"]);
+    if (!has.rowCount) {
+      await pool.query("INSERT INTO channels (name, kind, members, created_by) VALUES ($1,'channel','[]',$2)", ["general", req.user.id]);
+    }
+  } catch {}
   const r = await pool.query("SELECT * FROM channels ORDER BY kind, lower(name)");
   const uid = req.user.id;
   const visible = r.rows.filter((c) => c.kind === "channel" || (c.members || []).includes(uid));

@@ -15,6 +15,8 @@ const state = require("./routes/state");
 const payslip = require("./routes/payslip");
 const files = require("./routes/files");
 const backup = require("./routes/backup");
+const attendanceRt = require("./routes/attendance");
+const { startAttendanceWatch } = require("./lib/attendanceWatch");
 const { startBackupSchedule } = require("./lib/backupJob");
 const ai = require("./routes/ai");
 const { crud } = require("./routes/crud");
@@ -34,6 +36,7 @@ app.use("/api/state", state);
 app.use("/api/payslip", payslip);
 app.use("/api/files", files);
 app.use("/api/backup", backup);
+app.use("/api/attendance", attendanceRt);
 app.use("/api/ai", ai);
 
 // generic CRUD modules
@@ -115,5 +118,6 @@ init()
     // slow cleanup can never delay or block start-up.
     setTimeout(() => { try { files.autoTidyOnBoot(); } catch (e) { console.error("auto-tidy skipped:", e.message); } }, 3000);
     try { startBackupSchedule(); } catch (e) { console.error("backup schedule skipped:", e.message); }
+    try { startAttendanceWatch(); } catch (e) { console.error("attendance watch skipped:", e.message); }
   }))
   .catch((e) => { console.error("DB init failed:", e); process.exit(1); });

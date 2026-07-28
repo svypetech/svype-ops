@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 28 Jul 2026 · todo-fix-v1";
+const APP_BUILD = "Build 28 Jul 2026 · drafts-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -460,6 +460,7 @@ function empNotes(data, me) {
   (data.requests||[]).filter(r=>r.employee===me.name && r.status==="Done").slice(0,3).forEach(r=>out.push({ text:`Your ${r.type} is ready — collect it from HR`, tab:"payslips" }));
   (data.attendance||[]).filter(a=>a.employee===me.name && a.timeReq && a.timeReq.status!=="Pending").slice(-3).forEach(a=>out.push({ text:`Your check-in correction for ${a.date} was ${a.timeReq.status==="Approved"?"approved ✓":"declined — the recorded time stands"}`, tab:"attendance" }));
   (data.attendance||[]).filter(a=>a.employee===me.name && a.outReq && a.outReq.status!=="Pending").slice(-3).forEach(a=>out.push({ text:`Your check-out correction for ${a.date} was ${a.outReq.status==="Approved"?"approved ✓":"declined — the recorded time stands"}`, tab:"attendance" }));
+  (data.timesheets||[]).filter(t=>t.employee===me.name && (t.replies||[]).length).slice(0,3).forEach(t=>out.push({ text:`${t.replies[t.replies.length-1].by} replied on your work update (${t.date})`, tab:"timesheets" }));
   (data.wfhRequests||[]).filter(w=>w.employee===me.name && w.status!=="Pending").slice(-3).forEach(w=>out.push({ text:`Your work-from-home request for ${w.date} was ${w.status==="Approved"?"approved ✓":"declined"}`, tab:"attendance" }));
   (data.payables||[]).filter(p=>p.kind==="reimbursement" && p.vendor===me.name && p.status==="Rejected").slice(-3).forEach(p=>out.push({ text:`Your claim "${p.desc.replace("Reimbursement: ","")}" was rejected${p.finalRejected?" (final)":" — you can appeal"}`, tab:"expenses" }));
   [...data.leaves].filter(l=>l.employee===me.name && l.status!=="Pending").sort((a,b)=>(b.decidedOn||"").localeCompare(a.decidedOn||"")).slice(0,5).forEach(l=>out.push({ text:`Your ${l.type||""} leave (${l.from} → ${l.to}) was ${l.status==="Approved"?"approved ✓":"declined"}`, tab:"attendance" }));
@@ -516,6 +517,7 @@ const NAV = [
 // Grouped navigation: each top-level section opens to a page with sub-tabs.
 const NAV_GROUPS = [
   { id:"dash", label:"Dashboard", icon:LayoutDashboard, tabs:["dash"] },
+  { id:"chat", label:"Team Chat", icon:MessageSquare, tabs:["chat"] },
   { id:"people", label:"People", icon:Users, tabs:["employees","attendance","todos","payroll","gigs","advances","recruit","cvbank"] },
   { id:"sales", label:"Clients & Sales", icon:Contact, tabs:["clients","proposals","quotations","retainers","invoices","receipts"] },
   { id:"finance", label:"Finance", icon:Wallet, tabs:["payables","receivables","vendorbills","accounts"] },
@@ -538,6 +540,7 @@ const EMP_NAV = [
   { id:"dash", label:"Home", icon:LayoutDashboard },
   { id:"profile", label:"My Profile", icon:UserCircle },
   { id:"attendance", label:"Attendance & Leave", icon:CalendarCheck },
+  { id:"chat", label:"Team Chat", icon:MessageSquare },
   { id:"todos", label:"My To-dos", icon:CalendarCheck },
   { id:"gigs", label:"My Projects", icon:Briefcase },
   { id:"payslips", label:"Payslips", icon:Wallet },
@@ -1109,10 +1112,52 @@ const Head = ({ title, sub, action }) => (<div className="flex flex-wrap items-e
 const Btn = ({ children, onClick, variant="primary", disabled=false }) => { const s={primary:"bg-sky-600 text-white hover:bg-sky-700",ghost:"bg-white border border-slate-300 text-slate-700 hover:bg-slate-100",danger:"bg-white border border-rose-300 text-rose-600 hover:bg-rose-50",ok:"bg-emerald-600 text-white hover:bg-emerald-700"}; return <button onClick={onClick} disabled={disabled} className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-medium transition ${s[variant]} ${disabled?"opacity-60 cursor-not-allowed":""}`}>{children}</button>; };
 const Card = ({ children }) => <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">{children}</div>;
 const Pill = ({ s }) => { const m={Active:"bg-emerald-100 text-emerald-700",Paid:"bg-emerald-100 text-emerald-700",Sent:"bg-sky-100 text-sky-700",Accepted:"bg-emerald-100 text-emerald-700",Done:"bg-emerald-100 text-emerald-700",Cleared:"bg-emerald-100 text-emerald-700",Pending:"bg-amber-100 text-amber-700",Unpaid:"bg-amber-100 text-amber-700",Open:"bg-amber-100 text-amber-700",Requested:"bg-amber-100 text-amber-700","Pending HR":"bg-amber-100 text-amber-700","Pending Founder":"bg-sky-100 text-sky-700",Partial:"bg-orange-100 text-orange-700",Outstanding:"bg-amber-100 text-amber-700",Overdue:"bg-rose-100 text-rose-700",Approved:"bg-emerald-100 text-emerald-700",Rejected:"bg-rose-100 text-rose-700",Draft:"bg-slate-100 text-slate-600",Inactive:"bg-slate-100 text-slate-600",Paused:"bg-slate-100 text-slate-600"}; return <span className={`px-2 py-0.5 rounded-md text-xs font-medium ${m[s]||"bg-slate-100 text-slate-600"}`}>{s}</span>; };
+// Keeps a form's contents in this browser as it is typed, so a closed tab, a crash or
+// a flat battery doesn't lose the work. Cleared the moment the form is saved.
+function useDraft(key, value, setValue, active) {
+  const [found, setFound] = useState(null);
+  const k = "svype_draft_" + key;
+  useEffect(() => {
+    if (!active) return;
+    try {
+      const raw = localStorage.getItem(k);
+      if (raw) { const d = JSON.parse(raw); if (d && d.at) setFound(d); }
+    } catch {}
+  }, [active, k]);
+  useEffect(() => {
+    if (!active || !value) return;
+    const id = setTimeout(() => {
+      try { localStorage.setItem(k, JSON.stringify({ at: new Date().toISOString(), value })); } catch {}
+    }, 600);
+    return () => clearTimeout(id);
+  }, [active, k, JSON.stringify(value || {})]);
+  const clear = () => { try { localStorage.removeItem(k); } catch {}; setFound(null); };
+  const restore = () => { if (found && found.value) setValue(found.value); setFound(null); };
+  return { found, restore, clear };
+}
+const DraftBanner = ({ draft }) => !draft.found ? null : (
+  <div className="flex flex-wrap items-center gap-2 text-xs bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+    <span className="text-amber-800 flex-1">You have an unsaved draft from {dtOf(draft.found.at)}.</span>
+    <button onClick={draft.restore} className="font-medium text-sky-700 hover:underline">Restore it</button>
+    <button onClick={draft.clear} className="text-slate-500 hover:underline">Discard</button>
+  </div>);
 function Modal({ title, onClose, children, wide }) {
-  return <div className="fixed inset-0 grid place-items-center z-50 p-4" style={{background:"rgba(15,23,42,.5)"}} onClick={onClose}>
-    <div className={`bg-white border border-slate-200 rounded-2xl w-full ${wide?"max-w-2xl":"max-w-md"} overflow-y-auto shadow-xl`} style={{maxHeight:"90vh", paddingBottom:"env(safe-area-inset-bottom)"}} onClick={e=>e.stopPropagation()}>
-      <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200"><h3 className="font-semibold text-slate-900">{title}</h3><button onClick={onClose} className="text-slate-400 hover:text-slate-700"><X size={18}/></button></div>
+  // Anything typed inside marks the form dirty, so a stray click on the backdrop (or
+  // the X) asks before throwing the work away.
+  const dirty = useRef(false);
+  const guardedClose = () => {
+    if (dirty.current && !window.confirm("Discard what you've typed? It has not been saved.")) return;
+    dirty.current = false;
+    onClose && onClose();
+  };
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") guardedClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  return <div className="fixed inset-0 grid place-items-center z-50 p-4" style={{background:"rgba(15,23,42,.5)"}} onClick={guardedClose}>
+    <div className={`bg-white border border-slate-200 rounded-2xl w-full ${wide?"max-w-2xl":"max-w-md"} overflow-y-auto shadow-xl`} style={{maxHeight:"90vh", paddingBottom:"env(safe-area-inset-bottom)"}} onClick={e=>e.stopPropagation()} onInput={()=>{dirty.current=true;}}>
+      <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200"><h3 className="font-semibold text-slate-900">{title}</h3><button onClick={guardedClose} className="text-slate-400 hover:text-slate-700"><X size={18}/></button></div>
       <div className="p-5 space-y-3">{children}</div></div></div>;
 }
 const inputCls = "w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-sky-500 focus:ring-1 focus:ring-sky-200 outline-none";
@@ -1200,6 +1245,22 @@ function LeaveBalances({ data, name }) {
 }
 
 /* ---------------- payroll calc ---------------- */
+// Late arrival policy: 30 minutes' grace, then salary is deducted per hour for the
+// time beyond it. Only HR-approved check-in times count (effIn), so a corrected
+// check-in never costs someone money.
+function lateMinutesFor(data, name, mk, startTime = "09:30", graceMin = 30) {
+  const [sh, sm] = String(startTime).split(":").map(Number);
+  return (data.attendance || [])
+    .filter(a => a.employee === name && (a.date || "").startsWith(mk) && a.status !== "Leave" && a.status !== "Requested")
+    .reduce((total, a) => {
+      const iso = effIn(a); if (!iso) return total;
+      const d = new Date(iso); if (isNaN(d)) return total;
+      const mins = d.getHours() * 60 + d.getMinutes() - (sh * 60 + sm);
+      return total + Math.max(0, mins - (+graceMin || 0));
+    }, 0);
+}
+const hhmm = (mins) => `${Math.floor(mins / 60)}h ${mins % 60}m`;
+const monthKeyOfLabel = (label) => { const d = new Date(`1 ${label}`); return isNaN(d) ? monthKey() : `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`; };
 function computePayslip(e, data, month) {
   const basic = +e.salary || 0;
   const allowances = 0; // no automatic allowance — add increases manually with a reason
@@ -1207,9 +1268,25 @@ function computePayslip(e, data, month) {
   const tax = 0;   // not auto-calculated — set manually per payslip if needed
   const eobi = 0;  // not auto-calculated
   const pf = Math.round(basic * (+e.pf||0) / 100);
+  // Unpaid leave approved for this month, charged at basic / 30 per day.
+  const mk = monthKeyOfLabel(month);
+  const unpaidDays = (data.leaves||[])
+    .filter(l=>l.employee===e.name && l.status==="Approved" && +l.unpaidDays > 0 && (l.from||"").startsWith(mk))
+    .reduce((n,l)=>n + (+l.unpaidDays||0), 0);
+  const unpaidLeaveCut = Math.round((basic / 30) * unpaidDays);
+  // Late arrivals, charged per hour beyond the grace period, when switched on.
+  const auto = data.payrollAuto || {};
+  const watch = data.attendanceWatch || {};
+  const lateMins = auto.lateDeduction ? lateMinutesFor(data, e.name, mk, watch.startTime || "09:30", +auto.graceMin || 30) : 0;
+  const lateCut = lateMins > 0 ? Math.round((basic / 30 / 8) * (lateMins / 60)) : 0;
   const advance = data.advances.filter(a=>a.employee===e.name && a.status==="Active" && a.remaining>0).reduce((s,a)=>s+Math.min(+a.installment, a.remaining),0);
   const deductions = tax + eobi + pf + advance;
-  return { id:uid(), employee:e.name, month, basic, allowances, reimbursements:reimb, tax, eobi, pf, advance, deductions, adjustments:[], paid:false, date:today() };
+  return { id:uid(), employee:e.name, month, basic, allowances, reimbursements:reimb, tax, eobi, pf, advance, deductions,
+    adjustments: [
+      ...(unpaidLeaveCut > 0 ? [{ reason:`Unpaid leave (${unpaidDays} day${unpaidDays>1?"s":""})`, amount: -unpaidLeaveCut }] : []),
+      ...(lateCut > 0 ? [{ reason:`Late arrivals (${hhmm(lateMins)} beyond grace)`, amount: -lateCut }] : []),
+    ],
+    unpaidLeaveDays: unpaidDays, lateMinutes: lateMins, paid:false, date:today() };
 }
 // Sum of manual adjustments (+ increase / - deduction)
 const adjTotal = (p) => (p.adjustments||[]).reduce((s,a)=>s + (+a.amount||0), 0);
@@ -1460,13 +1537,16 @@ function EmpAttendance({ data, update, mutateData, me }) {
     const days = dayCount(l.from, l.to);
     if (!days || days < 1) { setLerr("Pick a valid date range."); return; }
     if (l.type==="Bereavement" && days > 3) { setLerr("Bereavement leave is 3 days per qualifying event. For more time, please speak to HR."); return; }
+    // Beyond the entitlement the extra days are unpaid rather than blocked — payroll
+    // deducts them automatically once HR approves.
+    let unpaidDays = l.type === "Unpaid" ? days : 0;
     if (["Casual","Sick","Annual"].includes(l.type)) {
-      const left = leaveLeft(data, me.name, l.type);
-      if (days > left) { setLerr(`You have ${Math.max(0,left)} ${l.type.toLowerCase()} day(s) left this year — this request is ${days} day(s).`); return; }
+      const left = Math.max(0, leaveLeft(data, me.name, l.type));
+      unpaidDays = Math.max(0, days - left);
     }
     setSubmitting(true);
     try {
-      await mutateData((cur)=>({ ...cur, leaves: [...(cur.leaves||[]), { ...l, days, id:uid(), requestedOn: today() }] }), `${me.name} requested ${l.type} leave (${l.from} → ${l.to})`);
+      await mutateData((cur)=>({ ...cur, leaves: [...(cur.leaves||[]), { ...l, days, unpaidDays, id:uid(), requestedOn: today() }] }), `${me.name} requested ${l.type} leave (${l.from} → ${l.to})`);
       setLf(null); setLerr(""); setSentMsg("Leave request sent to HR — you'll be notified once it's approved or declined.");
       setTimeout(()=>setSentMsg(""), 7000);
     } catch { setLerr("Couldn't reach the server — please try again."); }
@@ -1502,6 +1582,8 @@ function EmpAttendance({ data, update, mutateData, me }) {
     {lf && <Modal title="Request leave" onClose={()=>{setLf(null);setLerr("");}}>
       <Select label="Type" options={LEAVE_TYPES} value={lf.type} onChange={e=>{setLf({...lf,type:e.target.value});setLerr("");}}/>
       <div className="grid grid-cols-2 gap-3"><Field label="From" type="date" value={lf.from} onChange={e=>{setLf({...lf,from:e.target.value});setLerr("");}}/><Field label="To" type="date" value={lf.to} onChange={e=>{setLf({...lf,to:e.target.value});setLerr("");}}/></div>
+      {(()=>{ const dd=dayCount(lf.from,lf.to)||0; const lft=["Casual","Sick","Annual"].includes(lf.type)?Math.max(0,leaveLeft(data,me.name,lf.type)):0; const up=lf.type==="Unpaid"?dd:Math.max(0,dd-lft);
+        return up>0 ? <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">{up} of these {dd} day(s) will be <b>unpaid</b> and deducted from your salary — your paid balance is used up.</div> : null; })()}
       <div className="text-xs text-slate-500">{dayCount(lf.from,lf.to)||0} day(s){["Casual","Sick","Annual"].includes(lf.type)?` · ${Math.max(0,leaveLeft(data,me.name,lf.type))} ${lf.type.toLowerCase()} left this year`:""}</div>
       {lf.type==="Sick" && dayCount(lf.from,lf.to)>2 && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">Per policy: more than 2 consecutive sick days requires a medical report to HR.</div>}
       <Area label="Reason" value={lf.reason} onChange={e=>setLf({...lf,reason:e.target.value})}/>
@@ -1542,8 +1624,8 @@ function EmpTimesheet({ data, update, me }) {
   const mine = data.timesheets.filter(t=>t.employee===me.name).slice().sort((a,b)=>b.date.localeCompare(a.date));
   const submit = () => {
     if(!f.client || !f.work) return;
-    if (editId) { update("timesheets", data.timesheets.map(t=>t.id===editId?{...t,...f,hours:+f.hours||0,edited:true}:t), `${me.name} edited a work log (${f.client})`); }
-    else { update("timesheets", [{ id:uid(), employee:me.name, ...f, hours:+f.hours||0 }, ...data.timesheets], `${me.name} logged daily work (${f.client})`); }
+    if (editId) { update("timesheets", data.timesheets.map(t=>t.id===editId?{...t,...f,hours:+f.hours||0,edited:true,editedAt:new Date().toISOString()}:t), `${me.name} edited a work log (${f.client})`); }
+    else { update("timesheets", [{ id:uid(), employee:me.name, ...f, hours:+f.hours||0, submittedAt:new Date().toISOString() }, ...data.timesheets], `${me.name} logged daily work (${f.client})`); }
     setF(blank); setEditId(null);
   };
   const editRow = (t) => { setEditId(t.id); setF({ client:t.client, date:t.date, work:t.work||t.note||"", status:t.status||"Completed", hours:t.hours||"" }); };
@@ -1556,7 +1638,7 @@ function EmpTimesheet({ data, update, me }) {
         <div className="grid grid-cols-3 gap-3"><Field label="Date" type="date" value={f.date} onChange={e=>setF({...f,date:e.target.value})}/><Select label="Status" options={["Completed","In progress","Blocked"]} value={f.status} onChange={e=>setF({...f,status:e.target.value})}/><Field label="Hours (optional)" type="number" value={f.hours} onChange={e=>setF({...f,hours:e.target.value})}/></div>
         <div className="flex gap-2"><Btn onClick={submit}><Check size={15}/>{editId?"Save update":"Log work"}</Btn>{editId && <Btn variant="ghost" onClick={()=>{setF(blank);setEditId(null);}}>Cancel</Btn>}</div>
       </div></Card>
-      <Card><Table cols={["Date","Client","Work","Status",""]}>{mine.length===0?<tr><td colSpan={5}><Empty msg="No work logged yet"/></td></tr>:mine.map(t=>(<Row key={t.id}><Td className="text-slate-500 whitespace-nowrap">{t.date}</Td><Td className="font-medium">{t.client}</Td><Td className="text-slate-600">{t.work||t.note}{t.hours?<span className="text-slate-400 text-xs"> · {t.hours}h</span>:null}</Td><Td><Pill s={t.status==="Completed"?"Done":t.status||"Done"}/></Td><Td><RowActions onEdit={()=>editRow(t)}/></Td></Row>))}</Table></Card>
+      <Card><Table cols={["Date","Client","Work","Status",""]}>{mine.length===0?<tr><td colSpan={5}><Empty msg="No work logged yet"/></td></tr>:mine.map(t=>(<Row key={t.id}><Td className="text-slate-500 whitespace-nowrap">{t.date}{t.submittedAt&&<div className="text-xs text-slate-400">sent {timeOf(t.submittedAt)}{t.edited?" · edited":""}</div>}</Td><Td className="font-medium">{t.client}</Td><Td className="text-slate-600">{t.work||t.note}{t.hours?<span className="text-slate-400 text-xs"> · {t.hours}h</span>:null}</Td><Td><Pill s={t.status==="Completed"?"Done":t.status||"Done"}/></Td><Td><RowActions onEdit={()=>editRow(t)}/></Td></Row>))}</Table></Card>
     </div></>);
 }
 function EmpExpenses({ data, update, mutateData, me }) {
@@ -2775,6 +2857,8 @@ function Payroll({ data, patch, update, brand }) {
     markSlipsPaid(bp.selected, { proof: bulkPay.proof, method: bulkPay.method });
     bp.clear(); setBulkPay(null);
   };
+  const auto = { lateDeduction:false, graceMin:30, ...(data.payrollAuto||{}) };
+  const setAuto = (next)=> patch({ payrollAuto: { ...next, graceMin:+next.graceMin||30 } }, "Updated payroll automation");
   const withAllowance = data.payroll.filter(p => +p.allowances > 0);
   const clearAllowances = () => {
     const total = withAllowance.reduce((t,p)=>t + (+p.allowances||0), 0);
@@ -2824,6 +2908,13 @@ function Payroll({ data, patch, update, brand }) {
   const empAcct = (name) => data.employees.find(e=>e.name===name)?.account || "";
   return (<>
     <Head title="Payroll & Salary Slips" sub={`${month} · base salary + your adjustments − deductions (no automatic allowance)${pendingReimb?` · ${fmt(pendingReimb)} reimbursements queued`:""}`} action={<Btn onClick={askRun}><Wallet size={15}/>Run payroll · {month}</Btn>}/>
+    <Card><div className="p-4 mb-4 flex flex-wrap items-center gap-3">
+      <div className="flex-1 min-w-56"><div className="font-semibold text-sm">Automatic deductions</div>
+        <p className="text-xs text-slate-500 mt-0.5">Unpaid leave is always deducted. Late arrivals follow your policy: {auto.graceMin} minutes' grace, then per hour on basic pay. Every figure stays editable on the slip.</p></div>
+      <label className="flex items-center gap-2 text-xs text-slate-600 cursor-pointer whitespace-nowrap">
+        <input type="checkbox" checked={!!auto.lateDeduction} onChange={e=>setAuto({...auto, lateDeduction:e.target.checked})}/>Deduct late arrivals</label>
+      <div className="w-28"><Field label="Grace (min)" type="number" value={auto.graceMin} onChange={e=>setAuto({...auto, graceMin:e.target.value})}/></div>
+    </div></Card>
     {withAllowance.length>0 && <div className="mb-3 flex flex-wrap items-center gap-3 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
       <div className="text-sm text-amber-800 flex-1">{withAllowance.length} salary slip(s) still carry an automatic 10% allowance added by an older version. New payroll runs no longer add it.</div>
       <Btn variant="ghost" onClick={clearAllowances}><X size={15}/>Remove automatic allowance</Btn>
@@ -2859,9 +2950,25 @@ function Payroll({ data, patch, update, brand }) {
       {runAsk.targets.length===0
         ? <div className="text-sm text-slate-600">Every active employee already has a salary slip for {month}. Nothing to run — this is what stops a second run from creating duplicate slips or deducting advances twice.</div>
         : <>
-          <div className="text-sm text-slate-600">This will create <b>{runAsk.targets.length}</b> salary slip{runAsk.targets.length>1?"s":""} for {month}:</div>
-          <div className="max-h-40 overflow-y-auto bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm space-y-0.5">
-            {runAsk.targets.map(e=>(<div key={e.id} className="flex justify-between"><span>{e.name}</span><span className="text-slate-500">{fmt(e.salary)}</span></div>))}
+          <div className="text-sm text-slate-600">This will create <b>{runAsk.targets.length}</b> salary slip{runAsk.targets.length>1?"s":""} for {month}. Review the figures — you can still adjust any slip afterwards.</div>
+          <div className="max-h-64 overflow-y-auto border border-slate-200 rounded-lg">
+            <table className="w-full text-xs">
+              <thead className="bg-slate-50 text-slate-500"><tr>
+                <th className="text-left px-2 py-1.5">Employee</th><th className="text-right px-2">Basic</th>
+                <th className="text-right px-2">Unpaid</th><th className="text-right px-2">Late</th>
+                <th className="text-right px-2">Deductions</th><th className="text-right px-2 py-1.5">Net</th></tr></thead>
+              <tbody>{runAsk.targets.map(e=>{ const sl=computePayslip(e,data,month); const cut=(sl.adjustments||[]).reduce((t,a)=>t+Math.abs(Math.min(0,+a.amount||0)),0)+(+sl.deductions||0);
+                return (<tr key={e.id} className="border-t border-slate-100">
+                  <td className="px-2 py-1.5">{e.name}</td>
+                  <td className="text-right px-2">{fmt(sl.basic)}</td>
+                  <td className={`text-right px-2 ${sl.unpaidLeaveDays?"text-amber-600":"text-slate-300"}`}>{sl.unpaidLeaveDays?`${sl.unpaidLeaveDays}d`:"—"}</td>
+                  <td className={`text-right px-2 ${sl.lateMinutes?"text-amber-600":"text-slate-300"}`}>{sl.lateMinutes?hhmm(sl.lateMinutes):"—"}</td>
+                  <td className={`text-right px-2 ${cut?"text-rose-600":"text-slate-300"}`}>{cut?fmt(cut):"—"}</td>
+                  <td className="text-right px-2 py-1.5 font-medium">{fmt(netPay(sl))}</td></tr>); })}</tbody>
+              <tfoot><tr className="border-t-2 border-slate-200 bg-slate-50 font-semibold">
+                <td className="px-2 py-1.5" colSpan={5}>Total payout</td>
+                <td className="text-right px-2 py-1.5">{fmt(runAsk.targets.reduce((t,e)=>t+netPay(computePayslip(e,data,month)),0))}</td></tr></tfoot>
+            </table>
           </div>
           {runAsk.already.length>0 && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">Skipping {runAsk.already.length} employee(s) who already have a slip for {month}: {runAsk.already.slice(0,6).join(", ")}{runAsk.already.length>6?"…":""}</div>}
           <p className="text-xs text-slate-400">Approved reimbursements and one advance installment are applied only to the people listed above. Freelancers are never included — they are paid per project.</p>
@@ -3076,7 +3183,22 @@ function Advances({ data, update }) {
   </>);
 }
 
-function Timesheets({ data }) {
+function Timesheets({ data, mutateData, session, me, role }) {
+  const [replyTo, setReplyTo] = useState(null);
+  const [replyText, setReplyText] = useState("");
+  const [rBusy, setRBusy] = useState(false);
+  const who = (me && me.name) || session?.name || session?.username || "HR";
+  const sendReply = async (entryId) => {
+    const v = replyText.trim(); if (!v) return;
+    setRBusy(true);
+    try {
+      await mutateData((cur)=>({ ...cur, timesheets:(cur.timesheets||[]).map(t=>t.id!==entryId ? t
+        : { ...t, replies:[...(t.replies||[]), { id:uid(), by:who, text:v, at:new Date().toISOString() }] }) }),
+        `${who} replied on a work update`);
+      setReplyText(""); setReplyTo(null);
+    } catch {}
+    setRBusy(false);
+  };
   const [openEmp, setOpenEmp] = useState(null);
   const [day, setDay] = useState(""); const [client, setClient] = useState("");
   const all = data.timesheets || [];
@@ -3095,7 +3217,18 @@ function Timesheets({ data }) {
         {(day||client) && <Btn variant="ghost" onClick={()=>{setDay("");setClient("");}}><X size={14}/>Clear filters</Btn>}
       </div>
       <Card><Table cols={["Date","Client","Work done","Hours","Status"]}>{mine.length===0?<tr><td colSpan={5}><Empty msg={day?`No work logged on ${day}`:"No work logged yet"}/></td></tr>:mine.map(t=>(
-        <Row key={t.id}><Td className="text-slate-500 whitespace-nowrap">{t.date}</Td><Td className="font-medium">{t.client||"—"}</Td><Td className="text-slate-600 text-sm max-w-[340px]">{t.work||"—"}</Td><Td>{t.hours?`${t.hours}h`:"—"}</Td><Td><Pill s={t.status||"Logged"}/></Td></Row>))}</Table></Card>
+        <Row key={t.id}><Td className="text-slate-500 whitespace-nowrap align-top">{t.date}{t.submittedAt&&<div className="text-xs text-slate-400">sent {timeOf(t.submittedAt)}{t.edited?" · edited":""}</div>}</Td>
+        <Td className="font-medium align-top">{t.client||"—"}</Td>
+        <Td className="text-slate-600 text-sm max-w-[380px] align-top">{t.work||"—"}
+          {(t.replies||[]).length>0 && <div className="mt-2 space-y-1.5 border-l-2 border-slate-200 pl-3">{t.replies.map(r=>(
+            <div key={r.id}><div className="text-xs"><b className="text-slate-700">{r.by}</b> <span className="text-slate-400">{dtOf(r.at)}</span></div><div className="text-sm text-slate-600">{r.text}</div></div>))}</div>}
+          {replyTo===t.id
+            ? <div className="mt-2 flex gap-2"><input autoFocus value={replyText} onChange={e=>setReplyText(e.target.value)} onKeyDown={e=>e.key==="Enter"&&sendReply(t.id)} placeholder="Write a reply…" className={inputCls+" flex-1"}/>
+                <Btn onClick={()=>sendReply(t.id)} disabled={rBusy}>{rBusy?<Loader2 size={14} className="animate-spin"/>:<Send size={14}/>}Reply</Btn>
+                <Btn variant="ghost" onClick={()=>{setReplyTo(null);setReplyText("");}}>Cancel</Btn></div>
+            : <button onClick={()=>{setReplyTo(t.id);setReplyText("");}} className="mt-2 text-xs text-sky-600 hover:underline">{(t.replies||[]).length?"Reply":"Reply to this update"}</button>}
+        </Td>
+        <Td className="align-top">{t.hours?`${t.hours}h`:"—"}</Td><Td className="align-top"><Pill s={t.status||"Logged"}/></Td></Row>))}</Table></Card>
     </>);
   }
   const todayCount = all.filter(t=>t.date===today()).length;
@@ -4090,6 +4223,46 @@ function Vault({ data, patch }) {
   </>);
 }
 
+function AttendanceWatchCard({ data, patch }) {
+  const cfg = { enabled:false, startTime:"09:30", graceMin:30, endTime:"18:00", outGraceMin:60, hrEmail:"", remindEmployee:true, ...(data.attendanceWatch||{}) };
+  const [f, setF] = useState(cfg);
+  const [st, setSt] = useState(null);
+  const [busy, setBusy] = useState(""); const [msg, setMsg] = useState(null);
+  const load = () => apiReq("GET","/attendance/watch-status").then(setSt).catch(()=>{});
+  useEffect(() => { load(); }, []);
+  const save = (next) => { setF(next); patch({ attendanceWatch:{ ...next, graceMin:+next.graceMin||0, outGraceMin:+next.outGraceMin||0 } }, "Updated attendance reminders"); };
+  const test = async (kind) => {
+    setBusy(kind); setMsg(null);
+    try { const r = await apiReq("POST","/attendance/watch-test",{ kind }); setMsg({ ok:true, text:`Sent — ${r.pending} person(s) currently ${kind==="in"?"not checked in":"not checked out"}.` }); load(); }
+    catch (e) { setMsg({ ok:false, text:e.message || "Could not send." }); }
+    setBusy("");
+  };
+  return (<Card><div className="p-5 space-y-3">
+    <div className="flex items-start justify-between gap-3">
+      <div><div className="font-semibold text-sm">Check-in / check-out reminders</div>
+        <p className="text-xs text-slate-500 mt-0.5">HR is emailed who hasn't checked in after office start, and who is still checked in after office end.</p></div>
+      <label className="flex items-center gap-2 text-xs text-slate-600 whitespace-nowrap cursor-pointer">
+        <input type="checkbox" checked={f.enabled} onChange={e=>save({...f, enabled:e.target.checked})}/>{f.enabled?"On":"Off"}</label>
+    </div>
+    <div className="grid sm:grid-cols-2 gap-3">
+      <Field label="Office start" type="time" value={f.startTime} onChange={e=>save({...f,startTime:e.target.value})}/>
+      <Field label="Tell HR this many minutes later" type="number" value={f.graceMin} onChange={e=>setF({...f,graceMin:e.target.value})} onBlur={()=>save(f)}/>
+      <Field label="Office end" type="time" value={f.endTime} onChange={e=>save({...f,endTime:e.target.value})}/>
+      <Field label="Tell HR this many minutes later" type="number" value={f.outGraceMin} onChange={e=>setF({...f,outGraceMin:e.target.value})} onBlur={()=>save(f)}/>
+    </div>
+    <Field label="Send alerts to (blank = the sending mailbox)" value={f.hrEmail} onChange={e=>setF({...f,hrEmail:e.target.value})} onBlur={()=>save(f)} placeholder="hr@svype.net"/>
+    <label className="flex items-start gap-2 text-sm text-slate-700 cursor-pointer"><input type="checkbox" checked={f.remindEmployee!==false} onChange={e=>save({...f,remindEmployee:e.target.checked})} className="mt-0.5"/>
+      <span>Nudge the employee too<div className="text-xs text-slate-400">They get their own reminder at the same time, pointing them at the correction form.</div></span></label>
+    {st && <div className="text-xs text-slate-500">Alerts fire at <b>{st.alertsAt.in}</b> and <b>{st.alertsAt.out}</b> (Pakistan). Right now: {st.missingIn} not checked in, {st.missingOut} not checked out.{st.lastInAlert?` Last morning alert: ${st.lastInAlert}.`:""}</div>}
+    {st && !st.emailReady && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">Set up Settings → Email first — alerts are sent from that mailbox.</div>}
+    <div className="flex flex-wrap gap-2">
+      <Btn variant="ghost" onClick={()=>test("in")} disabled={!!busy}>{busy==="in"?<Loader2 size={15} className="animate-spin"/>:<Send size={15}/>}Test morning alert</Btn>
+      <Btn variant="ghost" onClick={()=>test("out")} disabled={!!busy}>{busy==="out"?<Loader2 size={15} className="animate-spin"/>:<Send size={15}/>}Test evening alert</Btn>
+    </div>
+    {msg && <div className={`text-xs rounded-lg px-3 py-2 ${msg.ok?"bg-emerald-50 border border-emerald-200 text-emerald-700":"bg-rose-50 border border-rose-200 text-rose-700"}`}>{msg.text}</div>}
+    <p className="text-xs text-slate-400">People on approved leave are skipped. Work-from-home days are included but flagged.</p>
+  </div></Card>);
+}
 function StorageCard() {
   const [info, setInfo] = useState(null);
   const [busy, setBusy] = useState("");
@@ -4183,7 +4356,7 @@ function Backup({ data, brand, restore, wipe, patch }) {
     } catch { setMsg("That file could not be read as a Svype OS backup."); }
   };
   return (<>
-    <div className="mb-5 grid lg:grid-cols-2 gap-5"><StorageCard/><NightlyBackupCard data={data} patch={patch}/></div>
+    <div className="mb-5 grid lg:grid-cols-2 gap-5"><StorageCard/><NightlyBackupCard data={data} patch={patch}/><AttendanceWatchCard data={data} patch={patch}/></div>
     <Head title="Backup & Data" sub="Your data lives in this browser — download a backup regularly, or restore from one"/>
     <div className="grid sm:grid-cols-2 gap-5">
       <Card><div className="p-5"><div className="font-semibold text-sm mb-1">Download backup</div><p className="text-sm text-slate-500 mb-4">Saves all your data (employees, clients, finance, documents, settings) to a single file you can keep safe.</p><Btn onClick={doExport}><Download size={15}/>Download backup file</Btn></div></Card>
@@ -4287,8 +4460,10 @@ function EmpMeetings({ data, update, me }) {
   const rows = (data.meetingNotes || []).filter(n=>n.employee===me.name).sort((a,b)=>b.date.localeCompare(a.date));
   const [edit, setEdit] = useState(null);
   const blank = { client:"", title:"", body:"", date:today() };
+  const draft = useDraft("meetingnote_" + (me.name || "me"), edit, setEdit, !!edit);
   const save = (n) => {
     if (!n.body) return;
+    draft.clear();
     if (n.id) update("meetingNotes", (data.meetingNotes||[]).map(x=>x.id===n.id?{...n,edited:true}:x), `${me.name} edited a meeting note (${n.client||"no client"})`);
     else update("meetingNotes", [{ ...n, id:uid(), employee:me.name }, ...(data.meetingNotes||[])], `${me.name} added a meeting note (${n.client||"no client"})`);
     setEdit(null);
@@ -4301,6 +4476,7 @@ function EmpMeetings({ data, update, me }) {
         <div className="text-sm text-slate-600 mt-2 whitespace-pre-wrap">{n.body}</div>
       </div></Card>))}</div>}
     {edit && <Modal title={edit.id?"Edit note":"New meeting note"} onClose={()=>setEdit(null)}>
+      <DraftBanner draft={draft}/>
       <ClientInput clients={data.clients} value={edit.client} onChange={e=>setEdit({...edit,client:e.target.value})}/>
       <div className="grid grid-cols-2 gap-3"><Field label="Title" value={edit.title} onChange={e=>setEdit({...edit,title:e.target.value})} placeholder="e.g. Kickoff call"/><Field label="Date" type="date" value={edit.date} onChange={e=>setEdit({...edit,date:e.target.value})}/></div>
       <Area label="Notes" value={edit.body} onChange={e=>setEdit({...edit,body:e.target.value})} placeholder="What was discussed, decisions, action items…"/>
