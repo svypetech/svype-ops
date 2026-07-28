@@ -317,7 +317,7 @@ function buildPayslipPdf(slip = {}, brand = {}, employee = {}) {
   // The block below the columns is fixed in size: net pay band + amount in words +
   // the signature area + the footer. Whatever is left is what the columns may use, so
   // a slip with many lines shrinks its rows instead of running over the signature.
-  const BELOW = 96 + 130 + 92;                       // net pay/words, signature block, footer
+  const BELOW = 96 + 155 + 92;                       // net pay/words, signature block, footer
   const avail = Math.max(150, y - BELOW);
   let rowH = 21;
   const needed = () => 36 + rowsMax * rowH + 34;
@@ -358,22 +358,25 @@ function buildPayslipPdf(slip = {}, brand = {}, employee = {}) {
 
   // ================= signature & stamp (anchored near the foot) =================
   // Sit the signature below whatever the content actually needed, never on top of it.
-  const sigY = Math.max(150, Math.min(226, y - 104));
-  if (stampImg) d.image(stampImg, M + 60, sigY + 18, 156, 104);
-  if (sigImg) d.image(sigImg, M, sigY + 26, 178, 66);
+  // The stamp is the tallest item here, reaching sigY + 112. The clearance below the
+  // "in words" line must cover that — under-reserving it caused the overlap.
+  const sigY = Math.max(140, Math.min(226, y - 130));
+  if (stampImg) d.image(stampImg, M + 56, sigY + 16, 144, 96);
+  if (sigImg) d.image(sigImg, M, sigY + 24, 172, 62);
   d.line(M, sigY + 20, M + 200, sigY + 20, 0.55);
   d.text(M, sigY + 6, (sig && sig.name) || "Authorised signatory", { size: 9.5, bold: true });
   d.text(M, sigY - 6, (sig && sig.role) || "Human Resources", { size: 8, gray: 0.45 });
   // payment summary opposite the signature
-  const boxX = M + innerW - 210;
-  d.rect(boxX, sigY - 14, 210, 92, 0.972);
-  d.frame(boxX, sigY - 14, 210, 92, 0.9);
-  d.text(boxX + 14, sigY + 62, "PAYMENT DETAILS", { size: 7.5, bold: true, gray: 0.45 });
-  const pRow = (yy, k, v) => { d.text(boxX + 14, yy, k, { size: 8.5, gray: 0.5 }); d.right(boxX + 196, yy, fit(v || "-", 8.5, true, 118), { size: 8.5, bold: true }); };
-  pRow(sigY + 44, "Method", slip.paid ? (slip.payMethod || "-") : "Not yet paid");
-  pRow(sigY + 28, "Paid on", slip.paid ? prettyDate(slip.paidOn) : "-");
-  pRow(sigY + 12, "Account", employee.account || "-");
-  pRow(sigY - 4, "Net paid", money(net, cur));
+  const boxX = M + innerW - 220, boxH = 106;
+  d.rect(boxX, sigY - 18, 220, boxH, 0.972);
+  d.frame(boxX, sigY - 18, 220, boxH, 0.9);
+  d.text(boxX + 14, sigY + 72, "PAYMENT DETAILS", { size: 7.5, bold: true, gray: 0.45 });
+  const pRow = (yy, k, v) => { d.text(boxX + 14, yy, k, { size: 8.5, gray: 0.5 }); d.right(boxX + 206, yy, fit(v || "-", 8.5, true, 116), { size: 8.5, bold: true }); };
+  pRow(sigY + 54, "Method", slip.paid ? (slip.payMethod || "-") : "Not yet paid");
+  pRow(sigY + 38, "Paid on", slip.paid ? prettyDate(slip.paidOn) : "-");
+  pRow(sigY + 22, "Bank", employee.bankName || employee.bank || "-");
+  pRow(sigY + 6, "Account", employee.account || "-");
+  pRow(sigY - 10, "Net paid", money(net, cur));
 
   // ================= footer =================
   const fH = 92;
