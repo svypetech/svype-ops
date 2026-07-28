@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 28 Jul 2026 · drafts-v1";
+const APP_BUILD = "Build 29 Jul 2026 · chat-live-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -315,9 +315,13 @@ async function identifyForChat(u){
     localStorage.setItem("svype_chat_uid", String(r.user.id));
   }catch(e){ console.error("chat identify failed", e); }
 }
-function chatSocket(onMessage){  const proto = location.protocol === "https:" ? "wss" : "ws";
+function chatSocket(onMessage){
+  const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws?token=${getChatToken()}`);
   ws.onmessage = (e)=>{ try{ onMessage(JSON.parse(e.data)); }catch{} };
+  const queue = [];
+  ws.addEventListener("open", ()=>{ while(queue.length) ws.send(queue.shift()); });
+  ws.sendJson = (obj) => { const raw = JSON.stringify(obj); if (ws.readyState === 1) ws.send(raw); else queue.push(raw); };
   return ws;
 }
 async function aiDraft(kind, fields, template){
@@ -4529,6 +4533,15 @@ function BrandSettings({ brand, saveBrand }) {
 function TeamChat({ session }) {
   const myId = Number(localStorage.getItem("svype_chat_uid") || 0);
   const myName = session?.username || session?.name || "me";
+  // A DM's stored name is fixed at creation and reflects only whoever started it —
+  // showing "hrsvype" to hrsvype themself. Display the OTHER member's name instead,
+  // worked out fresh for whoever is looking at it.
+  const dmLabel = (c, dir) => {
+    if (c.kind !== "dm") return c.name;
+    const otherId = (c.members || []).find(id => id !== myId);
+    const person = dir.find(u => u.id === otherId);
+    return person ? person.username : c.name;
+  };
   const [channels, setChannels] = useState([]);
   const [directory, setDirectory] = useState([]);
   const [active, setActive] = useState(null);
@@ -4536,6 +4549,10 @@ function TeamChat({ session }) {
   const [text, setText] = useState("");
   const [newCh, setNewCh] = useState("");
   const [showDir, setShowDir] = useState(false);
+  const [typers, setTypers] = useState([]);          // usernames currently typing in this channel
+  const [readMap, setReadMap] = useState({});         // messageId -> Set(userIds who have seen it)
+  const typeTimer = useRef(null);
+  const typerClearRef = useRef({});
   const wsRef = useRef(null);
   const endRef = useRef(null);
 
@@ -4545,8 +4562,23 @@ function TeamChat({ session }) {
   useEffect(() => { loadChannels(); apiReq("GET", "/chat/directory").then(setDirectory).catch(()=>{}); }, []);
 
   useEffect(() => {
-    const ws = chatSocket((m) => { if (m.type === "message" && m.channelId === active?.id) setMessages((p) => p.some(x=>x.id===m.message.id) ? p : [...p, m.message]); });
+    const ws = chatSocket((m) => {
+      if (m.type === "message" && m.channelId === active?.id) {
+        setMessages((p) => p.some(x=>x.id===m.message.id) ? p : [...p, m.message]);
+      } else if (m.type === "typing" && m.channelId === active?.id && m.userId !== myId) {
+        clearTimeout(typerClearRef.current[m.userId]);
+        if (m.at) {
+          setTypers((p) => p.includes(m.username) ? p : [...p, m.username]);
+          typerClearRef.current[m.userId] = setTimeout(() => setTypers((p) => p.filter(x=>x!==m.username)), 3000);
+        } else {
+          setTypers((p) => p.filter(x=>x!==m.username));
+        }
+      } else if (m.type === "read" && m.channelId === active?.id) {
+        setReadMap((p) => { const n = { ...p }; Object.keys(n).forEach(id => { n[id] = new Set([...(n[id]||[]), m.userId]); }); return n; });
+      }
+    });
     wsRef.current = ws;
+    setTypers([]);
     return () => ws.close();
   }, [active?.id]);
 
@@ -4554,14 +4586,31 @@ function TeamChat({ session }) {
     if (!active) return;
     apiReq("GET", `/chat/channels/${active.id}/messages`).then((ms) => {
       setMessages(ms);
-      const send = () => wsRef.current?.readyState === 1 && wsRef.current.send(JSON.stringify({ type: "join", channelId: active.id }));
-      if (wsRef.current?.readyState === 1) send(); else setTimeout(send, 300);
+      const rm = {}; ms.forEach(m => { rm[m.id] = new Set(m.readBy || []); });
+      setReadMap(rm);
+      wsRef.current?.sendJson({ type: "join", channelId: active.id });
+      wsRef.current?.sendJson({ type: "read", channelId: active.id });   // I have now seen everything up to this point
     }).catch(()=>{});
   }, [active]);
+  // Also mark read when a new message lands while this channel is already open.
+  useEffect(() => { if (active && messages.length) wsRef.current?.sendJson({ type: "read", channelId: active.id }); }, [messages.length]);
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
-  const send = async () => { if (!text.trim() || !active) return; const body = text.trim(); setText(""); try { const msg = await apiReq("POST", `/chat/channels/${active.id}/messages`, { body }); if (msg && msg.id) setMessages((p) => p.some(x=>x.id===msg.id) ? p : [...p, msg]); } catch {} };
+  const notifyTyping = (on) => { if (active) wsRef.current?.sendJson({ type: "typing", channelId: active.id, at: on }); };
+  const onType = (v) => {
+    setText(v);
+    if (!active) return;
+    clearTimeout(typeTimer.current);
+    notifyTyping(true);
+    typeTimer.current = setTimeout(() => notifyTyping(false), 2000);
+  };
+  const send = async () => {
+    if (!text.trim() || !active) return;
+    const body = text.trim(); setText("");
+    clearTimeout(typeTimer.current); notifyTyping(false);
+    try { const msg = await apiReq("POST", `/chat/channels/${active.id}/messages`, { body }); if (msg && msg.id) setMessages((p) => p.some(x=>x.id===msg.id) ? p : [...p, msg]); } catch {}
+  };
   const createChannel = async () => { if (!newCh.trim()) return; try { const c = await apiReq("POST", "/chat/channels", { name: newCh.trim() }); setNewCh(""); await loadChannels(); setActive(c); } catch {} };
   const startDm = async (userId) => { try { const c = await apiReq("POST", "/chat/dm", { userId }); setShowDir(false); await loadChannels(); setActive(c); } catch {} };
 
@@ -4583,23 +4632,28 @@ function TeamChat({ session }) {
           ))}
           <div className="flex items-center justify-between mt-3 mb-1 px-2"><span className="text-xs uppercase text-slate-400">Direct</span><button onClick={() => setShowDir((s) => !s)} className="text-sky-600"><Plus size={13} /></button></div>
           {showDir && (<div className="bg-slate-50 rounded p-1 mb-2">{directory.length ? directory.map((u) => (<button key={u.id} onClick={() => startDm(u.id)} className="w-full text-left px-2 py-1 rounded text-xs hover:bg-white">{u.username}</button>)) : <div className="text-xs text-slate-400 px-2 py-1">No other users yet</div>}</div>)}
-          {dms.map((c) => (<button key={c.id} onClick={() => setActive(c)} className={`w-full text-left px-2 py-1.5 rounded text-sm ${active?.id === c.id ? "bg-sky-50 text-sky-700" : "hover:bg-slate-50"}`}>@ {c.name}</button>))}
+          {dms.map((c) => (<button key={c.id} onClick={() => setActive(c)} className={`w-full text-left px-2 py-1.5 rounded text-sm ${active?.id === c.id ? "bg-sky-50 text-sky-700" : "hover:bg-slate-50"}`}>@ {dmLabel(c, directory)}</button>))}
         </div>
       </div>
       <div className="flex-1 flex flex-col min-w-0">
         {active ? (<>
-          <div className="px-4 py-3 border-b border-slate-100 font-semibold text-sm flex items-center gap-1.5">{active.kind === "channel" ? <Hash size={15} /> : "@"} {active.name}</div>
+          <div className="px-4 py-3 border-b border-slate-100 font-semibold text-sm flex items-center gap-1.5">{active.kind === "channel" ? <Hash size={15} /> : "@"} {dmLabel(active, directory)}</div>
           <div className="flex-1 overflow-y-auto p-4 space-y-3">
-            {messages.map((m) => (
-              <div key={m.id} className={`flex flex-col ${m.userId === myId ? "items-end" : "items-start"}`}>
+            {messages.map((m, i) => {
+              const mine = m.userId === myId;
+              const seenByOther = mine && [...(readMap[m.id] || new Set())].some(id => id !== myId);
+              const isLast = mine && i === messages.length - 1;
+              return (<div key={m.id} className={`flex flex-col ${mine ? "items-end" : "items-start"}`}>
                 <div className="text-xs text-slate-400 mb-0.5">{m.username} · {new Date(m.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</div>
-                <div className={`px-3 py-2 rounded-2xl text-sm max-w-md ${m.userId === myId ? "bg-sky-600 text-white" : "bg-slate-100 text-slate-800"}`}>{m.body}</div>
-              </div>
-            ))}
+                <div className={`px-3 py-2 rounded-2xl text-sm max-w-md ${mine ? "bg-sky-600 text-white" : "bg-slate-100 text-slate-800"}`}>{m.body}</div>
+                {isLast && <div className="text-xs text-slate-400 mt-0.5">{seenByOther ? "Seen" : "Sent"}</div>}
+              </div>);
+            })}
+            {typers.length>0 && <div className="text-xs text-slate-400 italic flex items-center gap-1.5"><span className="inline-flex gap-0.5"><span className="w-1 h-1 rounded-full bg-slate-400 animate-bounce" style={{animationDelay:"0ms"}}/><span className="w-1 h-1 rounded-full bg-slate-400 animate-bounce" style={{animationDelay:"120ms"}}/><span className="w-1 h-1 rounded-full bg-slate-400 animate-bounce" style={{animationDelay:"240ms"}}/></span>{typers.join(", ")} {typers.length===1?"is":"are"} typing…</div>}
             <div ref={endRef} />
           </div>
           <div className="p-3 border-t border-slate-100 flex gap-2">
-            <input value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === "Enter" && send()} placeholder={`Message ${active.kind === "channel" ? "#" + active.name : active.name}`} className={inputCls} />
+            <input value={text} onChange={(e) => onType(e.target.value)} onKeyDown={(e) => e.key === "Enter" && send()} placeholder={`Message ${active.kind === "channel" ? "#" + active.name : dmLabel(active, directory)}`} className={inputCls} />
             <button onClick={send} className="px-4 rounded-lg bg-sky-600 text-white"><Send size={16} /></button>
           </div>
         </>) : (<div className="flex-1 grid place-items-center text-slate-400 text-sm">Select or create a channel to start chatting</div>)}

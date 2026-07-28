@@ -96,6 +96,28 @@ wss.on("connection", (ws, req) => {
       if (!clientsByChannel.has(+m.channelId)) clientsByChannel.set(+m.channelId, new Set());
       clientsByChannel.get(+m.channelId).add(ws);
     }
+    // Typing is ephemeral — never stored, just relayed live to whoever else is in
+    // the channel right now.
+    if (m.type === "typing" && m.channelId) {
+      const set = clientsByChannel.get(+m.channelId);
+      if (set) {
+        const payload = JSON.stringify({ type: "typing", channelId: +m.channelId, userId: ws.user.id, username: ws.user.username, at: m.at !== false });
+        set.forEach((peer) => { if (peer !== ws) { try { peer.send(payload); } catch {} } });
+      }
+    }
+    // Read receipts: persisted (so "seen" survives a reload) and relayed live.
+    if (m.type === "read" && m.channelId) {
+      const cid = +m.channelId;
+      pool.query(
+        "UPDATE messages SET read_by = (SELECT jsonb_agg(DISTINCT v) FROM jsonb_array_elements(COALESCE(read_by,'[]'::jsonb) || to_jsonb($1::int)) v) WHERE channel_id=$2 AND user_id != $1 AND created_at <= now()",
+        [ws.user.id, cid]
+      ).catch(() => {});
+      const set = clientsByChannel.get(cid);
+      if (set) {
+        const payload = JSON.stringify({ type: "read", channelId: cid, userId: ws.user.id, at: new Date().toISOString() });
+        set.forEach((peer) => { if (peer !== ws) { try { peer.send(payload); } catch {} } });
+      }
+    }
   });
   ws.on("close", () => {
     ws.channels.forEach((cid) => clientsByChannel.get(cid)?.delete(ws));

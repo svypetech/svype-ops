@@ -330,3 +330,6 @@ CREATE TABLE IF NOT EXISTS files (
   bytes      BYTEA NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Who has seen each message (array of user ids). Added for chat read receipts.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_by JSONB DEFAULT '[]'::jsonb;
