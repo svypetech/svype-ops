@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 27 Jul 2026 · freelance-v1";
+const APP_BUILD = "Build 28 Jul 2026 · invoices-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -1109,9 +1109,9 @@ const Head = ({ title, sub, action }) => (<div className="flex flex-wrap items-e
 const Btn = ({ children, onClick, variant="primary", disabled=false }) => { const s={primary:"bg-sky-600 text-white hover:bg-sky-700",ghost:"bg-white border border-slate-300 text-slate-700 hover:bg-slate-100",danger:"bg-white border border-rose-300 text-rose-600 hover:bg-rose-50",ok:"bg-emerald-600 text-white hover:bg-emerald-700"}; return <button onClick={onClick} disabled={disabled} className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-medium transition ${s[variant]} ${disabled?"opacity-60 cursor-not-allowed":""}`}>{children}</button>; };
 const Card = ({ children }) => <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">{children}</div>;
 const Pill = ({ s }) => { const m={Active:"bg-emerald-100 text-emerald-700",Paid:"bg-emerald-100 text-emerald-700",Sent:"bg-sky-100 text-sky-700",Accepted:"bg-emerald-100 text-emerald-700",Done:"bg-emerald-100 text-emerald-700",Cleared:"bg-emerald-100 text-emerald-700",Pending:"bg-amber-100 text-amber-700",Unpaid:"bg-amber-100 text-amber-700",Open:"bg-amber-100 text-amber-700",Requested:"bg-amber-100 text-amber-700","Pending HR":"bg-amber-100 text-amber-700","Pending Founder":"bg-sky-100 text-sky-700",Partial:"bg-orange-100 text-orange-700",Outstanding:"bg-amber-100 text-amber-700",Overdue:"bg-rose-100 text-rose-700",Approved:"bg-emerald-100 text-emerald-700",Rejected:"bg-rose-100 text-rose-700",Draft:"bg-slate-100 text-slate-600",Inactive:"bg-slate-100 text-slate-600",Paused:"bg-slate-100 text-slate-600"}; return <span className={`px-2 py-0.5 rounded-md text-xs font-medium ${m[s]||"bg-slate-100 text-slate-600"}`}>{s}</span>; };
-function Modal({ title, onClose, children }) {
+function Modal({ title, onClose, children, wide }) {
   return <div className="fixed inset-0 grid place-items-center z-50 p-4" style={{background:"rgba(15,23,42,.5)"}} onClick={onClose}>
-    <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-md overflow-y-auto shadow-xl" style={{maxHeight:"90vh", paddingBottom:"env(safe-area-inset-bottom)"}} onClick={e=>e.stopPropagation()}>
+    <div className={`bg-white border border-slate-200 rounded-2xl w-full ${wide?"max-w-2xl":"max-w-md"} overflow-y-auto shadow-xl`} style={{maxHeight:"90vh", paddingBottom:"env(safe-area-inset-bottom)"}} onClick={e=>e.stopPropagation()}>
       <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200"><h3 className="font-semibold text-slate-900">{title}</h3><button onClick={onClose} className="text-slate-400 hover:text-slate-700"><X size={18}/></button></div>
       <div className="p-5 space-y-3">{children}</div></div></div>;
 }
@@ -3582,7 +3582,122 @@ function Ledger({ title, sub, rows, setRows, blank, fields, cols, render, extraA
     {edit && <Modal title={edit.id?"Edit":"Add"} onClose={()=>setEdit(null)}>{fields(edit,setEdit)}<Btn onClick={()=>save(edit)}><Check size={15}/>Save</Btn></Modal>}
   </>);
 }
-function Invoices({ data, update, patch }) {
+// ===== Custom invoice builder =====
+// Any client, priced line by line, in any of our billing currencies. When a client
+// is billed in one currency but pays in another, both are shown with the rate used.
+const CUR_SYM = { PKR:"PKR", USD:"$", GBP:"GBP", SAR:"SAR", AED:"AED", CAD:"CAD" };
+const lineTotal = (l) => (+l.qty || 0) * (+l.rate || 0);
+const invTotals = (inv) => {
+  const sub = (inv.items || []).reduce((t, l) => t + lineTotal(l), 0);
+  const disc = +inv.discount || 0;
+  const taxable = Math.max(0, sub - disc);
+  const tax = taxable * ((+inv.taxPct || 0) / 100);
+  const total = taxable + tax;
+  const alt = inv.altCurrency && +inv.fxRate ? total * +inv.fxRate : null;
+  return { sub, disc, tax, total, alt };
+};
+function InvoiceBuilder({ data, brand, edit, setEdit, onSave }) {
+  const t = invTotals(edit);
+  const setItem = (i, patchObj) => setEdit({ ...edit, items: edit.items.map((l, k) => k === i ? { ...l, ...patchObj } : l) });
+  const bank = (data.bankAccounts || []).find(b => b.id === edit.bankId);
+  return (<Modal title={edit.id ? `Invoice ${edit.number}` : "New invoice"} onClose={() => setEdit(null)} wide>
+    <div className="grid sm:grid-cols-2 gap-3">
+      <ClientInput data={data} value={edit.client} onChange={v => setEdit({ ...edit, client: v })}/>
+      <Field label="Invoice number" value={edit.number} onChange={e => setEdit({ ...edit, number: e.target.value })}/>
+      <Field label="Issue date" type="date" value={edit.date} onChange={e => setEdit({ ...edit, date: e.target.value })}/>
+      <Field label="Due date" type="date" value={edit.due || ""} onChange={e => setEdit({ ...edit, due: e.target.value })}/>
+    </div>
+    <div>
+      <div className="text-xs uppercase tracking-wider text-slate-500 font-medium mb-2">Items</div>
+      <div className="space-y-2">{(edit.items || []).map((l, i) => (
+        <div key={i} className="grid grid-cols-12 gap-2 items-end">
+          <div className="col-span-6"><Field label={i === 0 ? "Description" : ""} value={l.desc} onChange={e => setItem(i, { desc: e.target.value })}/></div>
+          <div className="col-span-2"><Field label={i === 0 ? "Qty" : ""} type="number" value={l.qty} onChange={e => setItem(i, { qty: e.target.value })}/></div>
+          <div className="col-span-3"><Field label={i === 0 ? "Rate" : ""} type="number" value={l.rate} onChange={e => setItem(i, { rate: e.target.value })}/></div>
+          <button onClick={() => setEdit({ ...edit, items: edit.items.filter((_, k) => k !== i) })} className="col-span-1 h-9 text-slate-300 hover:text-rose-500"><X size={15}/></button>
+        </div>))}
+      </div>
+      <Btn variant="ghost" onClick={() => setEdit({ ...edit, items: [...(edit.items || []), { desc: "", qty: 1, rate: "" }] })}><Plus size={15}/>Add line</Btn>
+    </div>
+    <div className="grid sm:grid-cols-3 gap-3">
+      <Select label="Bill in" options={CURRENCIES} value={edit.currency} onChange={e => setEdit({ ...edit, currency: e.target.value })}/>
+      <Field label="Discount" type="number" value={edit.discount || ""} onChange={e => setEdit({ ...edit, discount: e.target.value })}/>
+      <Field label="Tax %" type="number" value={edit.taxPct || ""} onChange={e => setEdit({ ...edit, taxPct: e.target.value })}/>
+    </div>
+    <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-2">
+      <div className="text-xs text-slate-500">Paying in a different currency? Show the equivalent on the invoice.</div>
+      <div className="grid sm:grid-cols-2 gap-3">
+        <Select label="Also show in" options={["", ...CURRENCIES.filter(c => c !== edit.currency)]} value={edit.altCurrency || ""} onChange={e => setEdit({ ...edit, altCurrency: e.target.value })}/>
+        <Field label={`Rate (1 ${edit.currency} = ? ${edit.altCurrency || "—"})`} type="number" value={edit.fxRate || ""} onChange={e => setEdit({ ...edit, fxRate: e.target.value })}/>
+      </div>
+      {t.alt != null && <div className="text-sm text-slate-700">Equivalent: <b>{fmt(t.alt, edit.altCurrency)}</b> at 1 {edit.currency} = {edit.fxRate} {edit.altCurrency}</div>}
+    </div>
+    <Select label="Bank account shown on the invoice" options={["", ...(data.bankAccounts || []).map(b => b.label || b.bank || b.title)]}
+      value={bank ? (bank.label || bank.bank || bank.title) : ""}
+      onChange={e => { const b = (data.bankAccounts || []).find(x => (x.label || x.bank || x.title) === e.target.value); setEdit({ ...edit, bankId: b ? b.id : "" }); }}/>
+    <Area label="Notes / terms" value={edit.notes || ""} onChange={e => setEdit({ ...edit, notes: e.target.value })}/>
+    <div className="bg-white border border-slate-200 rounded-lg p-3 text-sm space-y-1">
+      <div className="flex justify-between"><span className="text-slate-500">Subtotal</span><span>{fmt(t.sub, edit.currency)}</span></div>
+      {!!t.disc && <div className="flex justify-between"><span className="text-slate-500">Discount</span><span>-{fmt(t.disc, edit.currency)}</span></div>}
+      {!!t.tax && <div className="flex justify-between"><span className="text-slate-500">Tax</span><span>{fmt(t.tax, edit.currency)}</span></div>}
+      <div className="flex justify-between font-semibold text-base border-t border-slate-200 pt-1"><span>Total</span><span>{fmt(t.total, edit.currency)}</span></div>
+      {t.alt != null && <div className="flex justify-between text-slate-500"><span>Payable in {edit.altCurrency}</span><span>{fmt(t.alt, edit.altCurrency)}</span></div>}
+    </div>
+    <Btn onClick={() => onSave({ ...edit, amount: t.total, altAmount: t.alt })}><Check size={15}/>Save invoice</Btn>
+  </Modal>);
+}
+function customInvoiceHTML(inv, brand, bank) {
+  const t = invTotals(inv);
+  const rows = (inv.items || []).map(l => `<tr><td>${l.desc || ""}</td><td class="r">${l.qty || 0}</td><td class="r">${fmt(l.rate, inv.currency)}</td><td class="r">${fmt(lineTotal(l), inv.currency)}</td></tr>`).join("");
+  const offices = (brand.offices || []).map(o => `${o.city}: ${o.address}`).join("<br>");
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${inv.number}</title><style>
+    body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial;color:#0f172a;margin:0;padding:38px}
+    .top{display:flex;justify-content:space-between;align-items:flex-start;gap:20px}
+    .logo{height:52px}.co{font-size:22px;font-weight:700}.tag{color:#64748b;font-size:12px}
+    .title{color:${brand.accent || "#0284c7"};font-size:20px;font-weight:700;text-align:right}
+    .meta{color:#64748b;font-size:12px;text-align:right}
+    .bar{height:3px;background:${brand.accent || "#0284c7"};margin:14px 0 22px}
+    .who{background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px;margin-bottom:20px;font-size:13px}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th{background:${brand.accent || "#0284c7"};color:#fff;text-align:left;padding:9px 10px;font-size:11px;letter-spacing:.04em}
+    td{padding:9px 10px;border-bottom:1px solid #eef2f7}.r{text-align:right}
+    .tot{margin-left:auto;width:290px;font-size:13px;margin-top:14px}
+    .tot div{display:flex;justify-content:space-between;padding:5px 0}
+    .grand{border-top:2px solid #0f172a;font-weight:700;font-size:16px}
+    .alt{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px;margin-top:10px;font-size:12.5px}
+    .bank{margin-top:24px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px;font-size:12.5px}
+    .bank b{display:block;font-size:11px;letter-spacing:.05em;color:#64748b;margin-bottom:6px}
+    .foot{margin-top:26px;border-top:1px solid #e2e8f0;padding-top:10px;color:#94a3b8;font-size:11px}
+    @media print{body{padding:0}}
+  </style></head><body>
+    <div class="top"><div>${brand.logo ? `<img class="logo" src="${brand.logo}">` : ""}<div class="co">${brand.company || ""}</div><div class="tag">${brand.tagline || ""}</div></div>
+      <div><div class="title">INVOICE</div><div class="meta">${inv.number}<br>Issued ${inv.date || ""}${inv.due ? `<br>Due ${inv.due}` : ""}</div></div></div>
+    <div class="bar"></div>
+    <div class="who"><b>Billed to</b><br><span style="font-size:15px;font-weight:600">${inv.client || ""}</span></div>
+    <table><thead><tr><th>Description</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="tot">
+      <div><span>Subtotal</span><span>${fmt(t.sub, inv.currency)}</span></div>
+      ${t.disc ? `<div><span>Discount</span><span>-${fmt(t.disc, inv.currency)}</span></div>` : ""}
+      ${t.tax ? `<div><span>Tax ${inv.taxPct}%</span><span>${fmt(t.tax, inv.currency)}</span></div>` : ""}
+      <div class="grand"><span>Total</span><span>${fmt(t.total, inv.currency)}</span></div>
+    </div>
+    ${t.alt != null ? `<div class="alt"><b>Payable in ${inv.altCurrency}: ${fmt(t.alt, inv.altCurrency)}</b><br>Converted at 1 ${inv.currency} = ${inv.fxRate} ${inv.altCurrency} on ${inv.date || today()}. The ${inv.currency} amount above is the billed amount.</div>` : ""}
+    ${bank ? `<div class="bank"><b>PAYMENT DETAILS</b>
+      ${bank.title ? `Account title: ${bank.title}<br>` : ""}${bank.bank ? `Bank: ${bank.bank}<br>` : ""}
+      ${bank.number ? `Account number: ${bank.number}<br>` : ""}${bank.iban ? `IBAN: ${bank.iban}<br>` : ""}
+      ${bank.swift ? `SWIFT: ${bank.swift}<br>` : ""}${bank.branch ? `Branch: ${bank.branch}` : ""}</div>` : ""}
+    ${inv.notes ? `<div style="margin-top:16px;font-size:12.5px;color:#475569">${String(inv.notes).replace(/</g, "&lt;").replace(/\n/g, "<br>")}</div>` : ""}
+    <div class="foot">${offices}<br>${[brand.phone, brand.email, brand.website].filter(Boolean).join(" &middot; ")}</div>
+    <script>window.onload=()=>window.print()<\/script>
+  </body></html>`;
+}
+const openCustomInvoice = (inv, brand, bank) => {
+  const w = window.open("", "_blank");
+  if (!w) { alert("Allow pop-ups to print the invoice."); return; }
+  w.document.write(customInvoiceHTML(inv, brand, bank));
+  w.document.close();
+};
+function Invoices({ data, update, patch, brand }) {
   const rows=data.invoices; const clients=data.clients;
   const setRows=(r)=>{
     const wasById = Object.fromEntries(rows.map(x=>[x.id,x]));
@@ -3594,11 +3709,25 @@ function Invoices({ data, update, patch }) {
       update("invoices", r);
     }
   };
-  return <Ledger noun="invoice" title="Invoices & Receipts" sub="Billing to clients · marking an invoice Paid creates a receipt in the Receipts tab" rows={rows} setRows={setRows}
+  const [inv, setInv] = useState(null);
+  const bankOf = (r)=> (data.bankAccounts||[]).find(b=>b.id===r.bankId) || null;
+  const newInvoice = () => setInv({ client:"", number:"INV-"+(1000+rows.length+1), date:today(), due:"", currency:"PKR",
+    items:[{desc:"",qty:1,rate:""}], discount:"", taxPct:"", altCurrency:"", fxRate:"", bankId:(data.bankAccounts||[])[0]?.id||"", notes:"", status:"Draft", type:"Invoice" });
+  const saveInvoice = (v) => {
+    setRows(v.id ? rows.map(x=>x.id===v.id?v:x) : [{ ...v, id:uid() }, ...rows]);
+    setInv(null);
+  };
+  return (<>
+    {inv && <InvoiceBuilder data={data} brand={brand} edit={inv} setEdit={setInv} onSave={saveInvoice}/>}
+    <Ledger noun="invoice" title="Invoices & Receipts" sub="Billing to clients · marking an invoice Paid creates a receipt in the Receipts tab" rows={rows} setRows={setRows}
     blank={()=>({client:"",number:"INV-"+(1000+rows.length+1),amount:"",currency:"PKR",date:today(),status:"Draft",type:"Invoice"})}
     cols={["Number","Client","Type","Amount","Date","Status"]}
-    render={r=>(<><Td className="font-medium">{r.number}</Td><Td className="text-slate-500">{r.client}</Td><Td className="text-slate-500">{r.type}</Td><Td>{fmt(r.amount,r.currency)}</Td><Td className="text-slate-500">{r.date}</Td><Td><Pill s={r.status}/></Td></>)}
-    fields={(e,s)=>(<><ClientInput clients={clients} value={e.client} onChange={ev=>{const v=ev.target.value;const c=clients.find(x=>x.name===v);s({...e,client:v,...(c?{currency:c.currency||"PKR"}:{})});}}/><Field label="Number" value={e.number} onChange={ev=>s({...e,number:ev.target.value})}/><Select label="Type" options={["Invoice","Receipt"]} value={e.type} onChange={ev=>s({...e,type:ev.target.value})}/><div className="grid grid-cols-2 gap-3"><Field label="Amount" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Select label="Currency" options={CURRENCIES} value={e.currency} onChange={ev=>s({...e,currency:ev.target.value})}/></div><Field label="Date" type="date" value={e.date} onChange={ev=>s({...e,date:ev.target.value})}/><Select label="Status" options={["Draft","Sent","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>;
+    extraActions={r=> (r.items||[]).length ? <><button onClick={()=>setInv(r)} title="Edit invoice" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Edit3 size={15}/></button><button onClick={()=>openCustomInvoice(r, brand, bankOf(r))} title="Print / save PDF" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Download size={15}/></button></> : null}
+    render={r=>(<><Td className="font-medium">{r.number}{(r.items||[]).length?<div className="text-xs text-slate-400">{r.items.length} line(s)</div>:null}</Td><Td className="text-slate-500">{r.client}</Td><Td className="text-slate-500">{r.type}</Td><Td>{fmt(r.amount,r.currency)}{r.altAmount?<div className="text-xs text-slate-400">= {fmt(r.altAmount,r.altCurrency)}</div>:null}</Td><Td className="text-slate-500">{r.date}</Td><Td><Pill s={r.status}/></Td></>)}
+    fields={(e,s)=>(<><ClientInput clients={clients} value={e.client} onChange={ev=>{const v=ev.target.value;const c=clients.find(x=>x.name===v);s({...e,client:v,...(c?{currency:c.currency||"PKR"}:{})});}}/><Field label="Number" value={e.number} onChange={ev=>s({...e,number:ev.target.value})}/><Select label="Type" options={["Invoice","Receipt"]} value={e.type} onChange={ev=>s({...e,type:ev.target.value})}/><div className="grid grid-cols-2 gap-3"><Field label="Amount" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Select label="Currency" options={CURRENCIES} value={e.currency} onChange={ev=>s({...e,currency:ev.target.value})}/></div><Field label="Date" type="date" value={e.date} onChange={ev=>s({...e,date:ev.target.value})}/><Select label="Status" options={["Draft","Sent","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>
+    <div className="mt-4"><Btn onClick={newInvoice}><Plus size={15}/>Build a custom invoice</Btn>
+      <p className="text-xs text-slate-400 mt-2">Line items, any currency, your bank details, and a second currency with the rate when a client pays in something else.</p></div>
+  </>);
 }
 function Receipts({ data, update, brand }) {
   const br = useBatch(data.receipts||[]);

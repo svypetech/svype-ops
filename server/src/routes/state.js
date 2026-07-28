@@ -10,7 +10,7 @@ const router = express.Router();
 // on, the write is rejected (409) and the client re-applies its change on the
 // latest doc and retries.
 // NOTE: keep SERVER_BUILD in sync with APP_BUILD in client/src/App.jsx on every release.
-const SERVER_BUILD = "Build 27 Jul 2026 · freelance-v1";
+const SERVER_BUILD = "Build 28 Jul 2026 · invoices-v1";
 router.get("/", auth, async (req, res) => {
   const known = req.query.knownRev != null ? +req.query.knownRev : null;
   if (known != null) {

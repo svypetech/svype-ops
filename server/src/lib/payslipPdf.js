@@ -312,9 +312,17 @@ function buildPayslipPdf(slip = {}, brand = {}, employee = {}) {
   const gross = plus.reduce((t, [, v]) => t + v, 0);
   const totalDed = minus.reduce((t, [, v]) => t + v, 0);
 
-  const gap = 18, colW = (innerW - gap) / 2, rowH = 21;
+  const gap = 18, colW = (innerW - gap) / 2;
   const rowsMax = Math.max(plus.length, minus.length || 1);
-  const colH = Math.max(232, 36 + rowsMax * rowH + 34);   // stretches so the page stays full
+  // The block below the columns is fixed in size: net pay band + amount in words +
+  // the signature area + the footer. Whatever is left is what the columns may use, so
+  // a slip with many lines shrinks its rows instead of running over the signature.
+  const BELOW = 96 + 130 + 92;                       // net pay/words, signature block, footer
+  const avail = Math.max(150, y - BELOW);
+  let rowH = 21;
+  const needed = () => 36 + rowsMax * rowH + 34;
+  while (needed() > avail && rowH > 13) rowH -= 1;
+  const colH = Math.min(Math.max(232, needed()), Math.max(avail, needed() > avail ? needed() : 0));
   const drawCol = (x, title, rows, total, totalLabel) => {
     d.rect(x, y - colH, colW, colH, 0.995);
     d.frame(x, y - colH, colW, colH, 0.86);
@@ -349,7 +357,8 @@ function buildPayslipPdf(slip = {}, brand = {}, employee = {}) {
   d.text(M + 48, y, `${amountInWords(net)} Rupees Only`, { size: 8.5, bold: true, gray: 0.25 });
 
   // ================= signature & stamp (anchored near the foot) =================
-  const sigY = 226;
+  // Sit the signature below whatever the content actually needed, never on top of it.
+  const sigY = Math.max(150, Math.min(226, y - 104));
   if (stampImg) d.image(stampImg, M + 60, sigY + 18, 156, 104);
   if (sigImg) d.image(sigImg, M, sigY + 26, 178, 66);
   d.line(M, sigY + 20, M + 200, sigY + 20, 0.55);
