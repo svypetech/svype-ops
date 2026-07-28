@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 28 Jul 2026 · slip-v4";
+const APP_BUILD = "Build 28 Jul 2026 · reimb-link-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -2730,11 +2730,34 @@ function Payroll({ data, patch, update, brand }) {
   // second slip (or a second advance deduction) for someone already run this month.
   const bp = useBatch(data.payroll);
   const [bulkPay, setBulkPay] = useState(null);
+  // Paying a salary also pays the reimbursements that were folded into it.
+  const markSlipsPaid = (slipIds, { proof, method }) => {
+    const ids = new Set(slipIds);
+    patch({
+      payroll: data.payroll.map(x=>ids.has(x.id) && !x.paid ? { ...x, paid:true, payMethod:method, proof:proof||x.proof, paidOn:today() } : x),
+      payables: data.payables.map(p=>ids.has(p.slipId) && p.status!=="Paid" ? { ...p, status:"Paid", settled:true, paidDate:today() } : p),
+    }, `Marked ${ids.size} salary slip(s) paid`);
+  };
+  // Deleting a slip undoes what it did: reimbursements go back to Approved and any
+  // advance installment it took is returned.
+  const deleteSlips = (slipIds) => {
+    const ids = new Set(slipIds);
+    const gone = data.payroll.filter(x=>ids.has(x.id));
+    const refund = {};
+    gone.forEach(sl=>{ if (+sl.advance) refund[sl.employee] = (refund[sl.employee]||0) + (+sl.advance||0); });
+    const used = {};
+    patch({
+      payroll: data.payroll.filter(x=>!ids.has(x.id)),
+      payables: data.payables.map(p=>ids.has(p.slipId) ? { ...p, settled:false, status:"Approved", slipId:null, paidDate:null } : p),
+      advances: data.advances.map(a=>{
+        const owed = refund[a.employee]; if (!owed || used[a.employee]) return a;
+        used[a.employee] = true;
+        return { ...a, remaining:(+a.remaining||0) + owed, status:"Active" };
+      }),
+    }, `Deleted ${ids.size} salary slip(s) — reimbursements and advances restored`);
+  };
   const doBulkPay = () => {
-    const ids = new Set(bp.selected);
-    update("payroll", data.payroll.map(x=>ids.has(x.id) && !x.paid
-      ? { ...x, paid:true, payMethod:bulkPay.method, proof:bulkPay.proof||x.proof, paidOn:today() } : x),
-      `Marked ${ids.size} salary slip(s) paid`);
+    markSlipsPaid(bp.selected, { proof: bulkPay.proof, method: bulkPay.method });
     bp.clear(); setBulkPay(null);
   };
   const withAllowance = data.payroll.filter(p => +p.allowances > 0);
@@ -2757,7 +2780,10 @@ function Payroll({ data, patch, update, brand }) {
     // advance installment taken — that's what made a repeat run dangerous before.
     const ids=[]; data.payables.forEach(p=>{ if(p.kind==="reimbursement"&&p.status==="Approved"&&!p.settled&&p.payVia==="salary"&&(!p.payMonth||p.payMonth===month)&&names.has(p.vendor)) ids.push(p.id); });
     const runs=runAsk.targets.map(e=>computePayslip(e,data,month));
-    const newPayables=data.payables.map(p=>ids.includes(p.id)?{...p,settled:true,status:"Paid"}:p);
+    const slipOf = Object.fromEntries(runs.map(r=>[r.employee, r.id]));
+    // Settled means "already inside a payslip" so it can't be counted twice. It is only
+    // marked Paid once that salary is actually paid.
+    const newPayables=data.payables.map(p=>ids.includes(p.id)?{...p,settled:true,slipId:slipOf[p.vendor]||null}:p);
     const newAdvances=data.advances.map(a=>{ if(a.status==="Active"&&a.remaining>0&&names.has(a.employee)){ const d=Math.min(+a.installment,a.remaining); const rem=a.remaining-d; return {...a,remaining:rem,status:rem<=0?"Cleared":"Active"};} return a; });
     patch({ payroll:[...runs,...data.payroll], payables:newPayables, advances:newAdvances }, `Ran payroll for ${month} · ${runs.length} employee(s)`);
     setRunAsk(null);
@@ -2788,7 +2814,7 @@ function Payroll({ data, patch, update, brand }) {
       <Btn variant="ghost" onClick={clearAllowances}><X size={15}/>Remove automatic allowance</Btn>
     </div>}
     <BatchBar count={bp.count} noun="salary slip" onClear={bp.clear}
-      onDelete={()=>{ const ids=new Set(bp.selected); update("payroll", data.payroll.filter(x=>!ids.has(x.id)), `Deleted ${ids.size} salary slip(s)`); bp.clear(); }}>
+      onDelete={()=>{ deleteSlips(bp.selected); bp.clear(); }}>
       <Btn variant="ghost" onClick={()=>setBulkPay({ method:"Bank transfer", proof:null })}><Check size={15}/>Mark paid</Btn>
     </BatchBar>
     <Card><Table cols={[<SelBox key="a" on={bp.allOn} onChange={bp.toggleAll} title="Select all"/>,"Employee","Month","Net","Account / IBAN","Payment","",""]}>{data.payroll.length===0?<tr><td colSpan={8}><Empty msg="No payroll runs yet"/></td></tr>:data.payroll.map(p=>(
@@ -2848,7 +2874,7 @@ function Payroll({ data, patch, update, brand }) {
       <Btn onClick={saveDed}><Check size={15}/>Save deductions</Btn>
     </Modal>}
     {payProof && <PayrollPaidModal rec={payProof} brand={brand} email={empEmail(payProof.employee)} employee={data.employees.find(e=>e.name===payProof.employee)||{}} onClose={()=>setPayProof(null)}
-      onSave={(proof, method)=>{ update("payroll", data.payroll.map(x=>x.id===payProof.id?{...x,paid:true,proof,payMethod:method,paidOn:today()}:x), `Marked salary paid: ${payProof.employee} (${payProof.month})`); setPayProof(null); }}/>}
+      onSave={(proof, method)=>{ markSlipsPaid([payProof.id], { proof, method }); setPayProof(null); }}/>}
   </>);
 }
 function PayrollPaidModal({ rec, brand, email, employee, onClose, onSave }) {
@@ -3808,7 +3834,8 @@ function Payables({ data, update, patch, brand }) {
         {(r.rejections||[]).length>0 && <div className="text-xs text-rose-600">Rejected: {r.rejections[r.rejections.length-1].reason}{r.finalRejected?" · final":""}</div>}
         {(r.appeals||[]).length>0 && r.status==="Pending" && <div className="text-xs text-amber-600">Appealed: {r.appeals[r.appeals.length-1].reason}</div>}
       </div></Td><Td>{fmt(r.amount)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
-      extraActions={r=> r.kind==="reimbursement" && r.status!=="Approved" && r.status!=="Paid" ? <>{r.status!=="Rejected" && <button onClick={()=>openApprove(r)} title="Approve reimbursement" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button>}{!r.finalRejected && <button onClick={()=>openReject(r)} title={r.status==="Rejected"?"Already rejected":"Reject this claim"} className="p-1.5 rounded text-slate-400 hover:text-rose-600 hover:bg-slate-100 disabled:opacity-30" disabled={r.status==="Rejected"}><X size={15}/></button>}</> : (r.kind==="vendorbill" && r.status!=="Paid" ? <button onClick={()=>markVendorPaid(r)} title="Mark vendor bill as paid" className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Mark paid</button> : null)}
+      extraActions={r=> r.kind==="reimbursement" && r.settled ? <button onClick={()=>{ if(!confirm(`Put "${r.desc}" back into the next payroll?\n\nIt becomes an approved claim again and will be added to that employee's next salary slip.`)) return; setRows(rows.map(x=>x.id===r.id?{...x, settled:false, status:"Approved", slipId:null, paidDate:null}:x)); }} title="Return to the next payroll" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Repeat size={15}/></button>
+        : r.kind==="reimbursement" && r.status!=="Approved" && r.status!=="Paid" ? <>{r.status!=="Rejected" && <button onClick={()=>openApprove(r)} title="Approve reimbursement" className="p-1.5 rounded text-slate-400 hover:text-emerald-600 hover:bg-slate-100"><Check size={15}/></button>}{!r.finalRejected && <button onClick={()=>openReject(r)} title={r.status==="Rejected"?"Already rejected":"Reject this claim"} className="p-1.5 rounded text-slate-400 hover:text-rose-600 hover:bg-slate-100 disabled:opacity-30" disabled={r.status==="Rejected"}><X size={15}/></button>}</> : (r.kind==="vendorbill" && r.status!=="Paid" ? <button onClick={()=>markVendorPaid(r)} title="Mark vendor bill as paid" className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Mark paid</button> : null)}
       fields={(e,s)=>(<><Field label="Vendor" value={e.vendor} onChange={ev=>s({...e,vendor:ev.target.value})}/><Field label="Description" value={e.desc} onChange={ev=>s({...e,desc:ev.target.value})}/><Field label="Amount (PKR)" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Field label="Due" type="date" value={e.due} onChange={ev=>s({...e,due:ev.target.value})}/><Select label="Status" options={["Pending","Approved","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>
     {rej && <Modal title={`Reject claim · ${rej.vendor}`} onClose={()=>setRej(null)}>
       <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm flex justify-between"><span className="text-slate-500">{rej.desc}</span><b>{fmt(rej.amount)}</b></div>
