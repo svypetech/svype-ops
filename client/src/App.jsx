@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 29 Jul 2026 · chat-live-v1";
+const APP_BUILD = "Build 29 Jul 2026 · todo-times-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -1843,6 +1843,7 @@ function SlipModal({ slip, brand, data, sendable = false, onClose }) {
 // Each person plans their day; unfinished tasks carry to the next day automatically,
 // but a reason must be given for every missed task. HR & CEO track it in Team To-dos.
 function todoOwner(session, me) { return (me && me.name) || session?.name || session?.username || "User"; }
+const taskWhen = (iso, dateOnly) => iso ? dtOf(iso) : (dateOnly || "");
 function TodoCard({ data, mutateData, session, me }) {
   const owner = todoOwner(session, me);
   const t = today();
@@ -1865,10 +1866,11 @@ function TodoCard({ data, mutateData, session, me }) {
   const add = async () => {
     const v = text.trim(); if (!v) return;
     setText("");
-    await mutateData((cur)=>({ ...cur, todos:[...(cur.todos||[]), { id:uid(), owner, text:v, date:t, createdOn:t, done:false, carry:0, reasons:[] }] }), null);
+    const now = new Date().toISOString();
+    await mutateData((cur)=>({ ...cur, todos:[...(cur.todos||[]), { id:uid(), owner, text:v, date:t, createdOn:t, createdAt:now, done:false, carry:0, reasons:[] }] }), null);
   };
   const setDone = (task, done) => mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).map(x=>x.id!==task.id ? x
-    : done ? { ...x, done:true, completedOn:t } : { ...x, done:false, completedOn:null, date:t }) }),
+    : done ? { ...x, done:true, completedOn:t, completedAt:new Date().toISOString() } : { ...x, done:false, completedOn:null, completedAt:null, date:t }) }),
     done ? `${owner} completed: ${task.text}` : null);
   const del = (task) => mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).filter(x=>x.id!==task.id) }), null);
   const carryAll = async () => {
@@ -1896,6 +1898,7 @@ function TodoCard({ data, mutateData, session, me }) {
                 onKeyDown={e=>{ if(e.key==="Enter") saveEdit(); if(e.key==="Escape") setEditId(null); }} className={inputCls}/>
             : <span onDoubleClick={()=>{setEditId(x.id);setEditText(x.text);}}>{x.text}</span>}
           {x.carry>0 && <span className="ml-2 text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">carried {x.carry}d</span>}
+          <div className="text-xs text-slate-400 mt-0.5">added {taskWhen(x.createdAt, x.createdOn)}</div>
           {(x.reasons||[]).length>0 && <div className="text-xs text-slate-400 mt-0.5">last reason: {x.reasons[x.reasons.length-1].reason}</div>}
         </div>
         {editId!==x.id && <button onClick={()=>{setEditId(x.id);setEditText(x.text);}} title="Edit wording" className="opacity-0 group-hover:opacity-100 text-slate-300 hover:text-sky-600"><Edit3 size={14}/></button>}
@@ -1904,7 +1907,7 @@ function TodoCard({ data, mutateData, session, me }) {
     </div>
     {doneToday.length>0 && <div className="mt-3 pt-3 border-t border-slate-100">
       <div className="text-xs uppercase tracking-wider text-slate-400 mb-1">Completed today</div>
-      {doneToday.map(x=>(<div key={x.id} className="flex items-start gap-2 py-1"><button onClick={()=>setDone(x, true)} className="mt-0.5 w-4 h-4 rounded bg-emerald-500 text-white grid place-items-center shrink-0" title="Undo"><Check size={11}/></button><div className="flex-1 text-sm text-slate-400 line-through">{x.text}</div></div>))}
+      {doneToday.map(x=>(<div key={x.id} className="flex items-start gap-2 py-1"><button onClick={()=>setDone(x, false)} className="mt-0.5 w-4 h-4 rounded bg-emerald-500 text-white grid place-items-center shrink-0" title="Undo"><Check size={11}/></button><div className="flex-1"><div className="text-sm text-slate-400 line-through">{x.text}</div><div className="text-xs text-slate-400">done {taskWhen(x.completedAt, x.completedOn)}</div></div></div>))}
     </div>}
     {overdue.length>0 && <Modal title={`${overdue.length} task(s) from earlier days not completed`} onClose={()=>{}}>
       <p className="text-xs text-slate-500">These will be moved to today's list. Per policy, please give a reason each one wasn't completed — HR and management can see these reasons.</p>
@@ -1933,7 +1936,7 @@ function MyTodos({ data, mutateData, session, me }) {
         <Card>{pending.length===0?<Empty msg="Nothing pending — you're all clear"/>:<div className="divide-y divide-slate-100">{pending.map(x=>(
           <div key={x.id} className="px-5 py-3">
             <div className="flex items-center justify-between gap-2"><div className="text-sm font-medium text-slate-800">{x.text}</div>
-              <div className="text-xs text-slate-400 whitespace-nowrap">since {x.createdOn}{x.carry>0?` · carried ${x.carry}d`:""}</div></div>
+              <div className="text-xs text-slate-400 whitespace-nowrap">added {taskWhen(x.createdAt, x.createdOn)}{x.carry>0?` · carried ${x.carry}d`:""}</div></div>
             {(x.reasons||[]).length>0 && <div className="mt-1.5 space-y-0.5">{x.reasons.map((r,i)=>(<div key={i} className="text-xs text-slate-500">• {r.missedOn}: <span className="text-slate-600">{r.reason}</span></div>))}</div>}
           </div>))}</div>}</Card>
       </div>
@@ -1942,8 +1945,8 @@ function MyTodos({ data, mutateData, session, me }) {
           <div className="text-xs uppercase tracking-wider text-slate-500 font-medium">Completed {day?`on ${day}`:""}</div>
           <div className="flex items-end gap-2"><div className="min-w-40"><Field label="Check a specific day" type="date" value={day} onChange={e=>setDay(e.target.value)}/></div>{day&&<Btn variant="ghost" onClick={()=>setDay("")}><X size={14}/>Clear</Btn>}</div>
         </div>
-        <Card>{completed.length===0?<Empty msg={day?`Nothing completed on ${day}`:"Nothing completed yet"}/>:<Table cols={["Task","Planned on","Completed","On time"]}>{completed.map(x=>(
-          <Row key={x.id}><Td className="text-slate-700">{x.text}</Td><Td className="text-slate-500">{x.createdOn}</Td><Td className="text-slate-500">{x.completedOn}</Td>
+        <Card>{completed.length===0?<Empty msg={day?`Nothing completed on ${day}`:"Nothing completed yet"}/>:<Table cols={["Task","Added","Completed","On time"]}>{completed.map(x=>(
+          <Row key={x.id}><Td className="text-slate-700">{x.text}</Td><Td className="text-slate-500 whitespace-nowrap">{taskWhen(x.createdAt, x.createdOn)}</Td><Td className="text-slate-500 whitespace-nowrap">{taskWhen(x.completedAt, x.completedOn)}</Td>
           <Td>{x.carry>0?<span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">{x.carry}d late</span>:<span className="text-xs text-emerald-600">on time</span>}</Td></Row>))}</Table>}</Card>
       </div>
     </div>
@@ -1968,12 +1971,12 @@ function TeamTodos({ data, go }) {
       {day && <Card><div className="p-4 text-sm text-slate-600">{plannedThatDay.length} task(s) on their list on {day} · {mine.filter(x=>x.completedOn===day).length} completed that day</div></Card>}
       <div className="text-xs uppercase tracking-wider text-slate-500 font-medium mt-4 mb-2">Pending (carrying forward)</div>
       <Card>{pending.length===0?<Empty msg="Nothing pending — all clear"/>:<div className="divide-y divide-slate-100">{pending.map(x=>(
-        <div key={x.id} className="px-5 py-3"><div className="flex items-center justify-between"><div className="text-sm font-medium text-slate-800">{x.text}</div><div className="text-xs text-slate-400">since {x.createdOn}{x.carry>0?` · carried ${x.carry}d`:""}</div></div>
+        <div key={x.id} className="px-5 py-3"><div className="flex items-center justify-between"><div className="text-sm font-medium text-slate-800">{x.text}</div><div className="text-xs text-slate-400">added {taskWhen(x.createdAt, x.createdOn)}{x.carry>0?` · carried ${x.carry}d`:""}</div></div>
         {(x.reasons||[]).length>0 && <div className="mt-1.5 space-y-0.5">{x.reasons.map((r,i)=>(<div key={i} className="text-xs text-slate-500">• {r.missedOn}: <span className="text-slate-600">{r.reason}</span></div>))}</div>}
         </div>))}</div>}</Card>
       <div className="text-xs uppercase tracking-wider text-slate-500 font-medium mt-5 mb-2">Completed {day?`on ${day}`:""}</div>
-      <Card>{completed.length===0?<Empty msg={day?`Nothing completed on ${day}`:"Nothing completed yet"}/>:<Table cols={["Task","Planned on","Completed","Carried"]}>{completed.map(x=>(
-        <Row key={x.id}><Td className="text-slate-700">{x.text}{(x.reasons||[]).length>0&&<div className="text-xs text-slate-400 mt-0.5">{x.reasons.length} delay reason(s) on record</div>}</Td><Td className="text-slate-500">{x.createdOn}</Td><Td className="text-slate-500">{x.completedOn}</Td><Td>{x.carry>0?<span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">{x.carry}d late</span>:<span className="text-xs text-emerald-600">on time</span>}</Td></Row>))}</Table>}</Card>
+      <Card>{completed.length===0?<Empty msg={day?`Nothing completed on ${day}`:"Nothing completed yet"}/>:<Table cols={["Task","Added","Completed","Carried"]}>{completed.map(x=>(
+        <Row key={x.id}><Td className="text-slate-700">{x.text}{(x.reasons||[]).length>0&&<div className="text-xs text-slate-400 mt-0.5">{x.reasons.length} delay reason(s) on record</div>}</Td><Td className="text-slate-500 whitespace-nowrap">{taskWhen(x.createdAt, x.createdOn)}</Td><Td className="text-slate-500 whitespace-nowrap">{taskWhen(x.completedAt, x.completedOn)}</Td><Td>{x.carry>0?<span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">{x.carry}d late</span>:<span className="text-xs text-emerald-600">on time</span>}</Td></Row>))}</Table>}</Card>
     </>);
   }
   return (<>
@@ -2263,6 +2266,14 @@ function Clients({ data, update, patch }) {
   const rows = data.clients;
   const [edit, setEdit] = useState(null); const [open, setOpen] = useState(null);
   const [show, setShow] = useState("active"); const [onboard, setOnboard] = useState(false);
+  // Hooks must run unconditionally, in the same order, on every render. useBatch was
+  // previously called AFTER the onboard/open early returns below — so clicking
+  // "Onboard client" made this render call one fewer hook than the last render, and
+  // React throws on that mismatch. That was the crash. Computed here instead, before
+  // any early return, so it always runs.
+  const isActive = (c)=> (c.status||"Active")==="Active";
+  const filtered = rows.filter(c=> show==="all" ? true : show==="active" ? isActive(c) : !isActive(c));
+  const bcl = useBatch(filtered);
   const blank = { name:"", email:"", whatsapp:"", currency:"PKR", notes:"", retainer:"", status:"Active" };
   const openEdit = (c) => { const r = data.retainers.find(x=>x.client===c.name && x.status==="Active"); setEdit({ ...c, status:c.status||"Active", retainer: r ? r.amount : "" }); };
   const save = (c)=>{
@@ -2296,9 +2307,6 @@ function Clients({ data, update, patch }) {
   };
   if (onboard) return <ClientOnboarding data={data} patch={patch} onCancel={()=>setOnboard(false)} onDone={(rec)=>{ setOnboard(false); setOpen(rec.id); }}/>;
   if (open) { const c = rows.find(r=>r.id===open); if (c) return <ClientProfile c={c} data={data} patch={patch} onBack={()=>setOpen(null)} onEdit={()=>openEdit(c)}/>; }
-  const isActive = (c)=> (c.status||"Active")==="Active";
-  const filtered = rows.filter(c=> show==="all" ? true : show==="active" ? isActive(c) : !isActive(c));
-  const bcl = useBatch(filtered);
   const activeCount = rows.filter(isActive).length;
   return (<>
     <Head title="Clients" sub={`${activeCount} active · ${rows.length} total · used across retainers, invoices, proposals, quotations`} action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>setEdit(blank)}><Plus size={15}/>Quick add</Btn><Btn onClick={()=>setOnboard(true)}><UserPlus size={15}/>Onboard client</Btn></div>}/>
@@ -2316,17 +2324,6 @@ function Clients({ data, update, patch }) {
       <div className="grid grid-cols-2 gap-3"><Field label="Email" value={edit.email} onChange={e=>setEdit({...edit,email:e.target.value})}/><Field label="WhatsApp" value={edit.whatsapp} onChange={e=>setEdit({...edit,whatsapp:e.target.value})} placeholder="9230..."/></div>
       <div className="grid grid-cols-2 gap-3"><Select label="Default currency" options={CURRENCIES} value={edit.currency} onChange={e=>setEdit({...edit,currency:e.target.value})}/><Field label="Monthly retainer (optional)" type="number" value={edit.retainer} onChange={e=>setEdit({...edit,retainer:e.target.value})} placeholder="leave blank if none"/></div>
       <Select label="Status" options={["Active","Inactive"]} value={edit.status||"Active"} onChange={e=>setEdit({...edit,status:e.target.value})}/>
-      <Select label="Pay type" options={["Salaried (monthly)","Freelance (paid per project)"]} value={edit.payType==="Freelance"?"Freelance (paid per project)":"Salaried (monthly)"} onChange={e=>setEdit({...edit,payType:e.target.value.startsWith("Freelance")?"Freelance":"Salaried"})}/>
-      {edit.payType==="Freelance" && <p className="text-xs text-slate-500 bg-sky-50 border border-sky-200 rounded-lg px-3 py-2 -mt-1">Freelancers are left out of monthly payroll. They are paid per project under People → Freelance Projects, and the salary field above is ignored.</p>}
-      <Select label="Employment" options={["Working normally","On notice period"]} value={edit.onNotice?"On notice period":"Working normally"} onChange={e=>setEdit({...edit,onNotice:e.target.value==="On notice period"})}/>
-      {edit.onNotice && <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-3">
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Notice given on" type="date" value={edit.noticeGivenOn||""} onChange={e=>setEdit({...edit,noticeGivenOn:e.target.value})}/>
-          <Field label="Last working day" type="date" value={edit.lastWorkingDay||""} onChange={e=>setEdit({...edit,lastWorkingDay:e.target.value})}/>
-        </div>
-        <Field label="Note (reason, handover, replacement…)" value={edit.noticeNote||""} onChange={e=>setEdit({...edit,noticeNote:e.target.value})}/>
-        <p className="text-xs text-amber-700">They stay fully active — attendance, payroll and to-dos keep working until you set the status to Inactive.</p>
-      </div>}
       <p className="text-xs text-slate-400">Set a monthly retainer to add this client to the Retainers section automatically. Marking a client inactive pauses their retainer.</p>
       <Area label="Notes" value={edit.notes} onChange={e=>setEdit({...edit,notes:e.target.value})}/>
       <Btn onClick={()=>save(edit)}><Check size={15}/>Save</Btn>
@@ -2622,6 +2619,17 @@ function EmployeeForm({ edit, setEdit, save }) {
     <div className="grid grid-cols-2 gap-3"><Field label="Role" value={edit.role} onChange={e=>setEdit({...edit,role:e.target.value})}/><Field label="Department" value={edit.dept} onChange={e=>setEdit({...edit,dept:e.target.value})}/></div>
     <div className="grid grid-cols-2 gap-3"><Field label="Email" value={edit.email} onChange={e=>setEdit({...edit,email:e.target.value})}/><Field label="Phone" value={edit.phone} onChange={e=>setEdit({...edit,phone:e.target.value})}/></div>
     <div className="grid grid-cols-2 gap-3"><Field label="CNIC number" value={edit.cnic} onChange={e=>setEdit({...edit,cnic:e.target.value})} placeholder="00000-0000000-0"/><Field label="Monthly salary (PKR)" type="number" value={edit.salary} onChange={e=>setEdit({...edit,salary:e.target.value})}/></div>
+    <Select label="Pay type" options={["Salaried (monthly)","Freelance (paid per project)"]} value={edit.payType==="Freelance"?"Freelance (paid per project)":"Salaried (monthly)"} onChange={e=>setEdit({...edit,payType:e.target.value.startsWith("Freelance")?"Freelance":"Salaried"})}/>
+    {edit.payType==="Freelance" && <p className="text-xs text-slate-500 bg-sky-50 border border-sky-200 rounded-lg px-3 py-2">Freelancers are left out of monthly payroll. They are paid per project under People → Freelance Projects, and the salary field below is ignored.</p>}
+    <Select label="Employment" options={["Working normally","On notice period"]} value={edit.onNotice?"On notice period":"Working normally"} onChange={e=>setEdit({...edit,onNotice:e.target.value==="On notice period"})}/>
+    {edit.onNotice && <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-3">
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Notice given on" type="date" value={edit.noticeGivenOn||""} onChange={e=>setEdit({...edit,noticeGivenOn:e.target.value})}/>
+        <Field label="Last working day" type="date" value={edit.lastWorkingDay||""} onChange={e=>setEdit({...edit,lastWorkingDay:e.target.value})}/>
+      </div>
+      <Field label="Note (reason, handover, replacement…)" value={edit.noticeNote||""} onChange={e=>setEdit({...edit,noticeNote:e.target.value})}/>
+      <p className="text-xs text-amber-700">They stay fully active — attendance, payroll and to-dos keep working until you set the status to Inactive.</p>
+    </div>}
     <div className="grid grid-cols-2 gap-3"><Field label="Provident fund (% of basic)" type="number" value={edit.pf} onChange={e=>setEdit({...edit,pf:e.target.value})}/><Field label="Joined" type="date" value={edit.joined} onChange={e=>setEdit({...edit,joined:e.target.value})}/></div>
     <Select label="Check-in policy" options={["Office only (geofenced)","Anywhere (work from home)"]} value={edit.remoteAllowed?"Anywhere (work from home)":"Office only (geofenced)"} onChange={e=>setEdit({...edit,remoteAllowed:e.target.value.startsWith("Anywhere")})}/>
     <Select label="Status" options={["Active","Inactive"]} value={edit.status} onChange={e=>setEdit({...edit,status:e.target.value})}/>
