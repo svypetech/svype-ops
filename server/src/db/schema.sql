@@ -333,3 +333,11 @@ CREATE TABLE IF NOT EXISTS files (
 
 -- Who has seen each message (array of user ids). Added for chat read receipts.
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_by JSONB DEFAULT '[]'::jsonb;
+
+-- Per-user last-read marker for each chat channel/DM, used to compute unread counts.
+CREATE TABLE IF NOT EXISTS channel_reads (
+  channel_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  last_read_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (channel_id, user_id)
+);

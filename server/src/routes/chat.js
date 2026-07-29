@@ -76,6 +76,41 @@ router.post("/channels/:id/messages", auth, async (req, res) => {
   res.json(msg);
 });
 
+// Unread counts across every channel/DM the user can see — used for the sidebar
+// badge, the per-conversation badges, and to seed the toast popups on load.
+router.get("/unread", auth, async (req, res) => {
+  const uid = req.user.id;
+  const chans = await pool.query("SELECT id, kind, members, name FROM channels");
+  const visible = chans.rows.filter((c) => c.kind === "channel" || (c.members || []).includes(uid));
+  if (!visible.length) return res.json({ total: 0, byChannel: {} });
+  const reads = await pool.query("SELECT channel_id, last_read_at FROM channel_reads WHERE user_id=$1", [uid]);
+  const readMap = Object.fromEntries(reads.rows.map((r) => [r.channel_id, r.last_read_at]));
+  const byChannel = {};
+  let total = 0;
+  for (const c of visible) {
+    const since = readMap[c.id] || "1970-01-01";
+    const r = await pool.query(
+      "SELECT count(*)::int AS n FROM messages WHERE channel_id=$1 AND user_id != $2 AND created_at > $3",
+      [c.id, uid, since]
+    );
+    const n = r.rows[0].n;
+    if (n > 0) { byChannel[c.id] = n; total += n; }
+  }
+  res.json({ total, byChannel });
+});
+
+// REST fallback for marking a channel read (used if the socket isn't connected).
+router.post("/channels/:id/read", auth, async (req, res) => {
+  const cid = +req.params.id;
+  try {
+    await pool.query(
+      "INSERT INTO channel_reads (channel_id, user_id, last_read_at) VALUES ($1,$2,now()) ON CONFLICT (channel_id, user_id) DO UPDATE SET last_read_at = now()",
+      [cid, req.user.id]
+    );
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Directory of people to message
 router.get("/directory", auth, async (req, res) => {
   const r = await pool.query("SELECT id, username, role, emp_id FROM users WHERE active=TRUE ORDER BY username");

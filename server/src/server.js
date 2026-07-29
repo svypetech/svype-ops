@@ -89,6 +89,21 @@ wss.on("connection", (ws, req) => {
     return;
   }
   ws.channels = new Set();
+  // Auto-join every channel this user can see (all open channels + their own DMs) the
+  // moment they connect — not just whichever one happens to be open on screen. This is
+  // what lets unread badges and the toast popup work app-wide, not only inside Team Chat.
+  (async () => {
+    try {
+      const r = await pool.query("SELECT id, kind, members FROM channels");
+      r.rows.forEach((c) => {
+        const visible = c.kind === "channel" || (c.members || []).includes(ws.user.id);
+        if (!visible) return;
+        ws.channels.add(c.id);
+        if (!clientsByChannel.has(c.id)) clientsByChannel.set(c.id, new Set());
+        clientsByChannel.get(c.id).add(ws);
+      });
+    } catch {}
+  })();
   ws.on("message", (raw) => {
     let m; try { m = JSON.parse(raw); } catch { return; }
     if (m.type === "join" && m.channelId) {
@@ -111,6 +126,11 @@ wss.on("connection", (ws, req) => {
       pool.query(
         "UPDATE messages SET read_by = (SELECT jsonb_agg(DISTINCT v) FROM jsonb_array_elements(COALESCE(read_by,'[]'::jsonb) || to_jsonb($1::int)) v) WHERE channel_id=$2 AND user_id != $1 AND created_at <= now()",
         [ws.user.id, cid]
+      ).catch(() => {});
+      // Marks everything up to now as read for the unread badge/count too.
+      pool.query(
+        "INSERT INTO channel_reads (channel_id, user_id, last_read_at) VALUES ($1,$2,now()) ON CONFLICT (channel_id, user_id) DO UPDATE SET last_read_at = now()",
+        [cid, ws.user.id]
       ).catch(() => {});
       const set = clientsByChannel.get(cid);
       if (set) {

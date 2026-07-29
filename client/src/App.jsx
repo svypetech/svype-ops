@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 29 Jul 2026 · todo-times-v1";
+const APP_BUILD = "Build 29 Jul 2026 · chat-unread-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -553,6 +553,65 @@ const EMP_NAV = [
   { id:"expenses", label:"Expense Claims", icon:Receipt },
 ];
 
+// ===== Chat unread tracking + WhatsApp-style toast popups =====
+// A persistent connection that stays alive app-wide (not just while Team Chat is
+// open) so a badge and a corner popup can tell you a message arrived from anywhere
+// in the portal — exactly like WhatsApp's unread counts and notification banner.
+function useChatUnread(session) {
+  const myId = Number(localStorage.getItem("svype_chat_uid") || 0);
+  const [unreadByChannel, setUnreadByChannel] = useState({});
+  const [toasts, setToasts] = useState([]);
+  const [pendingChannelId, setPendingChannelId] = useState(null);
+  const activeRef = useRef({ onChatTab: false, channelId: null });
+  const wsRef = useRef(null);
+  const toastIdRef = useRef(0);
+
+  const totalUnread = Object.values(unreadByChannel).reduce((a, b) => a + b, 0);
+
+  const markRead = (channelId) => {
+    setUnreadByChannel((p) => { if (!p[channelId]) return p; const n = { ...p }; delete n[channelId]; return n; });
+  };
+  const setActiveChat = (onChatTab, channelId) => { activeRef.current = { onChatTab, channelId }; if (onChatTab && channelId) markRead(channelId); };
+  const dismissToast = (id) => setToasts((p) => p.filter((t) => t.id !== id));
+  const openFromToast = (t) => { setPendingChannelId(t.channelId); dismissToast(t.id); };
+  const clearPendingChannel = () => setPendingChannelId(null);
+
+  useEffect(() => {
+    if (!session) return;
+    let dead = false;
+    apiReq("GET", "/chat/unread").then((r) => { if (!dead) setUnreadByChannel(r.byChannel || {}); }).catch(() => {});
+    const ws = chatSocket((m) => {
+      if (m.type !== "message" || m.message?.userId === myId) return;
+      const cid = m.channelId;
+      const viewing = activeRef.current.onChatTab && activeRef.current.channelId === cid;
+      if (viewing) { wsRef.current?.sendJson({ type: "read", channelId: cid }); return; }
+      setUnreadByChannel((p) => ({ ...p, [cid]: (p[cid] || 0) + 1 }));
+      const id = ++toastIdRef.current;
+      setToasts((p) => [...p.slice(-2), { id, channelId: cid, username: m.message.username, body: m.message.body, at: Date.now() }]);
+      setTimeout(() => dismissToast(id), 6000);
+    });
+    wsRef.current = ws;
+    dead = false;
+    return () => { dead = true; ws.close(); };
+  }, [session?.username]);
+
+  return { totalUnread, unreadByChannel, markRead, setActiveChat, toasts, dismissToast, pendingChannelId, clearPendingChannel, openFromToast };
+}
+function ChatToasts({ toasts, dismissToast, openFromToast, go }) {
+  if (!toasts.length) return null;
+  return (<div className="fixed bottom-5 right-5 z-[90] space-y-2 w-72 max-w-[90vw]">
+    {toasts.map((t) => (
+      <div key={t.id} className="bg-white border border-slate-200 shadow-xl rounded-xl p-3 flex items-start gap-2.5 animate-[svy-rise_.25s_ease]">
+        <div className="w-8 h-8 rounded-full bg-sky-100 text-sky-700 grid place-items-center text-xs font-bold shrink-0">{(t.username||"?")[0].toUpperCase()}</div>
+        <button className="flex-1 min-w-0 text-left" onClick={() => { openFromToast(t); go("chat"); }}>
+          <div className="text-xs font-semibold text-slate-800 truncate">{t.username}</div>
+          <div className="text-xs text-slate-500 truncate">{t.body}</div>
+        </button>
+        <button onClick={() => dismissToast(t.id)} className="text-slate-300 hover:text-slate-500 shrink-0"><X size={14}/></button>
+      </div>
+    ))}
+  </div>);
+}
 export default function App() {
   const [loading, setLoading] = useState(true);
   const [session, setSessionRaw] = useState(() => {
@@ -563,6 +622,9 @@ export default function App() {
     try { s ? localStorage.setItem("svype_session", JSON.stringify(s)) : localStorage.removeItem("svype_session"); } catch {}
   };
   const [tab, setTab] = useState("dash");
+  const [chatChannelId, setChatChannelId] = useState(null);
+  const chat = useChatUnread(session);
+  useEffect(() => { chat.setActiveChat(tab === "chat", chatChannelId); }, [tab, chatChannelId]);
   const [navOpen, setNavOpen] = useState(false);
   const [data, setData] = useState(SEED);
   const dataRef = useRef(SEED); dataRef.current = data;
@@ -734,10 +796,10 @@ export default function App() {
           {isEmp
             ? empVisible.map(n=>{ const I=n.icon; return (
                 <button key={n.id} onClick={()=>{setTab(n.id);setNavOpen(false);}} className={`w-full flex items-center gap-3 px-5 py-2.5 text-sm transition ${active===n.id?"bg-slate-800 text-white border-r-2 border-sky-500":"text-slate-400 hover:text-white hover:bg-slate-800"}`}>
-                  <I size={17}/> {n.label}</button>); })
+                  <I size={17}/> {n.label}{n.id==="chat"&&chat.totalUnread>0&&<span className="ml-auto bg-rose-500 text-white text-[10px] font-bold rounded-full min-w-[18px] h-[18px] px-1 grid place-items-center">{chat.totalUnread>99?"99+":chat.totalUnread}</span>}</button>); })
             : groups.filter(g=>!g.bottom).map(g=>{ const I=g.icon; const on=activeGroup?.id===g.id; return (
                 <button key={g.id} onClick={()=>{ setTab(g.tabs[0]); setNavOpen(false); }} className={`w-full flex items-center gap-3 px-5 py-2.5 text-sm transition ${on?"bg-slate-800 text-white border-r-2 border-sky-500":"text-slate-400 hover:text-white hover:bg-slate-800"}`}>
-                  <I size={17}/> {g.label}</button>); })}
+                  <I size={17}/> {g.label}{g.id==="chat"&&chat.totalUnread>0&&<span className="ml-auto bg-rose-500 text-white text-[10px] font-bold rounded-full min-w-[18px] h-[18px] px-1 grid place-items-center">{chat.totalUnread>99?"99+":chat.totalUnread}</span>}</button>); })}
         </nav>
         <div className="border-t border-slate-700">
           {!isEmp && groups.filter(g=>g.bottom).map(g=>{ const I=g.icon; const on=activeGroup?.id===g.id; return (
@@ -752,6 +814,7 @@ export default function App() {
       </aside>
 
       <SaveStatus/>
+      <ChatToasts toasts={chat.toasts} dismissToast={chat.dismissToast} openFromToast={chat.openFromToast} go={setTab}/>
       <main className="flex-1 min-w-0 overflow-y-auto">
         <ErrorBoundary key={active}>
         <div className="sticky top-0 z-30 flex items-center gap-3 px-4 py-2.5 bg-white border-b border-slate-200">
@@ -779,7 +842,7 @@ export default function App() {
               </div>
             ) : (<>
             {active==="dash" && <EmpDashboard {...props}/>}
-            {active==="chat" && <TeamChat session={session}/>}
+            {active==="chat" && <TeamChat session={session} unreadByChannel={chat.unreadByChannel} markRead={chat.markRead} pendingChannelId={chat.pendingChannelId} clearPendingChannel={chat.clearPendingChannel} onActiveChannel={setChatChannelId}/>}
             {active==="profile" && <EmpProfile {...props}/>}
             {active==="attendance" && <EmpAttendance {...props}/>}
             {active==="todos" && <MyTodos {...props}/>}
@@ -792,7 +855,7 @@ export default function App() {
             {active==="dash" && <Dashboard {...props}/>}
             {active==="todos" && <TeamTodos {...props}/>}
             {active==="gigs" && <Gigs {...props}/>}
-            {active==="chat" && <TeamChat session={session}/>}
+            {active==="chat" && <TeamChat session={session} unreadByChannel={chat.unreadByChannel} markRead={chat.markRead} pendingChannelId={chat.pendingChannelId} clearPendingChannel={chat.clearPendingChannel} onActiveChannel={setChatChannelId}/>}
             {active==="employees" && <Employees {...props}/>}
             {active==="users" && <UsersAccess {...props}/>}
             {active==="permissions" && <Permissions {...props}/>}
@@ -4538,7 +4601,7 @@ function BrandSettings({ brand, saveBrand }) {
 }
 
 /* ===================== TEAM CHAT (server-backed) ===================== */
-function TeamChat({ session }) {
+function TeamChat({ session, unreadByChannel={}, markRead=()=>{}, pendingChannelId=null, clearPendingChannel=()=>{}, onActiveChannel=()=>{} }) {
   const myId = Number(localStorage.getItem("svype_chat_uid") || 0);
   const myName = session?.username || session?.name || "me";
   // A DM's stored name is fixed at creation and reflects only whoever started it —
@@ -4565,7 +4628,14 @@ function TeamChat({ session }) {
   const endRef = useRef(null);
 
   const loadChannels = async () => {
-    try { const ch = await apiReq("GET", "/chat/channels"); setChannels(ch); if (!active && ch.length) setActive(ch[0]); } catch {}
+    try {
+      const ch = await apiReq("GET", "/chat/channels"); setChannels(ch);
+      if (pendingChannelId) {
+        const c = ch.find(x => x.id === pendingChannelId);
+        if (c) setActive(c);
+        clearPendingChannel();
+      } else if (!active && ch.length) setActive(ch[0]);
+    } catch {}
   };
   useEffect(() => { loadChannels(); apiReq("GET", "/chat/directory").then(setDirectory).catch(()=>{}); }, []);
 
@@ -4587,7 +4657,12 @@ function TeamChat({ session }) {
     });
     wsRef.current = ws;
     setTypers([]);
-    return () => ws.close();
+    return () => { ws.close(); onActiveChannel(null); };
+  }, [active?.id]);
+
+  useEffect(() => {
+    onActiveChannel(active ? active.id : null);
+    if (active) markRead(active.id);
   }, [active?.id]);
 
   useEffect(() => {
@@ -4635,12 +4710,18 @@ function TeamChat({ session }) {
         </div>
         <div className="flex-1 overflow-y-auto p-2">
           <div className="text-xs uppercase text-slate-400 px-2 mb-1">Channels</div>
-          {chans.map((c) => (
-            <button key={c.id} onClick={() => setActive(c)} className={`w-full text-left px-2 py-1.5 rounded text-sm flex items-center gap-1.5 ${active?.id === c.id ? "bg-sky-50 text-sky-700" : "hover:bg-slate-50"}`}><Hash size={13} />{c.name}</button>
-          ))}
+          {chans.map((c) => { const n = unreadByChannel[c.id] || 0; return (
+            <button key={c.id} onClick={() => setActive(c)} className={`w-full text-left px-2 py-1.5 rounded text-sm flex items-center gap-1.5 ${active?.id === c.id ? "bg-sky-50 text-sky-700" : "hover:bg-slate-50"}`}>
+              <Hash size={13} /><span className={`flex-1 truncate ${n>0?"font-semibold text-slate-900":""}`}>{c.name}</span>
+              {n>0 && <span className="bg-rose-500 text-white text-[10px] font-bold rounded-full min-w-[18px] h-[18px] px-1 grid place-items-center shrink-0">{n>99?"99+":n}</span>}
+            </button>); })}
           <div className="flex items-center justify-between mt-3 mb-1 px-2"><span className="text-xs uppercase text-slate-400">Direct</span><button onClick={() => setShowDir((s) => !s)} className="text-sky-600"><Plus size={13} /></button></div>
           {showDir && (<div className="bg-slate-50 rounded p-1 mb-2">{directory.length ? directory.map((u) => (<button key={u.id} onClick={() => startDm(u.id)} className="w-full text-left px-2 py-1 rounded text-xs hover:bg-white">{u.username}</button>)) : <div className="text-xs text-slate-400 px-2 py-1">No other users yet</div>}</div>)}
-          {dms.map((c) => (<button key={c.id} onClick={() => setActive(c)} className={`w-full text-left px-2 py-1.5 rounded text-sm ${active?.id === c.id ? "bg-sky-50 text-sky-700" : "hover:bg-slate-50"}`}>@ {dmLabel(c, directory)}</button>))}
+          {dms.map((c) => { const n = unreadByChannel[c.id] || 0; return (
+            <button key={c.id} onClick={() => setActive(c)} className={`w-full text-left px-2 py-1.5 rounded text-sm flex items-center gap-1.5 ${active?.id === c.id ? "bg-sky-50 text-sky-700" : "hover:bg-slate-50"}`}>
+              <span className={`flex-1 truncate ${n>0?"font-semibold text-slate-900":""}`}>@ {dmLabel(c, directory)}</span>
+              {n>0 && <span className="bg-rose-500 text-white text-[10px] font-bold rounded-full min-w-[18px] h-[18px] px-1 grid place-items-center shrink-0">{n>99?"99+":n}</span>}
+            </button>); })}
         </div>
       </div>
       <div className="flex-1 flex flex-col min-w-0">
