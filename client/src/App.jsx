@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 29 Jul 2026 · invoice-fix-v1";
+const APP_BUILD = "Build 29 Jul 2026 · receivable-link-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -3815,13 +3815,20 @@ function Retainers({ data, update, patch, brand, go }) {
     let newRets = rets;
     if (shortfall>0 && carryChoice==="next") newRets = rets.map(r=>r.id===pay.retainerId ? { ...r, carry:(+r.carry||0)+shortfall } : r);
     if (overpay>0 && overChoice==="credit") newRets = newRets.map(r=>r.id===pay.retainerId ? { ...r, carry:(+r.carry||0)-overpay } : r);
+    // Any receivable already linked to THIS invoice is superseded by this payment —
+    // recomputed fresh below, so re-opening and changing the amount never leaves a
+    // stale or duplicate entry behind.
+    let newRecv = (data.receivables||[]).filter(r => r.sourceInvoiceId !== pay.id);
+    if (shortfall>0 && carryChoice==="receivable") {
+      newRecv = [{ id:uid(), client:pay.client, desc:`Retainer — ${pay.month} (balance)`, amount:shortfall, currency:pay.currency, due:pay.due||today(), status:"Outstanding", sourceInvoiceId:pay.id, sourceType:"retainer", sourceNumber:pay.number }, ...newRecv];
+    }
     // create a payment receipt for the amount received
-    const patchObj = { retainerInvoices:newInvs, retainers:newRets };
+    const patchObj = { retainerInvoices:newInvs, retainers:newRets, receivables:newRecv };
     if (recv > 0) {
       const r = makeReceipt({ client:pay.client, amount:recv, currency:pay.currency, forText:`Retainer — ${pay.month}`, account:accountName, source:"retainer", sourceNumber:pay.number });
       patchObj.receipts = [r, ...(data.receipts||[])];
     }
-    patch(patchObj, `Payment recorded for ${pay.client} (${pay.number})`); setPay(null);
+    patch(patchObj, `Payment recorded for ${pay.client} (${pay.number})${shortfall>0 && carryChoice==="receivable" ? ` — ${fmt(shortfall,pay.currency)} added to Receivables` : ""}`); setPay(null);
   };
   return (<>
     <Head title="Retainers" sub="Invoices are created only when you click Generate now (never on refresh). Issued 1st, due 5th of next month." action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>go("accounts")}><Landmark size={15}/>Accounts</Btn><Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn></div>}/>
@@ -3899,7 +3906,7 @@ function Retainers({ data, update, patch, brand, go }) {
 function PayModal({ inv, accounts, onClose, onConfirm, onManageAccounts }) {
   const [received, setReceived] = useState(String(inv.total));
   const [accountName, setAccountName] = useState(accounts[0]?.name || "");
-  const [carryChoice, setCarryChoice] = useState("next");
+  const [carryChoice, setCarryChoice] = useState("receivable");   // the sensible default — money owed should be visible, not silently rolled or dropped
   const [overChoice, setOverChoice] = useState("credit");
   const recv = +received||0;
   const shortfall = Math.max(0, inv.total - recv);
@@ -3908,7 +3915,10 @@ function PayModal({ inv, accounts, onClose, onConfirm, onManageAccounts }) {
     <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm flex justify-between"><span className="text-slate-500">Amount due</span><b>{fmt(inv.total,inv.currency)}</b></div>
     <Field label={`How much was received? (${inv.currency})`} type="number" value={received} onChange={e=>setReceived(e.target.value)}/>
     {accounts.length>0 ? (<div><Select label="Received in which account?" options={accounts.map(a=>a.name)} value={accountName} onChange={e=>setAccountName(e.target.value)}/><button onClick={onManageAccounts} className="text-sky-600 text-xs mt-1 hover:underline">Manage accounts</button></div>) : (<Field label="Received in which account?" value={accountName} onChange={e=>setAccountName(e.target.value)} placeholder="Type account name"/>)}
-    {shortfall>0 && <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2"><div className="text-sm text-amber-800">Short by {fmt(shortfall,inv.currency)}. What should happen to the rest?</div><label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" checked={carryChoice==="next"} onChange={()=>setCarryChoice("next")} className="accent-sky-600"/> Carry forward to next month's invoice</label><label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" checked={carryChoice==="discard"} onChange={()=>setCarryChoice("discard")} className="accent-sky-600"/> Leave it / write off</label></div>}
+    {shortfall>0 && <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2"><div className="text-sm text-amber-800">Short by {fmt(shortfall,inv.currency)}. What should happen to the rest?</div>
+      <label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" checked={carryChoice==="receivable"} onChange={()=>setCarryChoice("receivable")} className="accent-sky-600"/> Track as a receivable — shows in Finance → Receivables until collected</label>
+      <label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" checked={carryChoice==="next"} onChange={()=>setCarryChoice("next")} className="accent-sky-600"/> Carry forward to next month's invoice instead</label>
+      <label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" checked={carryChoice==="discard"} onChange={()=>setCarryChoice("discard")} className="accent-sky-600"/> Leave it / write off</label></div>}
     {overpay>0 && <div className="bg-sky-50 border border-sky-200 rounded-lg p-3 space-y-2"><div className="text-sm text-sky-800">Paid {fmt(overpay,inv.currency)} more than due. What should happen to the extra?</div><label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" checked={overChoice==="credit"} onChange={()=>setOverChoice("credit")} className="accent-sky-600"/> Credit to next month (reduces next invoice)</label><label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" checked={overChoice==="keep"} onChange={()=>setOverChoice("keep")} className="accent-sky-600"/> Keep as extra / advance (no adjustment)</label></div>}
     <Btn onClick={()=>onConfirm({ received, accountName, carryChoice, overChoice })}><Check size={15}/>{shortfall>0?"Record partial payment":"Mark as paid"}</Btn>
   </Modal>);
@@ -4235,7 +4245,7 @@ function Receivables({ data, update }) {
   return <Ledger noun="receivable" title="Receivables" sub={`Expected · ${fmt(rows.filter(r=>r.status!=="Paid").reduce((s,r)=>s+ +r.amount,0))}`} rows={rows} setRows={setRows}
     blank={()=>({client:"",desc:"",amount:"",due:today(),status:"Outstanding"})}
     cols={["Client","Description","Amount","Due","Status"]}
-    render={r=>(<><Td className="font-medium">{r.client}</Td><Td className="text-slate-500">{r.desc}</Td><Td>{fmt(r.amount)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
+    render={r=>(<><Td className="font-medium">{r.client}</Td><Td className="text-slate-500">{r.desc}{r.sourceInvoiceId&&<div className="text-xs text-sky-600 mt-0.5">auto-tracked from invoice {r.sourceNumber||r.sourceInvoiceId}</div>}</Td><Td>{fmt(r.amount,r.currency)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
     fields={(e,s)=>(<><ClientInput clients={clients} value={e.client} onChange={ev=>s({...e,client:ev.target.value})}/><Field label="Description" value={e.desc} onChange={ev=>s({...e,desc:ev.target.value})}/><Field label="Amount (PKR)" type="number" value={e.amount} onChange={ev=>s({...e,amount:ev.target.value})}/><Field label="Due" type="date" value={e.due} onChange={ev=>s({...e,due:ev.target.value})}/><Select label="Status" options={["Outstanding","Paid","Overdue"]} value={e.status} onChange={ev=>s({...e,status:ev.target.value})}/></>)}/>;
 }
 
