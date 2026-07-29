@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 29 Jul 2026 · hr-fixes-v1";
+const APP_BUILD = "Build 29 Jul 2026 · invoice-fix-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -237,6 +237,44 @@ const fileRef = (o, k) => {
     file: raw && !raw.startsWith("data:image") ? raw : null,
   };
 };
+const ONES_W = ["","One","Two","Three","Four","Five","Six","Seven","Eight","Nine","Ten","Eleven","Twelve","Thirteen","Fourteen","Fifteen","Sixteen","Seventeen","Eighteen","Nineteen"];
+const TENS_W = ["","","Twenty","Thirty","Forty","Fifty","Sixty","Seventy","Eighty","Ninety"];
+function below1000W(n) {
+  let s2 = "";
+  if (n >= 100) { s2 += ONES_W[Math.floor(n/100)] + " Hundred"; n %= 100; if (n) s2 += " "; }
+  if (n >= 20) { s2 += TENS_W[Math.floor(n/10)]; n %= 10; if (n) s2 += " " + ONES_W[n]; }
+  else if (n) s2 += ONES_W[n];
+  return s2;
+}
+function amountInWords(n) {   // South-Asian units: crore / lakh / thousand
+  n = Math.round(Math.abs(+n || 0));
+  if (!n) return "Zero";
+  const parts = [];
+  const crore = Math.floor(n / 10000000); n %= 10000000;
+  const lakh = Math.floor(n / 100000); n %= 100000;
+  const thousand = Math.floor(n / 1000); n %= 1000;
+  if (crore) parts.push(below1000W(crore) + " Crore");
+  if (lakh) parts.push(below1000W(lakh) + " Lakh");
+  if (thousand) parts.push(below1000W(thousand) + " Thousand");
+  if (n) parts.push(below1000W(n));
+  return parts.join(" ");
+}
+// A claim's attachments, normalised: whether it used the old single-file fields or
+// the new multi-file list, anything that displays a receipt sees the same shape.
+const receiptList = (p) => {
+  if (Array.isArray(p.receipts) && p.receipts.length) return p.receipts;
+  const single = fileRef(p, "receipt");
+  return (single.fileId || single.img || single.file) ? [{ ...single, name: p.receiptName }] : [];
+};
+function ReceiptThumbs({ list, size=32 }) {
+  if (!list || !list.length) return null;
+  return (<div className="flex items-center gap-1 flex-wrap">
+    {list.map((r,i)=>(<button key={i} onClick={(e)=>{e.stopPropagation(); openStored(r, r.name||`receipt-${i+1}`);}} title={r.name||`Receipt ${i+1} of ${list.length}`}
+      className="rounded border border-slate-200 overflow-hidden hover:ring-2 hover:ring-sky-400 shrink-0" style={{width:size,height:size}}>
+      <StoredImg d={r} className="w-full h-full object-cover"/>
+    </button>))}
+  </div>);
+}
 // ===== File storage =====
 // Uploaded files are kept in their own server table, not inside the shared data
 // document. The document only holds a small id, so saving a record never re-uploads
@@ -1311,7 +1349,7 @@ const Empty = ({ msg }) => <div className="px-4 py-12 text-center text-slate-400
 function ClientInput({ label="Client", clients, value, onChange }) {
   return (<label className="block"><span className="text-xs text-slate-500 mb-1 block">{label}</span>
     <input list="client-list" value={value} onChange={onChange} className={inputCls} placeholder="Type or pick a client"/>
-    <datalist id="client-list">{clients.map(c=><option key={c.id} value={c.name}/>)}</datalist></label>);
+    <datalist id="client-list">{(clients||[]).map(c=><option key={c.id} value={c.name}/>)}</datalist></label>);
 }
 
 /* ---------------- leave helpers ---------------- */
@@ -1709,7 +1747,7 @@ function EmpPayslips({ data, update, mutateData, brand, me }) {
     {slip && <SlipModal slip={slip} brand={brand} data={data} onClose={()=>setSlip(null)}/>}
   </>);
 }
-function EmpTimesheet({ data, update, me }) {
+function EmpTimesheet({ data, update, mutateData, session, me }) {
   const blank = { client:"", date:today(), work:"", status:"Completed", hours:"" };
   const [f, setF] = useState(blank); const [editId, setEditId] = useState(null);
   const mine = data.timesheets.filter(t=>t.employee===me.name).slice().sort((a,b)=>b.date.localeCompare(a.date));
@@ -1722,6 +1760,7 @@ function EmpTimesheet({ data, update, me }) {
   const editRow = (t) => { setEditId(t.id); setF({ client:t.client, date:t.date, work:t.work||t.note||"", status:t.status||"Completed", hours:t.hours||"" }); };
   return (<>
     <Head title="Daily Work Log" sub="Log what you worked on each day and for which client — your founder & HR can see this"/>
+    <div className="mb-5"><TodoCard data={data} mutateData={mutateData} session={session} me={me}/></div>
     <div className="grid lg:grid-cols-2 gap-5">
       <Card><div className="p-5 space-y-3">
         <ClientInput clients={data.clients} value={f.client} onChange={e=>setF({...f,client:e.target.value})}/>
@@ -1733,7 +1772,7 @@ function EmpTimesheet({ data, update, me }) {
     </div></>);
 }
 function EmpExpenses({ data, update, mutateData, me }) {
-  const [f, setF] = useState({ desc:"", amount:"", receipt:null });
+  const [f, setF] = useState({ desc:"", amount:"", receipts:[] });
   const [ap, setAp] = useState(null); const [apErr, setApErr] = useState(""); const [apBusy, setApBusy] = useState(false);
   const sendAppeal = async () => {
     if (!ap.reason.trim()) { setApErr("Please explain why it should be reconsidered."); return; }
@@ -1750,22 +1789,33 @@ function EmpExpenses({ data, update, mutateData, me }) {
   };
   const [err, setErr] = useState("");
   const mine = data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===me.name);
-  const onReceipt = async (file) => {
-    if (!file) return;
-    if (file.size > 20*1024*1024) { setErr("That file is over 20 MB — please compress it first."); return; }
-    const isImg = file.type.startsWith("image/");
-    const dataUrl = isImg ? await readImage(file, 1600, true, 0.82) : await readFile(file);
-    try {
-      const stored = await uploadFile(dataUrl, file.name);        // stored outside the data record
-      setF({ ...f, receipt:null, receiptFileId:stored.fileId, receiptMime:stored.mime, receiptName:file.name, receiptIsImg:isImg });
-      setErr("");
-    } catch { setErr("Couldn't upload the receipt — check your connection and try again."); }
+  const [uploading, setUploading] = useState(false);
+  const onReceipts = async (files) => {
+    if (!files || !files.length) return;
+    setUploading(true); setErr("");
+    const added = [];
+    for (const file of files) {
+      if (file.size > 20*1024*1024) { setErr(`${file.name} is over 20 MB — please compress it first.`); continue; }
+      const isImg = file.type.startsWith("image/");
+      const dataUrl = isImg ? await readImage(file, 1600, true, 0.82) : await readFile(file);
+      try {
+        const stored = await uploadFile(dataUrl, file.name);      // stored outside the data record
+        added.push({ fileId: stored.fileId, mime: stored.mime, name: file.name });
+      } catch { setErr("Couldn't upload one of the files — check your connection and try again."); }
+    }
+    if (added.length) setF((cur) => ({ ...cur, receipts: [...(cur.receipts||[]), ...added] }));
+    setUploading(false);
   };
+  const removeReceipt = (i) => setF((cur) => ({ ...cur, receipts: cur.receipts.filter((_, k) => k !== i) }));
   const submit = () => {
     if (!f.desc || !f.amount) { setErr("Please add a description and amount."); return; }
-    if (!f.receipt && !f.receiptFileId) { setErr("A photo of the bill/receipt is required to submit a claim."); return; }
-    update("payables", [{ id:uid(), vendor:me.name, desc:"Reimbursement: "+f.desc, amount:+f.amount, due:today(), status:"Pending", kind:"reimbursement", settled:false, receipt:f.receipt, receiptFileId:f.receiptFileId, receiptMime:f.receiptMime, receiptName:f.receiptName }, ...data.payables], `${me.name} submitted an expense claim`);
-    setF({ desc:"", amount:"", receipt:null, receiptFileId:null, receiptMime:null, receiptName:"", receiptIsImg:undefined }); setErr("");
+    if (!f.receipts || !f.receipts.length) { setErr("At least one photo of the bill/receipt is required to submit a claim."); return; }
+    // The first attachment is duplicated into the old single-file fields too, so any
+    // screen still expecting the old shape keeps showing something.
+    const first = f.receipts[0];
+    update("payables", [{ id:uid(), vendor:me.name, desc:"Reimbursement: "+f.desc, amount:+f.amount, due:today(), status:"Pending", kind:"reimbursement", settled:false,
+      receipts: f.receipts, receiptFileId:first.fileId, receiptMime:first.mime, receiptName:first.name }, ...data.payables], `${me.name} submitted an expense claim (${f.receipts.length} attachment${f.receipts.length>1?"s":""})`);
+    setF({ desc:"", amount:"", receipts:[] }); setErr("");
   };
   return (<>
     <Head title="Expense Claims" sub="Submit a claim with a receipt — approved claims are added to your salary"/>
@@ -1773,9 +1823,16 @@ function EmpExpenses({ data, update, mutateData, me }) {
       <Card><div className="p-5 space-y-3">
         <Field label="What was it for?" value={f.desc} onChange={e=>setF({...f,desc:e.target.value})} placeholder="e.g. Client meeting fuel, props for shoot"/>
         <Field label="Amount (PKR)" type="number" value={f.amount} onChange={e=>setF({...f,amount:e.target.value})}/>
-        <div><span className="text-xs text-slate-500 mb-1 block">Receipt / bill photo <span className="text-rose-500">*required</span></span>
-          <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500"><Paperclip size={15}/>{f.receipt?"Receipt attached":"Attach receipt / bill"}<input type="file" accept="image/*,application/pdf" className="hidden" onChange={e=>onReceipt(e.target.files[0])}/></label>
-          {(f.receipt||f.receiptFileId) && <button onClick={()=>openStored(fileRef(f,"receipt"), f.receiptName)} className="mt-2 flex items-center gap-2 text-sm text-sky-600 hover:underline"><FileText size={15}/>{f.receiptName||"Attached file"} ↗</button>}
+        <div><span className="text-xs text-slate-500 mb-1 block">Receipts / bills <span className="text-rose-500">*at least one required</span></span>
+          <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500">
+            {uploading?<Loader2 size={15} className="animate-spin"/>:<Paperclip size={15}/>}{uploading?"Uploading…":f.receipts.length?"Add another photo":"Attach receipt(s) / bill(s)"}
+            <input type="file" multiple accept="image/*,application/pdf" className="hidden" disabled={uploading} onChange={e=>{onReceipts([...e.target.files]); e.target.value="";}}/>
+          </label>
+          <p className="text-xs text-slate-400 mt-1">Add every photo for this claim — you can attach as many as you need, one at a time or all together.</p>
+          {f.receipts.length>0 && <div className="mt-2 flex flex-wrap gap-2">{f.receipts.map((r,i)=>(
+            <div key={i} className="relative"><ReceiptThumbs list={[r]} size={52}/>
+              <button onClick={()=>removeReceipt(i)} title="Remove" className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-rose-500 text-white grid place-items-center"><X size={10}/></button>
+            </div>))}</div>}
         </div>
         {err && <div className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{err}</div>}
         <Btn onClick={submit}><Check size={15}/>Submit claim</Btn>
@@ -1785,7 +1842,7 @@ function EmpExpenses({ data, update, mutateData, me }) {
         const canAppeal = rejected && !p.finalRejected && (+p.appealCount||0)===0;
         const lastRej = (p.rejections||[])[(p.rejections||[]).length-1];
         return (<Row key={p.id}>
-          <Td className="font-medium"><div className="flex items-center gap-2">{(p.receipt||p.receiptFileId)&&<button onClick={()=>openStored(fileRef(p,"receipt"), p.receiptName||"receipt")} title="Open receipt" className="w-8 h-8 rounded border border-slate-200 grid place-items-center overflow-hidden hover:ring-2 hover:ring-sky-400"><StoredImg d={fileRef(p,"receipt")} className="w-8 h-8 object-cover"/></button>}{p.desc.replace("Reimbursement: ","")}</div>
+          <Td className="font-medium"><div className="flex items-center gap-2"><ReceiptThumbs list={receiptList(p)}/>{p.desc.replace("Reimbursement: ","")}</div>
             {lastRej && <div className="text-xs text-rose-600 mt-1">HR: {lastRej.reason}</div>}
             {(p.appeals||[]).length>0 && <div className="text-xs text-amber-600 mt-0.5">Your appeal: {p.appeals[p.appeals.length-1].reason}</div>}
           </Td>
@@ -1954,11 +2011,12 @@ function TodoCard({ data, mutateData, session, me }) {
     const v = text.trim(); if (!v) return;
     setText("");
     const now = new Date().toISOString();
-    await mutateData((cur)=>({ ...cur, todos:[...(cur.todos||[]), { id:uid(), owner, text:v, date:t, createdOn:t, createdAt:now, done:false, carry:0, reasons:[] }] }), null);
+    await mutateData((cur)=>({ ...cur, todos:[...(cur.todos||[]), { id:uid(), owner, text:v, date:t, createdOn:t, createdAt:now, done:false, status:"Pending", carry:0, reasons:[] }] }), null);
   };
   const setDone = (task, done) => mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).map(x=>x.id!==task.id ? x
-    : done ? { ...x, done:true, completedOn:t, completedAt:new Date().toISOString() } : { ...x, done:false, completedOn:null, completedAt:null, date:t }) }),
+    : done ? { ...x, done:true, status:"Completed", completedOn:t, completedAt:new Date().toISOString() } : { ...x, done:false, status:"Pending", completedOn:null, completedAt:null, date:t }) }),
     done ? `${owner} completed: ${task.text}` : null);
+  const setStatus = (task, status) => mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).map(x=>x.id===task.id ? { ...x, status } : x) }), null);
   const del = (task) => mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).filter(x=>x.id!==task.id) }), null);
   const carryAll = async () => {
     if (overdue.some(x=>!(reasons[x.id]||"").trim())) { setRErr("Please give a reason for every task that wasn't completed."); return; }
@@ -1976,7 +2034,7 @@ function TodoCard({ data, mutateData, session, me }) {
       <Btn onClick={add}><Plus size={15}/>Add</Btn>
     </div>
     {open.length===0 && doneToday.length===0 && <div className="text-sm text-slate-400 py-2">No tasks yet — plan your day above.</div>}
-    <div className="space-y-1">{open.map(x=>(
+    <div className="space-y-1">{open.map(x=>{ const st = x.status || "Pending"; return (
       <div key={x.id} className="flex items-start gap-2 py-1.5 group">
         <button onClick={()=>setDone(x, true)} className="mt-0.5 w-4 h-4 rounded border border-slate-300 hover:border-sky-500 shrink-0" title="Mark completed"/>
         <div className="flex-1 text-sm text-slate-700">
@@ -1985,12 +2043,15 @@ function TodoCard({ data, mutateData, session, me }) {
                 onKeyDown={e=>{ if(e.key==="Enter") saveEdit(); if(e.key==="Escape") setEditId(null); }} className={inputCls}/>
             : <span onDoubleClick={()=>{setEditId(x.id);setEditText(x.text);}}>{x.text}</span>}
           {x.carry>0 && <span className="ml-2 text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">carried {x.carry}d</span>}
-          <div className="text-xs text-slate-400 mt-0.5">added {taskWhen(x.createdAt, x.createdOn)}</div>
+          <div className="flex items-center gap-2 mt-1">
+            <button onClick={()=>setStatus(x, st==="Pending"?"In Progress":"Pending")} title="Tap to change status" className={`text-xs px-2 py-0.5 rounded-full font-medium ${st==="In Progress"?"bg-sky-100 text-sky-700":"bg-slate-100 text-slate-500"}`}>{st}</button>
+            <span className="text-xs text-slate-400">added {taskWhen(x.createdAt, x.createdOn)}</span>
+          </div>
           {(x.reasons||[]).length>0 && <div className="text-xs text-slate-400 mt-0.5">last reason: {x.reasons[x.reasons.length-1].reason}</div>}
         </div>
         {editId!==x.id && <button onClick={()=>{setEditId(x.id);setEditText(x.text);}} title="Edit wording" className="opacity-0 group-hover:opacity-100 text-slate-300 hover:text-sky-600"><Edit3 size={14}/></button>}
         <button onClick={()=>del(x)} title="Delete task" className="opacity-0 group-hover:opacity-100 text-slate-300 hover:text-rose-500"><X size={14}/></button>
-      </div>))}
+      </div>);})}
     </div>
     {doneToday.length>0 && <div className="mt-3 pt-3 border-t border-slate-100">
       <div className="text-xs uppercase tracking-wider text-slate-400 mb-1">Completed today</div>
@@ -2022,7 +2083,8 @@ function MyTodos({ data, mutateData, session, me }) {
         <div className="text-xs uppercase tracking-wider text-slate-500 font-medium mb-2">Everything still pending</div>
         <Card>{pending.length===0?<Empty msg="Nothing pending — you're all clear"/>:<div className="divide-y divide-slate-100">{pending.map(x=>(
           <div key={x.id} className="px-5 py-3">
-            <div className="flex items-center justify-between gap-2"><div className="text-sm font-medium text-slate-800">{x.text}</div>
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-sm font-medium text-slate-800 flex items-center gap-2">{x.text}<span className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${x.status==="In Progress"?"bg-sky-100 text-sky-700":"bg-slate-100 text-slate-500"}`}>{x.status||"Pending"}</span></div>
               <div className="text-xs text-slate-400 whitespace-nowrap">added {taskWhen(x.createdAt, x.createdOn)}{x.carry>0?` · carried ${x.carry}d`:""}</div></div>
             {(x.reasons||[]).length>0 && <div className="mt-1.5 space-y-0.5">{x.reasons.map((r,i)=>(<div key={i} className="text-xs text-slate-500">• {r.missedOn}: <span className="text-slate-600">{r.reason}</span></div>))}</div>}
           </div>))}</div>}</Card>
@@ -2869,7 +2931,7 @@ function Gigs({ data, update, brand }) {
     {edit && <Modal title={edit.id?"Edit project":"Add project"} onClose={()=>setEdit(null)}>
       <Select label="Freelancer" options={freelancers.map(f=>f.name)} value={edit.employee} onChange={e=>setEdit({...edit,employee:e.target.value})}/>
       <Field label="Project title" value={edit.title} onChange={e=>setEdit({...edit,title:e.target.value})}/>
-      <ClientInput data={data} value={edit.client} onChange={v=>setEdit({...edit,client:v})}/>
+      <ClientInput clients={data.clients} value={edit.client} onChange={e=>setEdit({...edit,client:e.target.value})}/>
       <div className="grid grid-cols-2 gap-3">
         <Field label="Agreed amount" type="number" value={edit.amount} onChange={e=>setEdit({...edit,amount:e.target.value})}/>
         <Select label="Currency" options={CURRENCIES} value={edit.currency} onChange={e=>setEdit({...edit,currency:e.target.value})}/>
@@ -3883,16 +3945,25 @@ function InvoiceBuilder({ data, brand, edit, setEdit, onSave }) {
   const bank = (data.bankAccounts || []).find(b => b.id === edit.bankId);
   return (<Modal title={edit.id ? `Invoice ${edit.number}` : "New invoice"} onClose={() => setEdit(null)} wide>
     <div className="grid sm:grid-cols-2 gap-3">
-      <ClientInput data={data} value={edit.client} onChange={v => setEdit({ ...edit, client: v })}/>
+      <ClientInput clients={data.clients} value={edit.client} onChange={e => setEdit({ ...edit, client: e.target.value })}/>
       <Field label="Invoice number" value={edit.number} onChange={e => setEdit({ ...edit, number: e.target.value })}/>
       <Field label="Issue date" type="date" value={edit.date} onChange={e => setEdit({ ...edit, date: e.target.value })}/>
       <Field label="Due date" type="date" value={edit.due || ""} onChange={e => setEdit({ ...edit, due: e.target.value })}/>
     </div>
+    <div className="grid sm:grid-cols-2 gap-3">
+      <Field label={'Reference (optional, shows as "Re: ..." on the invoice)'} value={edit.reference || ""} onChange={e => setEdit({ ...edit, reference: e.target.value })} placeholder="e.g. Project or campaign name"/>
+      <Field label="Section title" value={edit.sectionTitle || ""} onChange={e => setEdit({ ...edit, sectionTitle: e.target.value })} placeholder="Invoice Details"/>
+    </div>
     <div>
-      <div className="text-xs uppercase tracking-wider text-slate-500 font-medium mb-2">Items</div>
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-xs uppercase tracking-wider text-slate-500 font-medium">Items</div>
+        <label className="flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer"><input type="checkbox" checked={!!edit.tagLabel} onChange={e=>setEdit({...edit, tagLabel: e.target.checked ? (edit.tagLabel||"Type") : ""})}/>Add a middle column (e.g. "Campaign Type")</label>
+      </div>
+      {edit.tagLabel!=null && edit.tagLabel!=="" && <Field label="Middle column heading" value={edit.tagLabel} onChange={e=>setEdit({...edit,tagLabel:e.target.value})} placeholder="Campaign Type"/>}
       <div className="space-y-2">{(edit.items || []).map((l, i) => (
         <div key={i} className="grid grid-cols-12 gap-2 items-end">
-          <div className="col-span-6"><Field label={i === 0 ? "Description" : ""} value={l.desc} onChange={e => setItem(i, { desc: e.target.value })}/></div>
+          <div className={edit.tagLabel ? "col-span-4" : "col-span-6"}><Field label={i === 0 ? "Description" : ""} value={l.desc} onChange={e => setItem(i, { desc: e.target.value })}/></div>
+          {edit.tagLabel && <div className="col-span-2"><Field label={i === 0 ? edit.tagLabel : ""} value={l.tag||""} onChange={e => setItem(i, { tag: e.target.value })}/></div>}
           <div className="col-span-2"><Field label={i === 0 ? "Qty" : ""} type="number" value={l.qty} onChange={e => setItem(i, { qty: e.target.value })}/></div>
           <div className="col-span-3"><Field label={i === 0 ? "Rate" : ""} type="number" value={l.rate} onChange={e => setItem(i, { rate: e.target.value })}/></div>
           <button onClick={() => setEdit({ ...edit, items: edit.items.filter((_, k) => k !== i) })} className="col-span-1 h-9 text-slate-300 hover:text-rose-500"><X size={15}/></button>
@@ -3927,48 +3998,87 @@ function InvoiceBuilder({ data, brand, edit, setEdit, onSave }) {
     <Btn onClick={() => onSave({ ...edit, amount: t.total, altAmount: t.alt })}><Check size={15}/>Save invoice</Btn>
   </Modal>);
 }
+const prettyDate2 = (d) => { if (!d) return ""; const dt = new Date(d); return isNaN(dt) ? String(d) : dt.toLocaleDateString("en-US", { month:"long", day:"numeric", year:"numeric" }); };
+const STATUS_LABEL = { Paid:"PAID", Partial:"PARTIALLY PAID", Overdue:"OVERDUE", Draft:"DRAFT", Sent:"PAYMENT DUE" };
+function darkenHex(hex, factor=0.42) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || "");
+  if (!m) return "#132a4a";
+  const n = parseInt(m[1], 16);
+  const r = Math.round(((n>>16)&255)*factor), g = Math.round(((n>>8)&255)*factor), b = Math.round((n&255)*factor);
+  return `#${[r,g,b].map(v=>v.toString(16).padStart(2,"0")).join("")}`;
+}
 function customInvoiceHTML(inv, brand, bank) {
   const t = invTotals(inv);
-  const rows = (inv.items || []).map(l => `<tr><td>${l.desc || ""}</td><td class="r">${l.qty || 0}</td><td class="r">${fmt(l.rate, inv.currency)}</td><td class="r">${fmt(lineTotal(l), inv.currency)}</td></tr>`).join("");
-  const offices = (brand.offices || []).map(o => `${o.city}: ${o.address}`).join("<br>");
+  const accent = brand.accent || "#0284c7";
+  const dark = darkenHex(accent);
+  const rows = (inv.items || []).map(l => {
+    const sub = (+l.qty||1) !== 1 ? `<div class="sub">${l.qty} &times; ${fmt(l.rate, inv.currency)}</div>` : (l.detail ? `<div class="sub">${l.detail}</div>` : "");
+    return `<tr><td><b>${l.desc || ""}</b>${sub}</td>${inv.tagLabel ? `<td>${l.tag||""}</td>` : ""}<td class="r"><b>${fmt(lineTotal(l), inv.currency)}</b></td></tr>`;
+  }).join("");
+  const statusText = STATUS_LABEL[inv.status] || "PAYMENT DUE";
+  const metaRow = (k,v,i2) => `<tr style="background:${i2%2?"#f1f5f9":"#fff"}"><td class="mk">${k}</td><td class="mv">${v}</td></tr>`;
+  const meta = [
+    metaRow("Invoice No.", inv.number||"", 0),
+    metaRow("Invoice Date", prettyDate2(inv.date), 1),
+    metaRow("Due Date", inv.due?prettyDate2(inv.due):"—", 2),
+  ].join("") + `<tr style="background:#f1f5f9"><td class="mk">Status</td><td class="mv" style="color:${accent};font-weight:700">${statusText}</td></tr>`;
+  const bankRows = [
+    ["Account Title", bank?.title], ["Bank Name", bank?.bank], ["Account Number", bank?.number],
+    ["IBAN", bank?.iban], ["Swift Code", bank?.swift], ["Branch", bank?.branch],
+  ].filter(([,v])=>v).map(([k,v],i2)=>`<tr style="background:${i2%2?"#f1f5f9":"#fff"}"><td class="mk">${k}</td><td class="mv" style="font-weight:700">${v}</td></tr>`).join("");
+  const noteLines = String(inv.notes||"").split("\n").map(l=>l.trim()).filter(Boolean);
   return `<!doctype html><html><head><meta charset="utf-8"><title>${inv.number}</title><style>
-    body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial;color:#0f172a;margin:0;padding:38px}
+    body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial;color:#0f172a;margin:0;padding:40px 44px}
     .top{display:flex;justify-content:space-between;align-items:flex-start;gap:20px}
-    .logo{height:52px}.co{font-size:22px;font-weight:700}.tag{color:#64748b;font-size:12px}
-    .title{color:${brand.accent || "#0284c7"};font-size:20px;font-weight:700;text-align:right}
-    .meta{color:#64748b;font-size:12px;text-align:right}
-    .bar{height:3px;background:${brand.accent || "#0284c7"};margin:14px 0 22px}
-    .who{background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px;margin-bottom:20px;font-size:13px}
-    table{width:100%;border-collapse:collapse;font-size:13px}
-    th{background:${brand.accent || "#0284c7"};color:#fff;text-align:left;padding:9px 10px;font-size:11px;letter-spacing:.04em}
-    td{padding:9px 10px;border-bottom:1px solid #eef2f7}.r{text-align:right}
-    .tot{margin-left:auto;width:290px;font-size:13px;margin-top:14px}
-    .tot div{display:flex;justify-content:space-between;padding:5px 0}
-    .grand{border-top:2px solid #0f172a;font-weight:700;font-size:16px}
-    .alt{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px;margin-top:10px;font-size:12.5px}
-    .bank{margin-top:24px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px;font-size:12.5px}
-    .bank b{display:block;font-size:11px;letter-spacing:.05em;color:#64748b;margin-bottom:6px}
-    .foot{margin-top:26px;border-top:1px solid #e2e8f0;padding-top:10px;color:#94a3b8;font-size:11px}
+    .logo{width:76px;height:76px;object-fit:contain;border-radius:10px}
+    .logofallback{width:76px;height:76px;border-radius:10px;background:${dark};color:#fff;font-size:28px;font-weight:800;display:flex;align-items:center;justify-content:center}
+    .brandword{font-size:38px;font-weight:800;color:${accent};letter-spacing:2px;text-align:right;line-height:1}
+    .brandsub{font-size:11px;font-weight:700;letter-spacing:6px;color:#64748b;text-align:right;margin-top:4px}
+    hr{border:none;border-top:1px solid #e2e8f0;margin:22px 0}
+    .row2{display:flex;justify-content:space-between;gap:24px;align-items:flex-start}
+    .billto-label{font-size:11px;font-weight:700;letter-spacing:2px;color:${accent};margin-bottom:4px}
+    .billto-name{font-size:19px;font-weight:700}
+    .billto-ref{font-size:12px;color:#64748b;margin-top:2px}
+    .meta{border-collapse:collapse;min-width:270px}
+    .meta td{padding:6px 12px;font-size:12px}
+    .mk{color:#64748b;font-weight:600}
+    .mv{text-align:right}
+    .bar{background:${dark};color:#fff;font-size:11px;font-weight:700;letter-spacing:2px;padding:9px 14px;margin-top:26px;text-transform:uppercase}
+    table.items{width:100%;border-collapse:collapse;font-size:13px;margin-top:0}
+    table.items th{background:${accent};color:#fff;text-align:left;padding:9px 14px;font-size:11px;letter-spacing:.04em;text-transform:uppercase}
+    table.items td{padding:11px 14px;border-bottom:1px solid #eef2f7;vertical-align:top}
+    table.items .sub{font-size:11.5px;color:#64748b;font-weight:400;margin-top:2px}
+    .r{text-align:right}
+    .totalbar{background:${dark};color:#fff;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;font-size:12.5px}
+    .totalbar .words{max-width:60%}
+    .totalbar .amt{font-size:18px;font-weight:800;white-space:nowrap}
+    .totalbar .amtlabel{font-size:10px;letter-spacing:2px;opacity:.85;display:block;text-align:right}
+    .alt{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;margin-top:14px;font-size:12.5px}
+    table.pay{width:100%;border-collapse:collapse;font-size:12.5px}
+    table.pay td{padding:8px 14px}
+    .notes-h{color:${accent};font-weight:700;font-size:12.5px;margin-top:22px}
+    .notes ul{margin:6px 0 0;padding-left:18px;font-size:12.5px;color:#334155}
+    .notes li{margin-bottom:3px}
+    .foot{margin-top:30px;border-top:1px solid #e2e8f0;padding-top:14px;text-align:center;color:#94a3b8;font-size:11px}
+    .foot a{color:${accent};text-decoration:none}
     @media print{body{padding:0}}
   </style></head><body>
-    <div class="top"><div>${brand.logo ? `<img class="logo" src="${brand.logo}">` : ""}<div class="co">${brand.company || ""}</div><div class="tag">${brand.tagline || ""}</div></div>
-      <div><div class="title">INVOICE</div><div class="meta">${inv.number}<br>Issued ${inv.date || ""}${inv.due ? `<br>Due ${inv.due}` : ""}</div></div></div>
-    <div class="bar"></div>
-    <div class="who"><b>Billed to</b><br><span style="font-size:15px;font-weight:600">${inv.client || ""}</span></div>
-    <table><thead><tr><th>Description</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead><tbody>${rows}</tbody></table>
-    <div class="tot">
-      <div><span>Subtotal</span><span>${fmt(t.sub, inv.currency)}</span></div>
-      ${t.disc ? `<div><span>Discount</span><span>-${fmt(t.disc, inv.currency)}</span></div>` : ""}
-      ${t.tax ? `<div><span>Tax ${inv.taxPct}%</span><span>${fmt(t.tax, inv.currency)}</span></div>` : ""}
-      <div class="grand"><span>Total</span><span>${fmt(t.total, inv.currency)}</span></div>
+    <div class="top">
+      ${brand.logo ? `<img class="logo" src="${brand.logo}">` : `<div class="logofallback">${(brand.company||"?")[0].toUpperCase()}</div>`}
+      <div><div class="brandword">INVOICE</div><div class="brandsub">${(brand.company||"").split(" ")[0].toUpperCase()}</div></div>
     </div>
-    ${t.alt != null ? `<div class="alt"><b>Payable in ${inv.altCurrency}: ${fmt(t.alt, inv.altCurrency)}</b><br>Converted at 1 ${inv.currency} = ${inv.fxRate} ${inv.altCurrency} on ${inv.date || today()}. The ${inv.currency} amount above is the billed amount.</div>` : ""}
-    ${bank ? `<div class="bank"><b>PAYMENT DETAILS</b>
-      ${bank.title ? `Account title: ${bank.title}<br>` : ""}${bank.bank ? `Bank: ${bank.bank}<br>` : ""}
-      ${bank.number ? `Account number: ${bank.number}<br>` : ""}${bank.iban ? `IBAN: ${bank.iban}<br>` : ""}
-      ${bank.swift ? `SWIFT: ${bank.swift}<br>` : ""}${bank.branch ? `Branch: ${bank.branch}` : ""}</div>` : ""}
-    ${inv.notes ? `<div style="margin-top:16px;font-size:12.5px;color:#475569">${String(inv.notes).replace(/</g, "&lt;").replace(/\n/g, "<br>")}</div>` : ""}
-    <div class="foot">${offices}<br>${[brand.phone, brand.email, brand.website].filter(Boolean).join(" &middot; ")}</div>
+    <hr/>
+    <div class="row2">
+      <div><div class="billto-label">BILL TO</div><div class="billto-name">${inv.client||""}</div>${inv.reference?`<div class="billto-ref">Re: ${inv.reference}</div>`:""}</div>
+      <table class="meta">${meta}</table>
+    </div>
+    <div class="bar">${inv.sectionTitle || "Invoice Details"}</div>
+    <table class="items"><thead><tr><th>Description</th>${inv.tagLabel?`<th>${inv.tagLabel}</th>`:""}<th class="r">Amount (${inv.currency})</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="totalbar"><div class="words">In Words: ${amountInWords(t.total)} Only</div><div><span class="amtlabel">TOTAL</span><span class="amt">${fmt(t.total, inv.currency)}</span></div></div>
+    ${t.alt != null ? `<div class="alt"><b>Payable in ${inv.altCurrency}: ${fmt(t.alt, inv.altCurrency)}</b><br>Converted at 1 ${inv.currency} = ${inv.fxRate} ${inv.altCurrency} on ${prettyDate2(inv.date)}.</div>` : ""}
+    ${bankRows ? `<div class="bar">Payment Details</div><table class="pay">${bankRows}</table>` : ""}
+    ${noteLines.length ? `<div class="notes-h">Notes</div><div class="notes"><ul>${noteLines.map(l=>`<li>${l}</li>`).join("")}</ul></div>` : ""}
+    <div class="foot"><a href="mailto:${brand.email||""}">${brand.email||""}</a> &middot; <a href="https://${brand.website||""}">${brand.website||""}</a> &middot; ${brand.company||""}</div>
     <script>window.onload=()=>window.print()<\/script>
   </body></html>`;
 }
@@ -4085,7 +4195,7 @@ function Payables({ data, update, patch, brand }) {
     <Ledger noun="payable" title="Payables" sub={`Owed · ${fmt(rows.filter(r=>r.status!=="Paid" && r.status!=="Rejected").reduce((s,r)=>s+ +r.amount,0))} · approved vendor bills land here as unpaid until you mark them paid`} rows={rows} setRows={setRows}
       blank={()=>({vendor:"",desc:"",amount:"",due:today(),status:"Pending"})}
       cols={["Vendor","Description","Amount","Due","Status"]}
-      render={r=>(<><Td className="font-medium">{r.vendor}</Td><Td className="text-slate-500"><div className="flex flex-col gap-0.5"><div className="flex items-center gap-2">{(r.receipt||r.receiptFileId)&&<button onClick={(e)=>{e.stopPropagation();openStored(fileRef(r,"receipt"), r.receiptName||"receipt");}} title="Open receipt" className="shrink-0 w-8 h-8 rounded border border-slate-200 grid place-items-center hover:ring-2 hover:ring-sky-400 overflow-hidden"><StoredImg d={fileRef(r,"receipt")} className="w-8 h-8 object-cover"/><FileText size={13} className="text-slate-400"/></button>}{r.desc}{r.payVia==="salary"&&<span className="text-xs text-sky-600">→ {r.payMonth} salary</span>}{r.kind==="vendorbill"&&<span className="text-xs text-slate-400">vendor bill</span>}</div>
+      render={r=>(<><Td className="font-medium">{r.vendor}</Td><Td className="text-slate-500"><div className="flex flex-col gap-0.5"><div className="flex items-center gap-2"><ReceiptThumbs list={receiptList(r)}/>{r.desc}{r.payVia==="salary"&&<span className="text-xs text-sky-600">→ {r.payMonth} salary</span>}{r.kind==="vendorbill"&&<span className="text-xs text-slate-400">vendor bill</span>}</div>
         {(r.rejections||[]).length>0 && <div className="text-xs text-rose-600">Rejected: {r.rejections[r.rejections.length-1].reason}{r.finalRejected?" · final":""}</div>}
         {(r.appeals||[]).length>0 && r.status==="Pending" && <div className="text-xs text-amber-600">Appealed: {r.appeals[r.appeals.length-1].reason}</div>}
       </div></Td><Td>{fmt(r.amount)}</Td><Td className="text-slate-500">{r.due}</Td><Td><Pill s={r.status}/></Td></>)}
@@ -4104,8 +4214,13 @@ function Payables({ data, update, patch, brand }) {
     </Modal>}
     {appr && <Modal title={`Approve reimbursement · ${appr.vendor}`} onClose={()=>setAppr(null)}>
       <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm flex justify-between"><span className="text-slate-500">Amount</span><b>{fmt(appr.amount)}</b></div>
-      {(appr.receipt||appr.receiptFileId) && <div><span className="text-xs text-slate-500 mb-1 block">Attached receipt / invoice — tap to open full size</span>
-        <button onClick={()=>openStored(fileRef(appr,"receipt"), appr.receiptName||"receipt")} className="block text-left"><StoredImg d={fileRef(appr,"receipt")} className="h-40 rounded-lg border border-slate-200 object-cover hover:ring-2 hover:ring-sky-400"/><span className="flex items-center gap-2 text-sm text-sky-600 hover:underline mt-1"><FileText size={15}/>{appr.receiptName||"Open attachment"} ↗</span></button></div>}
+      {(()=>{ const list=receiptList(appr); if(!list.length) return null; return (<div>
+        <span className="text-xs text-slate-500 mb-1 block">{list.length>1?`${list.length} attached receipts — tap any to open full size`:"Attached receipt / invoice — tap to open full size"}</span>
+        <div className="flex flex-wrap gap-2">{list.map((r,i)=>(
+          <button key={i} onClick={()=>openStored(r, r.name||`receipt-${i+1}`)} title={r.name||`Receipt ${i+1}`} className="block text-left">
+            <StoredImg d={r} className="h-32 w-32 rounded-lg border border-slate-200 object-cover hover:ring-2 hover:ring-sky-400"/>
+          </button>))}</div>
+      </div>); })()}
       <Select label="How should this be paid?" options={["salary","direct"]} value={appr.mode} onChange={e=>setAppr({...appr,mode:e.target.value})}/>
       {appr.mode==="salary"
         ? <Select label="Add to which month's salary?" options={months} value={appr.month} onChange={e=>setAppr({...appr,month:e.target.value})}/>
@@ -4491,6 +4606,8 @@ function BankAccounts({ data, update }) {
     a.bank && `Bank: ${a.bank}`,
     `Account Number: ${a.number}`,
     a.iban && `IBAN: ${a.iban}`,
+    a.swift && `SWIFT: ${a.swift}`,
+    a.branch && `Branch: ${a.branch}`,
   ].filter(Boolean).join("\n");
   const copyAcct = async (a) => {
     const text = acctText(a);
@@ -4502,7 +4619,7 @@ function BankAccounts({ data, update }) {
     }
     setCopiedId(a.id); setTimeout(()=>setCopiedId(c=>c===a.id?null:c), 1800);
   };
-  const blank = { type:"Company", label:"", title:"", number:"", iban:"", bank:"", notes:"" };
+  const blank = { type:"Company", label:"", title:"", number:"", iban:"", bank:"", swift:"", branch:"", notes:"" };
   const save = (a) => {
     if (!a.label || !a.number) return;
     if (a.id) update("bankAccounts", rows.map(x=>x.id===a.id?a:x), `Updated bank account: ${a.label}`);
@@ -4521,6 +4638,8 @@ function BankAccounts({ data, update }) {
           {a.title && <div><span className="text-slate-500">Title: </span>{a.title}</div>}
           <div><span className="text-slate-500">Account #: </span><b>{a.number}</b></div>
           {a.iban && <div><span className="text-slate-500">IBAN: </span><b>{a.iban}</b></div>}
+          {a.swift && <div><span className="text-slate-500">SWIFT: </span>{a.swift}</div>}
+          {a.branch && <div><span className="text-slate-500">Branch: </span>{a.branch}</div>}
           {a.notes && <div className="text-slate-500 text-xs mt-1">{a.notes}</div>}
         </div>
         <button onClick={()=>copyAcct(a)} className={`mt-3 w-full flex items-center justify-center gap-1.5 py-2 rounded-lg text-sm font-medium border transition ${copiedId===a.id?"bg-emerald-50 border-emerald-300 text-emerald-700":"bg-white border-slate-300 text-slate-700 hover:border-sky-400 hover:text-sky-700"}`}>
@@ -4534,6 +4653,10 @@ function BankAccounts({ data, update }) {
       <Field label="Account title" value={edit.title} onChange={e=>setEdit({...edit,title:e.target.value})} placeholder="Name on the account"/>
       <Field label="Account number" value={edit.number} onChange={e=>setEdit({...edit,number:e.target.value})}/>
       <Field label="IBAN" value={edit.iban} onChange={e=>setEdit({...edit,iban:e.target.value})} placeholder="PK.."/>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="SWIFT / BIC code" value={edit.swift||""} onChange={e=>setEdit({...edit,swift:e.target.value})} placeholder="e.g. ALFHPKKAXXX"/>
+        <Field label="Branch" value={edit.branch||""} onChange={e=>setEdit({...edit,branch:e.target.value})} placeholder="e.g. G-13/4, Islamabad"/>
+      </div>
       <Field label="Notes" value={edit.notes} onChange={e=>setEdit({...edit,notes:e.target.value})} placeholder="e.g. for vendor payments only"/>
       <Btn onClick={()=>save(edit)}><Check size={15}/>Save</Btn>
     </Modal>}
