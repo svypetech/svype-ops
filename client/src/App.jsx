@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 29 Jul 2026 · chat-unread-v1";
+const APP_BUILD = "Build 29 Jul 2026 · hr-fixes-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -622,6 +622,8 @@ export default function App() {
     try { s ? localStorage.setItem("svype_session", JSON.stringify(s)) : localStorage.removeItem("svype_session"); } catch {}
   };
   const [tab, setTab] = useState("dash");
+  const [viewAs, setViewAs] = useState("admin");
+  const [acctMenu, setAcctMenu] = useState(false);
   const [chatChannelId, setChatChannelId] = useState(null);
   const chat = useChatUnread(session);
   useEffect(() => { chat.setActiveChat(tab === "chat", chatChannelId); }, [tab, chatChannelId]);
@@ -757,7 +759,10 @@ export default function App() {
     onLogin={(u)=>{ identifyForChat(u); setSession(u); setTab("dash"); }}/>;
   if (needsSetup && role !== "employee") return <BrandSetup brand={brand} saveBrand={saveBrand} done={()=>setNeedsSetup(false)} />;
 
-  const isEmp = role === "employee";
+  // An HR/admin account can switch to viewing their own employee profile — same
+  // login, same permissions, just a different screen — without signing out.
+  const canViewAsEmp = role !== "employee" && !!meId;
+  const isEmp = role === "employee" || (viewAs === "employee" && canViewAsEmp);
   const me = isEmp ? data.employees.find(e=>e.id===meId) : null;
   const perms = session?.perms || null; // null/undefined = full access
   const canSeeTab = (id) => {
@@ -821,7 +826,26 @@ export default function App() {
           <button onClick={()=>setNavOpen(true)} className="lg:hidden text-slate-600"><Menu size={22}/></button>
           {!isEmp ? <GlobalSearch data={data} go={setTab}/> : <div className="font-semibold text-sm text-slate-700">Team Portal</div>}
           <div className="flex-1"/>
+          {viewAs==="employee" && <span className="text-xs px-2.5 py-1 rounded-full bg-amber-100 text-amber-700 font-medium mr-1 hidden sm:inline">Viewing as {me?.name || "employee"}</span>}
           <NotifBell items={notes} go={setTab}/>
+          <div className="relative">
+            <button onClick={()=>setAcctMenu(v=>!v)} className="w-8 h-8 rounded-full bg-slate-200 text-slate-700 grid place-items-center text-xs font-bold hover:bg-slate-300" title="Account">
+              {(session?.username||"?")[0].toUpperCase()}
+            </button>
+            {acctMenu && <>
+              <div className="fixed inset-0 z-40" onClick={()=>setAcctMenu(false)}/>
+              <div className="absolute right-0 top-10 z-50 w-56 bg-white border border-slate-200 rounded-xl shadow-xl py-1.5">
+                <div className="px-3 py-2 border-b border-slate-100">
+                  <div className="text-sm font-semibold text-slate-800 truncate">{session?.username}</div>
+                  <div className="text-xs text-slate-400">{isEmp ? "Employee view" : ROLES[role]}</div>
+                </div>
+                {canViewAsEmp && (viewAs==="employee"
+                  ? <button onClick={()=>{setViewAs("admin");setTab("dash");setAcctMenu(false);}} className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 flex items-center gap-2"><Building2 size={15}/>Back to HR / Admin view</button>
+                  : <button onClick={()=>{setViewAs("employee");setTab("dash");setAcctMenu(false);}} className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 flex items-center gap-2"><Users size={15}/>View as Employee</button>)}
+                <button onClick={()=>{setAcctMenu(false);reset();}} className="w-full text-left px-3 py-2 text-sm text-rose-600 hover:bg-rose-50 flex items-center gap-2"><LogOut size={15}/>Sign out</button>
+              </div>
+            </>}
+          </div>
         </div>
         {/* sub-tab bar for grouped admin sections with more than one tab */}
         {!isEmp && activeGroup && activeGroup.tabs.length > 1 && (
@@ -2500,15 +2524,17 @@ function UsersAccess({ data, update }) {
       <Field label="Password" value={edit.password} onChange={e=>setEdit({...edit,password:e.target.value})} placeholder="set a starting password"/>
       <label className="flex items-start gap-2 text-sm text-slate-700 cursor-pointer"><input type="checkbox" checked={edit.mustChange!==false} onChange={e=>setEdit({...edit,mustChange:e.target.checked})} className="mt-0.5"/>
         <span>Ask them to set their own password at first sign-in<div className="text-xs text-slate-400">Recommended — what you type above becomes a one-time code, and only they know their real password afterwards.</div></span></label>
-      <Select label="Role" options={["employee","hr","admin"]} value={edit.role} onChange={e=>setEdit({...edit,role:e.target.value, empId: e.target.value==="employee"?edit.empId:""})}/>
-      {edit.role==="employee" && <label className="block"><span className="text-xs text-slate-500 mb-1 block">Which staff member is this login for?</span>
-        <select value={edit.empId} onChange={e=>setEdit({...edit,empId:e.target.value})} className={inputCls}>
-          <option value="">— select employee —</option>
+      <Select label="Role" options={["employee","hr","admin"]} value={edit.role} onChange={e=>setEdit({...edit,role:e.target.value})}/>
+      <label className="block"><span className="text-xs text-slate-500 mb-1 block">{edit.role==="employee" ? "Which staff member is this login for?" : "Link to their own employee profile (optional)"}</span>
+        <select value={edit.empId||""} onChange={e=>setEdit({...edit,empId:e.target.value})} className={inputCls}>
+          <option value="">{edit.role==="employee" ? "— select employee —" : "— not linked —"}</option>
           {edit.id && data.employees.find(e=>e.id===edit.empId) && !unlinkedEmps.find(e=>e.id===edit.empId) && <option value={edit.empId}>{data.employees.find(e=>e.id===edit.empId).name}</option>}
           {unlinkedEmps.map(e=><option key={e.id} value={e.id}>{e.name}</option>)}
         </select>
-        <span className="text-xs text-slate-400 mt-1 block">Each employee login shows only that person's profile, payslips, attendance and claims.</span>
-      </label>}
+        <span className="text-xs text-slate-400 mt-1 block">{edit.role==="employee"
+          ? "Each employee login shows only that person's profile, payslips, attendance and claims."
+          : "Lets this HR/admin login switch to their own employee view (check-in, payslips, leave) without signing out. Doesn't change their permissions."}</span>
+      </label>
       <Btn onClick={()=>save(edit)}><Check size={15}/>{edit.id?"Save":"Create user"}</Btn>
     </Modal>}
 
@@ -2969,7 +2995,7 @@ function Payroll({ data, patch, update, brand }) {
     setEditDed(null);
   };
   // adjustments (increase or deduction with a reason)
-  const addAdjLine = (sign) => setAdj(a=>({ ...a, list:[...a.list, { id:uid(), reason:"", amount:"", sign }] }));
+  const addAdjLine = (sign, presetReason="") => setAdj(a=>({ ...a, list:[...a.list, { id:uid(), reason:presetReason, amount:"", sign }] }));
   const setAdjLine = (id,k,v) => setAdj(a=>({ ...a, list:a.list.map(l=>l.id===id?{...l,[k]:v}:l) }));
   const rmAdjLine = (id) => setAdj(a=>({ ...a, list:a.list.filter(l=>l.id!==id) }));
   const saveAdj = () => {
@@ -2982,7 +3008,7 @@ function Payroll({ data, patch, update, brand }) {
   const empEmail = (name) => data.employees.find(e=>e.name===name)?.email || "";
   const empAcct = (name) => data.employees.find(e=>e.name===name)?.account || "";
   return (<>
-    <Head title="Payroll & Salary Slips" sub={`${month} · base salary + your adjustments − deductions (no automatic allowance)${pendingReimb?` · ${fmt(pendingReimb)} reimbursements queued`:""}`} action={<Btn onClick={askRun}><Wallet size={15}/>Run payroll · {month}</Btn>}/>
+    <Head title="Payroll & Salary Slips" sub={`${month} · Run creates slips pending review · Adjust/Deductions to edit · View slip for the full breakdown · Approve & pay to finalise${pendingReimb?` · ${fmt(pendingReimb)} reimbursements queued`:""}`} action={<Btn onClick={askRun}><Wallet size={15}/>Run payroll · {month}</Btn>}/>
     <Card><div className="p-4 mb-4 flex flex-wrap items-center gap-3">
       <div className="flex-1 min-w-56"><div className="font-semibold text-sm">Automatic deductions</div>
         <p className="text-xs text-slate-500 mt-0.5">Unpaid leave is always deducted. Late arrivals follow your policy: {auto.graceMin} minutes' grace, then per hour on basic pay. Every figure stays editable on the slip.</p></div>
@@ -3003,9 +3029,9 @@ function Payroll({ data, patch, update, brand }) {
         <SelTd on={bp.has(p.id)} onChange={()=>bp.toggle(p.id)}/>
         <Td className="font-medium">{p.employee}</Td><Td className="text-slate-500">{p.month}</Td><Td className="font-semibold">{fmt(netPay(p))}{(p.adjustments||[]).length>0&&<div className="text-xs text-slate-400 font-normal">{adjTotal(p)>=0?"+":""}{fmt(adjTotal(p))} adj.</div>}</Td>
         <Td className="text-slate-500 text-xs">{empAcct(p.employee)||"— not on file —"}</Td>
-        <Td>{p.paid?<span className="flex items-center gap-2"><Pill s="Paid"/>{p.proof&&<button onClick={(e)=>{e.stopPropagation();openStored(typeof p.proof==="string"?{img:p.proof}:{...p.proof},"payment-proof");}} title="Open payment proof" className="w-7 h-7 rounded border border-slate-200 overflow-hidden grid place-items-center hover:ring-2 hover:ring-sky-400"><StoredImg d={typeof p.proof==="string"?{img:p.proof}:{...p.proof}} className="w-7 h-7 object-cover"/></button>}</span>:<Pill s="Pending"/>}</Td>
+        <Td>{p.paid?<span className="flex items-center gap-2"><Pill s="Paid"/>{p.proof&&<button onClick={(e)=>{e.stopPropagation();openStored(typeof p.proof==="string"?{img:p.proof}:{...p.proof},"payment-proof");}} title="Open payment proof" className="w-7 h-7 rounded border border-slate-200 overflow-hidden grid place-items-center hover:ring-2 hover:ring-sky-400"><StoredImg d={typeof p.proof==="string"?{img:p.proof}:{...p.proof}} className="w-7 h-7 object-cover"/></button>}</span>:<Pill s="Pending review"/>}</Td>
         <Td><button onClick={()=>setSlip(p)} className="text-sky-600 text-xs font-medium hover:underline">View slip</button></Td>
-        <Td><RowActions>{!p.paid && <button onClick={()=>openAdj(p)} title="Add increase / deduction with reason" className="px-2 py-1 rounded text-xs bg-sky-100 text-sky-700 hover:bg-sky-200">Adjust</button>}{!p.paid && <button onClick={()=>setEditDed({...p})} title="Tax / EOBI / PF / advance" className="px-2 py-1 rounded text-xs bg-slate-100 text-slate-600 hover:bg-slate-200">Deductions</button>}{!p.paid && <button onClick={()=>setPayProof({ ...p, proof:null })} className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Mark paid</button>}{p.paid && <button onClick={()=>setPayProof({ ...p })} title="Update payment" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Edit3 size={14}/></button>}</RowActions></Td>
+        <Td><RowActions>{!p.paid && <button onClick={()=>openAdj(p)} title="Add increase / deduction with reason" className="px-2 py-1 rounded text-xs bg-sky-100 text-sky-700 hover:bg-sky-200">Adjust</button>}{!p.paid && <button onClick={()=>setEditDed({...p})} title="Tax / EOBI / PF / advance" className="px-2 py-1 rounded text-xs bg-slate-100 text-slate-600 hover:bg-slate-200">Deductions</button>}{!p.paid && <button onClick={()=>setPayProof({ ...p, proof:null })} title="Approve this slip and record the payment" className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Approve & pay</button>}{p.paid && <button onClick={()=>setPayProof({ ...p })} title="Update payment" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Edit3 size={14}/></button>}</RowActions></Td>
       </Row>))}</Table></Card>
     {bulkPay && (()=>{ const chosen=data.payroll.filter(x=>bp.selected.includes(x.id)); const unpaid=chosen.filter(x=>!x.paid); return (
       <Modal title={`Mark ${unpaid.length} salary slip(s) paid`} onClose={()=>setBulkPay(null)}>
@@ -3052,7 +3078,13 @@ function Payroll({ data, patch, update, brand }) {
     </Modal>}
     {slip && <SlipModal slip={slip} brand={brand} data={data} sendable onClose={()=>setSlip(null)}/>}
     {adj && <Modal title={`Adjust pay · ${adj.employee}`} onClose={()=>setAdj(null)}>
-      <p className="text-xs text-slate-500">Add an increase (bonus, arrears) or a deduction (fine, leave-without-pay) with a reason. Each line appears on the payslip.</p>
+      <p className="text-xs text-slate-500">Add any additional dues (bonus, overtime, allowance, arrears) or a deduction (fine, unpaid leave) with a reason. Each line appears on the payslip and is included in the final payable amount below.</p>
+      <div className="flex flex-wrap gap-1.5">
+        <button onClick={()=>addAdjLine("+","Bonus")} className="text-xs px-2 py-1 rounded-full border border-slate-300 text-slate-600 hover:border-sky-400 hover:text-sky-700">+ Bonus</button>
+        <button onClick={()=>addAdjLine("+","Overtime")} className="text-xs px-2 py-1 rounded-full border border-slate-300 text-slate-600 hover:border-sky-400 hover:text-sky-700">+ Overtime</button>
+        <button onClick={()=>addAdjLine("+","Allowance")} className="text-xs px-2 py-1 rounded-full border border-slate-300 text-slate-600 hover:border-sky-400 hover:text-sky-700">+ Allowance</button>
+        <button onClick={()=>addAdjLine("-","Fine")} className="text-xs px-2 py-1 rounded-full border border-slate-300 text-slate-600 hover:border-rose-400 hover:text-rose-700">− Fine</button>
+      </div>
       <div className="space-y-2">{adj.list.length===0 && <div className="text-xs text-slate-400">No adjustments yet.</div>}
         {adj.list.map(l=>(<div key={l.id} className="flex items-center gap-2">
           <select value={l.sign} onChange={e=>setAdjLine(l.id,"sign",e.target.value)} className="bg-white border border-slate-300 rounded-lg px-2 py-2 text-sm"><option value="+">+ Add</option><option value="-">− Deduct</option></select>
@@ -4329,7 +4361,9 @@ function AttendanceWatchCard({ data, patch }) {
     <label className="flex items-start gap-2 text-sm text-slate-700 cursor-pointer"><input type="checkbox" checked={f.remindEmployee!==false} onChange={e=>save({...f,remindEmployee:e.target.checked})} className="mt-0.5"/>
       <span>Nudge the employee too<div className="text-xs text-slate-400">They get their own reminder at the same time, pointing them at the correction form.</div></span></label>
     {st && <div className="text-xs text-slate-500">Alerts fire at <b>{st.alertsAt.in}</b> and <b>{st.alertsAt.out}</b> (Pakistan). Right now: {st.missingIn} not checked in, {st.missingOut} not checked out.{st.lastInAlert?` Last morning alert: ${st.lastInAlert}.`:""}</div>}
+    {!f.enabled && <div className="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">Reminders are currently <b>Off</b> — nothing will be sent until you switch this On above. This is very likely why HR hasn't been receiving them.</div>}
     {st && !st.emailReady && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">Set up Settings → Email first — alerts are sent from that mailbox.</div>}
+    {st?.lastError && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">Last attempt failed — {st.lastError}</div>}
     <div className="flex flex-wrap gap-2">
       <Btn variant="ghost" onClick={()=>test("in")} disabled={!!busy}>{busy==="in"?<Loader2 size={15} className="animate-spin"/>:<Send size={15}/>}Test morning alert</Btn>
       <Btn variant="ghost" onClick={()=>test("out")} disabled={!!busy}>{busy==="out"?<Loader2 size={15} className="animate-spin"/>:<Send size={15}/>}Test evening alert</Btn>

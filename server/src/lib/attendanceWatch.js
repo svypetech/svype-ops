@@ -12,7 +12,10 @@ const DEFAULTS = {
   tzOffsetMin: 300,       // Pakistan (UTC+5)
   hrEmail: "",            // blank = the sending mailbox
   remindEmployee: true,   // nudge the employee before HR is told
+  weekendDays: [0, 6],    // Sunday=0 .. Saturday=6. Without this the alert fires
+                          // every weekend telling HR the whole team is "missing".
 };
+const isWeekendFor = (offsetMin, weekendDays) => weekendDays.includes(localNow(offsetMin).getUTCDay());
 
 const pad = (n) => String(n).padStart(2, "0");
 const localNow = (off) => new Date(Date.now() + (off || 0) * 60000);
@@ -120,6 +123,7 @@ function startAttendanceWatch() {
       const { doc } = await readState();
       const cfg = cfgOf(doc);
       if (!cfg.enabled) return;
+      if (isWeekendFor(cfg.tzOffsetMin, cfg.weekendDays || DEFAULTS.weekendDays)) return;   // no point telling HR the office is empty on a day off
       const hm = localHM(cfg.tzOffsetMin), date = localDate(cfg.tzOffsetMin);
       const saved = doc.attendanceWatch || {};
       if (hm === addMin(cfg.startTime, +cfg.graceMin || 0) && saved.lastInAlert !== date && guard.in !== date) {
@@ -133,7 +137,11 @@ function startAttendanceWatch() {
         console.log(`[attendance] check-out alert sent (${n} pending)`);
       }
     } catch (e) {
+      // Previously this only went to the server log, which nobody sees — so a
+      // misconfigured mailbox meant the alert silently never arrived, forever.
+      // Recording it here makes it visible right where the toggle lives.
       console.error("[attendance] watch failed:", e.message);
+      try { await stamp("lastError", `${localDate(300)}: ${e.message}`); } catch {}
     }
   }, 30000);
   console.log("[attendance] office-hours watch active");
