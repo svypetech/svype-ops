@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 29 Jul 2026 · receivable-link-v1";
+const APP_BUILD = "Build 30 Jul 2026 · todo-timezone-fix-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -165,7 +165,14 @@ async function _drainSaves() {
   } finally { _saving = false; }
 }
 const uid = () => Math.random().toString(36).slice(2, 10);
-const today = () => new Date().toISOString().slice(0, 10);
+// Uses the DEVICE'S local calendar date, not UTC. The previous UTC-based version
+// meant that for roughly five hours every night (midnight to 5am Pakistan time),
+// today() silently returned YESTERDAY'S date — any task, check-in, or leave day
+// touched during that window was misfiled under the wrong day. This is very likely
+// what caused completed tasks to be swept back into "carry over" the next morning:
+// a task ticked done just after midnight was stamped with the wrong completedOn,
+// so the day-comparison logic no longer recognised it as "done today."
+const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; };
 const monthKey = () => new Date().toISOString().slice(0, 7);
 const monthLabel = () => new Date().toLocaleString("default", { month: "long", year: "numeric" });
 const fmt = (n, cur) => `${cur || "PKR"} ${Number(n || 0).toLocaleString()}`;
@@ -1562,6 +1569,16 @@ function CheckInCard({ data, mutateData, me }) {
     setBusy(true); setMsg(null);
     checkInOut(mutateData, me.name, which, (res)=>{ setBusy(false); setMsg(res); }, !!me.remoteAllowed, myWfh || null);
   };
+  if (me.payType === "Freelance") {
+    return (<Card><div className="p-5">
+      <div className="flex items-center gap-3">
+        <div className="w-9 h-9 rounded-full bg-violet-100 text-violet-700 grid place-items-center shrink-0"><Briefcase size={16}/></div>
+        <div><div className="font-semibold text-sm">You're a freelance team member</div>
+          <p className="text-xs text-slate-500 mt-0.5">No need to check in or out — you're paid per project, not by attendance. See your work under <b>My Projects</b>.</p>
+        </div>
+      </div>
+    </div></Card>);
+  }
   return (<Card><div className="p-5">
     <div className="flex items-center gap-2 text-sm font-semibold mb-3"><Clock size={16} className="text-sky-600"/>Today · {new Date().toLocaleDateString()}</div>
     <div className="flex flex-wrap items-center gap-3">
@@ -1992,7 +2009,9 @@ function TodoCard({ data, mutateData, session, me }) {
   const owner = todoOwner(session, me);
   const t = today();
   const mine = (data.todos||[]).filter(x=>x.owner===owner);
-  const overdue = mine.filter(x=>!x.done && x.date < t);
+  // Belt-and-suspenders: never sweep a task that shows ANY sign of having been
+  // completed, even in the (now-fixed) event `done` and `completedAt` ever disagree.
+  const overdue = mine.filter(x=>!x.done && !x.completedAt && x.date < t);
   const open = mine.filter(x=>!x.done && x.date === t);
   const doneToday = mine.filter(x=>x.completedOn === t);
   const [text, setText] = useState("");
@@ -2013,9 +2032,30 @@ function TodoCard({ data, mutateData, session, me }) {
     const now = new Date().toISOString();
     await mutateData((cur)=>({ ...cur, todos:[...(cur.todos||[]), { id:uid(), owner, text:v, date:t, createdOn:t, createdAt:now, done:false, status:"Pending", carry:0, reasons:[] }] }), null);
   };
-  const setDone = (task, done) => mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).map(x=>x.id!==task.id ? x
-    : done ? { ...x, done:true, status:"Completed", completedOn:t, completedAt:new Date().toISOString() } : { ...x, done:false, status:"Pending", completedOn:null, completedAt:null, date:t }) }),
-    done ? `${owner} completed: ${task.text}` : null);
+  const [savingId, setSavingId] = useState(null);
+  const [failedId, setFailedId] = useState(null);
+  // Ticking a task now genuinely waits for the server to confirm the save before it
+  // shows as final — this is what was previously missing. Before, the checkbox
+  // flipped instantly on-screen the moment it was tapped, whether or not the write
+  // actually reached the server; if it silently failed (a dropped connection, the
+  // phone backgrounding mid-save), the tick was never real, and the next login
+  // showed the honest — but surprising and upsetting — un-ticked state. Now a failed
+  // save visibly reverts and demands a retry instead of quietly losing the change.
+  const setDone = async (task, done) => {
+    setSavingId(task.id); setFailedId(null);
+    const now = new Date().toISOString();
+    try {
+      await mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).map(x=>x.id!==task.id ? x
+        : done
+          ? { ...x, done:true, status:"Completed", completedOn:t, completedAt:now, history:[...(x.history||[]), { at:now, by:owner, event:"completed" }] }
+          : { ...x, done:false, status:"Pending", completedOn:null, completedAt:null, date:t, history:[...(x.history||[]), { at:now, by:owner, event:"reopened" }] }) }),
+        done ? `${owner} completed: ${task.text}` : `${owner} reopened: ${task.text}`);
+    } catch (e) {
+      setFailedId(task.id);
+    } finally {
+      setSavingId(null);
+    }
+  };
   const setStatus = (task, status) => mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).map(x=>x.id===task.id ? { ...x, status } : x) }), null);
   const del = (task) => mutateData((cur)=>({ ...cur, todos:(cur.todos||[]).filter(x=>x.id!==task.id) }), null);
   const carryAll = async () => {
@@ -2036,7 +2076,9 @@ function TodoCard({ data, mutateData, session, me }) {
     {open.length===0 && doneToday.length===0 && <div className="text-sm text-slate-400 py-2">No tasks yet — plan your day above.</div>}
     <div className="space-y-1">{open.map(x=>{ const st = x.status || "Pending"; return (
       <div key={x.id} className="flex items-start gap-2 py-1.5 group">
-        <button onClick={()=>setDone(x, true)} className="mt-0.5 w-4 h-4 rounded border border-slate-300 hover:border-sky-500 shrink-0" title="Mark completed"/>
+        {savingId===x.id
+          ? <div className="mt-0.5 w-4 h-4 shrink-0 grid place-items-center"><Loader2 size={12} className="animate-spin text-sky-500"/></div>
+          : <button onClick={()=>setDone(x, true)} className={`mt-0.5 w-4 h-4 rounded border shrink-0 ${failedId===x.id?"border-rose-400 bg-rose-50":"border-slate-300 hover:border-sky-500"}`} title="Mark completed"/>}
         <div className="flex-1 text-sm text-slate-700">
           {editId===x.id
             ? <input autoFocus value={editText} onChange={e=>setEditText(e.target.value)} onBlur={saveEdit}
@@ -2048,6 +2090,7 @@ function TodoCard({ data, mutateData, session, me }) {
             <span className="text-xs text-slate-400">added {taskWhen(x.createdAt, x.createdOn)}</span>
           </div>
           {(x.reasons||[]).length>0 && <div className="text-xs text-slate-400 mt-0.5">last reason: {x.reasons[x.reasons.length-1].reason}</div>}
+          {failedId===x.id && <div className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded px-2 py-1 mt-1 flex items-center gap-2">Couldn't save — check your connection.<button onClick={()=>setDone(x,true)} className="font-medium underline">Try again</button></div>}
         </div>
         {editId!==x.id && <button onClick={()=>{setEditId(x.id);setEditText(x.text);}} title="Edit wording" className="opacity-0 group-hover:opacity-100 text-slate-300 hover:text-sky-600"><Edit3 size={14}/></button>}
         <button onClick={()=>del(x)} title="Delete task" className="opacity-0 group-hover:opacity-100 text-slate-300 hover:text-rose-500"><X size={14}/></button>
@@ -2125,7 +2168,7 @@ function TeamTodos({ data, go }) {
         </div>))}</div>}</Card>
       <div className="text-xs uppercase tracking-wider text-slate-500 font-medium mt-5 mb-2">Completed {day?`on ${day}`:""}</div>
       <Card>{completed.length===0?<Empty msg={day?`Nothing completed on ${day}`:"Nothing completed yet"}/>:<Table cols={["Task","Added","Completed","Carried"]}>{completed.map(x=>(
-        <Row key={x.id}><Td className="text-slate-700">{x.text}{(x.reasons||[]).length>0&&<div className="text-xs text-slate-400 mt-0.5">{x.reasons.length} delay reason(s) on record</div>}</Td><Td className="text-slate-500 whitespace-nowrap">{taskWhen(x.createdAt, x.createdOn)}</Td><Td className="text-slate-500 whitespace-nowrap">{taskWhen(x.completedAt, x.completedOn)}</Td><Td>{x.carry>0?<span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">{x.carry}d late</span>:<span className="text-xs text-emerald-600">on time</span>}</Td></Row>))}</Table>}</Card>
+        <Row key={x.id}><Td className="text-slate-700">{x.text}{(x.reasons||[]).length>0&&<div className="text-xs text-slate-400 mt-0.5">{x.reasons.length} delay reason(s) on record</div>}{(x.history||[]).length>1&&<div className="text-xs text-slate-400 mt-0.5">{x.history.length} status change(s) — <button onClick={(e)=>{e.stopPropagation();alert(x.history.map(h=>`${h.event} by ${h.by} at ${dtOf(h.at)}`).join("\n"));}} className="underline hover:text-slate-600">view</button></div>}</Td><Td className="text-slate-500 whitespace-nowrap">{taskWhen(x.createdAt, x.createdOn)}</Td><Td className="text-slate-500 whitespace-nowrap">{taskWhen(x.completedAt, x.completedOn)}</Td><Td>{x.carry>0?<span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">{x.carry}d late</span>:<span className="text-xs text-emerald-600">on time</span>}</Td></Row>))}</Table>}</Card>
     </>);
   }
   return (<>
@@ -2769,7 +2812,12 @@ function EmployeeForm({ edit, setEdit, save }) {
     <Field label="Full name" value={edit.name} onChange={e=>setEdit({...edit,name:e.target.value})}/>
     <div className="grid grid-cols-2 gap-3"><Field label="Role" value={edit.role} onChange={e=>setEdit({...edit,role:e.target.value})}/><Field label="Department" value={edit.dept} onChange={e=>setEdit({...edit,dept:e.target.value})}/></div>
     <div className="grid grid-cols-2 gap-3"><Field label="Email" value={edit.email} onChange={e=>setEdit({...edit,email:e.target.value})}/><Field label="Phone" value={edit.phone} onChange={e=>setEdit({...edit,phone:e.target.value})}/></div>
-    <div className="grid grid-cols-2 gap-3"><Field label="CNIC number" value={edit.cnic} onChange={e=>setEdit({...edit,cnic:e.target.value})} placeholder="00000-0000000-0"/><Field label="Monthly salary (PKR)" type="number" value={edit.salary} onChange={e=>setEdit({...edit,salary:e.target.value})}/></div>
+    <div className="grid grid-cols-2 gap-3"><Field label="CNIC number" value={edit.cnic} onChange={e=>setEdit({...edit,cnic:e.target.value})} placeholder="00000-0000000-0"/>
+      <div>
+        <Field label="Monthly salary (PKR)" type="number" value={edit.payType==="Freelance" ? "" : edit.salary} disabled={edit.payType==="Freelance"} onChange={e=>setEdit({...edit,salary:e.target.value})}/>
+        {edit.payType==="Freelance" && <span className="text-xs text-slate-400 mt-1 block">Not used — freelancers are paid per project instead.</span>}
+      </div>
+    </div>
     <Select label="Pay type" options={["Salaried (monthly)","Freelance (paid per project)"]} value={edit.payType==="Freelance"?"Freelance (paid per project)":"Salaried (monthly)"} onChange={e=>setEdit({...edit,payType:e.target.value.startsWith("Freelance")?"Freelance":"Salaried"})}/>
     {edit.payType==="Freelance" && <p className="text-xs text-slate-500 bg-sky-50 border border-sky-200 rounded-lg px-3 py-2">Freelancers are left out of monthly payroll. They are paid per project under People → Freelance Projects, and the salary field below is ignored.</p>}
     <Select label="Employment" options={["Working normally","On notice period"]} value={edit.onNotice?"On notice period":"Working normally"} onChange={e=>setEdit({...edit,onNotice:e.target.value==="On notice period"})}/>
@@ -2782,7 +2830,8 @@ function EmployeeForm({ edit, setEdit, save }) {
       <p className="text-xs text-amber-700">They stay fully active — attendance, payroll and to-dos keep working until you set the status to Inactive.</p>
     </div>}
     <div className="grid grid-cols-2 gap-3"><Field label="Provident fund (% of basic)" type="number" value={edit.pf} onChange={e=>setEdit({...edit,pf:e.target.value})}/><Field label="Joined" type="date" value={edit.joined} onChange={e=>setEdit({...edit,joined:e.target.value})}/></div>
-    <Select label="Check-in policy" options={["Office only (geofenced)","Anywhere (work from home)"]} value={edit.remoteAllowed?"Anywhere (work from home)":"Office only (geofenced)"} onChange={e=>setEdit({...edit,remoteAllowed:e.target.value.startsWith("Anywhere")})}/>
+    {edit.payType!=="Freelance" && <Select label="Check-in policy" options={["Office only (geofenced)","Anywhere (work from home)"]} value={edit.remoteAllowed?"Anywhere (work from home)":"Office only (geofenced)"} onChange={e=>setEdit({...edit,remoteAllowed:e.target.value.startsWith("Anywhere")})}/>}
+    {edit.payType==="Freelance" && <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">Freelancers don't check in or out — their own portal shows a note instead.</p>}
     <Select label="Status" options={["Active","Inactive"]} value={edit.status} onChange={e=>setEdit({...edit,status:e.target.value})}/>
     <div className="grid grid-cols-2 gap-3"><Field label="Bank name" value={edit.bankName||""} onChange={e=>setEdit({...edit,bankName:e.target.value})} placeholder="e.g. Meezan Bank"/><Field label="Account number / IBAN" value={edit.account||""} onChange={e=>setEdit({...edit,account:e.target.value})}/></div>
     <div><span className="text-xs text-slate-500 mb-1 block">Documents (set an expiry to get reminders)</span>
@@ -2821,7 +2870,6 @@ function Attendance({ data, update, mutateData }) {
   const [view, setView] = useState("attendance");
   // HR always overrides: whatever the employee did, HR's mark wins and is stamped as theirs.
   const mark = (emp,status)=>{ mutateData((cur)=>{ const list=cur.attendance||[]; const ex=list.find(a=>a.employee===emp&&a.date===today()); return { ...cur, attendance: ex?list.map(a=>a===ex?{...a,status,markedBy:"HR",markedOn:new Date().toISOString()}:a):[...list,{id:uid(),employee:emp,date:today(),status,markedBy:"HR",markedOn:new Date().toISOString()}] }; }, `Marked ${emp} ${status}`); };
-  const bh = useBatch(data.attendance||[]);
   const [busyTime,setBusyTime]=useState(null);
   const decideTime = async (id,sv,field="timeReq")=>{
     const rec=(data.attendance||[]).find(x=>x.id===id); setBusyTime(id);
@@ -2848,7 +2896,12 @@ function Attendance({ data, update, mutateData }) {
   const [busyLeave,setBusyLeave]=useState(null);
   const setStatus=async (id,s)=>{ const l=data.leaves.find(x=>x.id===id); setBusyLeave(id); try { await mutateData((cur)=>({ ...cur, leaves:(cur.leaves||[]).map(x=>x.id===id?{...x,status:s,decidedOn:today()}:x) }), `Leave ${s.toLowerCase()} for ${l?.employee} — they have been notified`); } finally { setBusyLeave(null); } };
   const locLink = (loc) => loc && loc.lat ? `https://www.google.com/maps?q=${loc.lat},${loc.lng}` : null;
-  const history = [...data.attendance].sort((a,b)=> (b.date||"").localeCompare(a.date||"") || (b.checkIn||"").localeCompare(a.checkIn||""));
+  const [day, setDay] = useState("");
+  const [histEmp, setHistEmp] = useState("");
+  const historyAll = [...data.attendance].sort((a,b)=> (b.date||"").localeCompare(a.date||"") || (b.checkIn||"").localeCompare(a.checkIn||""));
+  const history = historyAll.filter(a => (!day || a.date===day) && (!histEmp || a.employee===histEmp));
+  const histEmpNames = [...new Set(historyAll.map(a=>a.employee).filter(Boolean))].sort();
+  const bh = useBatch(history);
   return (<>
     <Head title="Attendance & Leave" sub="Team marking, check-in/out log, and leave approvals"/>
     <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="attendance"?"primary":"ghost"} onClick={()=>setView("attendance")}>Today's attendance</Btn><Btn variant={view==="history"?"primary":"ghost"} onClick={()=>setView("history")}>Check-in/out log</Btn><Btn variant={view==="leave"?"primary":"ghost"} onClick={()=>setView("leave")}>Leave requests</Btn></div>
@@ -2860,8 +2913,16 @@ function Attendance({ data, update, mutateData }) {
           return <button key={st} onClick={()=>mark(e.name,st)} title={on?`Already marked ${st.toLowerCase()} — click to re-confirm`:`Set ${st.toLowerCase()} — this overrides whatever the employee did`}
             className={`px-2 py-1 rounded text-xs border ${on?onCls:offCls}`}>{st}</button>; })}</div></Td></Row>);})}</Table></Card>
     ):view==="history"?(
-      <><BatchBar count={bh.count} noun="record" onClear={bh.clear} onDelete={()=>{ const ids=new Set(bh.selected); update("attendance", (data.attendance||[]).filter(x=>!ids.has(x.id)), `Deleted ${ids.size} attendance record(s)`); bh.clear(); }}/>
-      <Card><Table cols={[<SelBox key="a" on={bh.allOn} onChange={bh.toggleAll} title="Select all"/>,"Date","Employee","Office","Check-in","Check-out","In loc","Out loc"]}>{history.length===0?<tr><td colSpan={8}><Empty msg="No attendance recorded yet"/></td></tr>:history.map(a=>{const ll=locLink(a.location);const lo=locLink(a.checkOutLocation);return(
+      <>
+      <div className="flex flex-wrap gap-3 mb-4 items-end">
+        <div className="min-w-40"><Field label="Check a specific day" type="date" value={day} onChange={e=>setDay(e.target.value)}/></div>
+        <div className="min-w-44"><Select label="Employee" options={["", ...histEmpNames]} value={histEmp} onChange={e=>setHistEmp(e.target.value)}/></div>
+        <Btn variant="ghost" onClick={()=>setDay(today())}>Today</Btn>
+        {(day||histEmp) && <Btn variant="ghost" onClick={()=>{setDay("");setHistEmp("");}}><X size={14}/>Clear filters</Btn>}
+        <span className="text-xs text-slate-400">{history.length} of {historyAll.length} record(s)</span>
+      </div>
+      <BatchBar count={bh.count} noun="record" onClear={bh.clear} onDelete={()=>{ const ids=new Set(bh.selected); update("attendance", (data.attendance||[]).filter(x=>!ids.has(x.id)), `Deleted ${ids.size} attendance record(s)`); bh.clear(); }}/>
+      <Card><Table cols={[<SelBox key="a" on={bh.allOn} onChange={bh.toggleAll} title="Select all"/>,"Date","Employee","Office","Check-in","Check-out","In loc","Out loc"]}>{history.length===0?<tr><td colSpan={8}><Empty msg={day?`No attendance recorded on ${day}`:"No attendance recorded yet"}/></td></tr>:history.map(a=>{const ll=locLink(a.location);const lo=locLink(a.checkOutLocation);return(
         <Row key={a.id}><SelTd on={bh.has(a.id)} onChange={()=>bh.toggle(a.id)}/><Td className="text-slate-500 whitespace-nowrap">{a.date}</Td><Td className="font-medium">{a.employee}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td><Td className="text-slate-500">{effIn(a)?timeOf(effIn(a)):"—"}<TimeReqActions a={a}/><TimeReqActions a={a} field="outReq" label="check-out"/>{a?.wfh&&<div className="text-xs text-indigo-600">work from home{a.status==="Requested"?" · awaiting approval":""}</div>}</Td><Td className="text-slate-500">{effOut(a)?timeOf(effOut(a)):"—"}{a.outReq?.status==="Pending"&&<div className="text-xs text-amber-600">check-out correction pending</div>}{a.outReq?.status==="Approved"&&<div className="text-xs text-emerald-600">corrected · was {a.checkOut?timeOf(a.checkOut):"—"}</div>}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td><Td className="text-xs">{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td></Row>);})}</Table></Card></>
     ):(
       <Card><Table cols={["Employee","Type & reason","From","To","Days","Balance left","Status",""]}>{data.leaves.length===0?<tr><td colSpan={8}><Empty msg="No leave requests"/></td></tr>:data.leaves.map(l=>(
@@ -4563,8 +4624,10 @@ function NightlyBackupCard({ data, patch }) {
       <Field label="Send to" value={f.to} onChange={e=>setF({...f,to:e.target.value})} onBlur={()=>save(f)} placeholder={status?.mailbox || "your@email.com"}/>
       <Field label="Time (Pakistan)" type="time" value={f.time} onChange={e=>save({...f,time:e.target.value})}/>
     </div>
+    {!f.enabled && <div className="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">Backups are currently <b>Off</b> — switch this On above to start receiving them.</div>}
     {!emailReady && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">Set up Settings → Email first — the backup is sent from that mailbox.</div>}
-    {status?.lastSentOn && <div className="text-xs text-slate-500">Last run: {status.lastSentOn}{status.lastResult?` · ${status.lastResult}`:""}</div>}
+    {status?.lastError && status?.lastSentOn !== status?.today && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">Last attempt tonight failed — {status.lastError}. It will keep retrying automatically until it succeeds.</div>}
+    {status?.lastSentOn && <div className="text-xs text-slate-500">Last successful run: {status.lastSentOn}{status.lastResult?` · ${status.lastResult}`:""}</div>}
     <div className="flex flex-wrap gap-2">
       <Btn onClick={sendNow} disabled={busy}>{busy?<Loader2 size={15} className="animate-spin"/>:<Send size={15}/>}{busy?"Sending…":"Send a backup now"}</Btn>
     </div>

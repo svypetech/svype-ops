@@ -24,12 +24,25 @@ async function readState() {
 const cfgOf = (doc) => ({ ...DEFAULTS, ...((doc && doc.backupConfig) || {}) });
 
 // Record the run without loading the document into memory.
-async function stampRun(dateStr, note) {
+// Success and failure are recorded separately. A FAILURE must never set lastSentOn —
+// that field is the "don't send again today" guard, and stamping it on a failed
+// attempt was silently cancelling the whole night's backup after one transient
+// hiccup (a brief network blip, a momentary SMTP error), with no retry and no
+// visible warning. That was the actual bug behind a missed backup.
+async function stampSuccess(dateStr, note) {
   await pool.query(
     `UPDATE app_state SET doc = COALESCE(doc,'{}'::jsonb) || jsonb_build_object(
-       'backupConfig', COALESCE(doc->'backupConfig','{}'::jsonb) || jsonb_build_object('lastSentOn', $1::text, 'lastResult', $2::text)
+       'backupConfig', COALESCE(doc->'backupConfig','{}'::jsonb) || jsonb_build_object('lastSentOn', $1::text, 'lastResult', $2::text, 'lastError', NULL)
      ), rev = rev + 1, updated_at = now() WHERE id=1`,
     [dateStr, String(note || "").slice(0, 300)]
+  );
+}
+async function stampFailure(note) {
+  await pool.query(
+    `UPDATE app_state SET doc = COALESCE(doc,'{}'::jsonb) || jsonb_build_object(
+       'backupConfig', COALESCE(doc->'backupConfig','{}'::jsonb) || jsonb_build_object('lastError', $1::text)
+     ), rev = rev + 1, updated_at = now() WHERE id=1`,
+    [String(note || "").slice(0, 300)]
   );
 }
 
@@ -104,13 +117,14 @@ async function runBackup({ manual = false } = {}) {
     attachments: [{ filename, content, contentType }],
   });
 
-  await stampRun(dateStr, `Sent to ${to} (${sentMb} MB)`);
+  await stampSuccess(dateStr, `Sent to ${to} (${sentMb} MB)`);
   return { ok: true, to, filename, sizeMb: sentMb, date: dateStr };
 }
 
 // ---- schedule ----
 let timer = null;
-let lastAttempt = "";   // guards against re-running inside the same minute
+let lastTriggerMinute = "";   // guards against firing twice inside the same target minute
+let lastRetryAt = 0;          // throttles retries after a failure
 
 function startBackupSchedule() {
   if (timer) return;
@@ -122,15 +136,25 @@ function startBackupSchedule() {
       const today = localDate(cfg.tzOffsetMin);
       const hm = localHM(cfg.tzOffsetMin);
       const target = /^\d{2}:\d{2}$/.test(cfg.time) ? cfg.time : DEFAULTS.time;
-      if (hm !== target) return;
-      const already = (doc.backupConfig || {}).lastSentOn === today;
-      if (already || lastAttempt === today) return;
-      lastAttempt = today;
+      const alreadySentToday = (doc.backupConfig || {}).lastSentOn === today;
+      if (alreadySentToday) return;
+
+      const atTargetMinute = hm === target && lastTriggerMinute !== `${today}T${hm}`;
+      // A failed attempt earlier tonight no longer cancels the rest of the night — it
+      // retries every 20 minutes until it succeeds or the day rolls over, instead of
+      // silently giving up after one bad moment (that silent give-up was the bug).
+      const hadEarlierFailureTonight = !!(doc.backupConfig || {}).lastError && !alreadySentToday;
+      const dueForRetry = hadEarlierFailureTonight && (Date.now() - lastRetryAt) > 20 * 60000;
+
+      if (!atTargetMinute && !dueForRetry) return;
+      if (atTargetMinute) lastTriggerMinute = `${today}T${hm}`;
+      lastRetryAt = Date.now();
+
       const r = await runBackup({ manual: false });
       console.log(`[backup] nightly backup emailed to ${r.to} (${r.sizeMb} MB)`);
     } catch (e) {
       console.error("[backup] nightly backup failed:", e.message);
-      try { await stampRun(localDate(300), "FAILED: " + e.message); } catch {}
+      try { await stampFailure(e.message); } catch {}
     }
   }, 30000);
   console.log("[backup] nightly backup schedule active");

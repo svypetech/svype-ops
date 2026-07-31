@@ -8,7 +8,8 @@ router.get("/status", auth, async (req, res) => {
     const { doc } = await readState();
     const cfg = cfgOf(doc);
     const emailReady = !!(doc.emailConfig && doc.emailConfig.user && doc.emailConfig.pass);
-    res.json({ ...cfg, emailReady, mailbox: (doc.emailConfig && doc.emailConfig.user) || null });
+    const today = new Date(Date.now() + (cfg.tzOffsetMin || 300) * 60000).toISOString().slice(0, 10);
+    res.json({ ...cfg, emailReady, mailbox: (doc.emailConfig && doc.emailConfig.user) || null, today });
   } catch (e) { res.status(500).json({ error: e.message || "Could not read the backup settings." }); }
 });
 
