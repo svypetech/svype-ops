@@ -3,7 +3,7 @@ import {
   LayoutDashboard, Users, CalendarCheck, Wallet, UserPlus, FolderOpen,
   FileText, ArrowDownCircle, ArrowUpCircle, ScrollText, Plus, Trash2,
   Edit3, X, Check, LogOut, Search, Download, Building2, Loader2, Settings,
-  Upload, PenTool, Stamp, ChevronLeft, FileSignature, Receipt, Briefcase, Paperclip,
+  Upload, PenTool, Stamp, ChevronLeft, FileSignature, Receipt, Briefcase, Laptop, Paperclip,
   Repeat, Send, Landmark, Menu, Megaphone, Inbox, UserCircle, Clock, MapPin, CalendarClock, Lock, Eye, EyeOff, Copy,
   Contact, History, Database, HandCoins, Bell, Mail, MessageSquare, Hash
 } from "lucide-react";
@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 30 Jul 2026 · viewas-fix-v1";
+const APP_BUILD = "Build 30 Jul 2026 · assets-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -395,6 +395,7 @@ const SEED = {
   todos: [],
   wfhRequests: [],
   gigs: [],
+  assets: [],
 };
 const OFFICE_ADDRESSES = [
   { city: "Islamabad", address: "Floor 1, Nova, Business Square, Gulberg Greens, Islamabad." },
@@ -538,6 +539,7 @@ const NAV = [
   { id:"attendance", label:"Attendance & Leave", icon:CalendarCheck },
   { id:"todos", label:"Team To-dos", icon:CalendarCheck },
   { id:"gigs", label:"Freelance Projects", icon:Briefcase },
+  { id:"assets", label:"Company Assets", icon:Laptop },
   { id:"payroll", label:"Payroll & Slips", icon:Wallet },
   { id:"advances", label:"Advances & Loans", icon:HandCoins },
   { id:"vendorbills", label:"Vendor Bills", icon:Receipt },
@@ -567,7 +569,7 @@ const NAV = [
 const NAV_GROUPS = [
   { id:"dash", label:"Dashboard", icon:LayoutDashboard, tabs:["dash"] },
   { id:"chat", label:"Team Chat", icon:MessageSquare, tabs:["chat"] },
-  { id:"people", label:"People", icon:Users, tabs:["employees","attendance","todos","payroll","gigs","advances","recruit","cvbank"] },
+  { id:"people", label:"People", icon:Users, tabs:["employees","attendance","todos","payroll","gigs","assets","advances","recruit","cvbank"] },
   { id:"sales", label:"Clients & Sales", icon:Contact, tabs:["clients","proposals","quotations","retainers","invoices","receipts"] },
   { id:"finance", label:"Finance", icon:Wallet, tabs:["payables","receivables","vendorbills","accounts"] },
   { id:"documents", label:"Documents", icon:FileSignature, tabs:["offers","letters","meetings"] },
@@ -592,6 +594,7 @@ const EMP_NAV = [
   { id:"chat", label:"Team Chat", icon:MessageSquare },
   { id:"todos", label:"My To-dos", icon:CalendarCheck },
   { id:"gigs", label:"My Projects", icon:Briefcase },
+  { id:"assets", label:"My Assets", icon:Laptop },
   { id:"payslips", label:"Payslips", icon:Wallet },
   { id:"timesheet", label:"Daily Work Log", icon:Clock },
   { id:"meetings", label:"Meeting Notes", icon:FileText },
@@ -916,6 +919,7 @@ export default function App() {
             {active==="attendance" && <EmpAttendance {...props}/>}
             {active==="todos" && <MyTodos {...props}/>}
             {active==="gigs" && <MyProjects {...props}/>}
+            {active==="assets" && <MyAssets {...props}/>}
             {active==="payslips" && <EmpPayslips {...props}/>}
             {active==="timesheet" && <EmpTimesheet {...props}/>}
             {active==="meetings" && <EmpMeetings {...props}/>}
@@ -924,6 +928,7 @@ export default function App() {
             {active==="dash" && <Dashboard {...props}/>}
             {active==="todos" && <TeamTodos {...props}/>}
             {active==="gigs" && <Gigs {...props}/>}
+            {active==="assets" && <Assets {...props}/>}
             {active==="chat" && <TeamChat session={session} unreadByChannel={chat.unreadByChannel} markRead={chat.markRead} pendingChannelId={chat.pendingChannelId} clearPendingChannel={chat.clearPendingChannel} onActiveChannel={setChatChannelId}/>}
             {active==="employees" && <Employees {...props}/>}
             {active==="users" && <UsersAccess {...props}/>}
@@ -2947,6 +2952,118 @@ function Attendance({ data, update, mutateData }) {
 // Freelancers earn per delivered project, never a monthly salary. A project moves
 // In progress -> Delivered -> Approved -> Paid, and only approved work is money owed.
 const GIG_FLOW = ["In progress", "Delivered", "Approved", "Paid"];
+// ===== Company assets =====
+// What the company has physically handed an employee — laptop, phone, whatever —
+// with its value, so both sides can always answer "what do I have, and what's it
+// worth" without a spreadsheet living outside the portal.
+const ASSET_CATEGORIES = ["Laptop","Phone","Monitor","Accessory","Furniture","Vehicle","Software licence","Other"];
+const ASSET_CONDITIONS = ["New","Good","Fair","Needs repair"];
+function Assets({ data, update, mutateData }) {
+  const rows = data.assets || [];
+  const [edit, setEdit] = useState(null);
+  const [ret, setRet] = useState(null);
+  const [show, setShow] = useState("assigned");   // assigned | returned | all
+  const [empFilter, setEmpFilter] = useState("");
+  const bAst = useBatch(rows.filter(a => (show==="all"?true: show==="assigned"?a.status!=="Returned": a.status==="Returned") && (!empFilter||a.assignedTo===empFilter)));
+  const blank = () => ({ name:"", category:"Laptop", serial:"", value:"", currency:"PKR", assignedTo:"", assignedOn:today(), condition:"New", notes:"", status:"Assigned", fileId:null, fileMime:null });
+  const save = (a) => {
+    if (!a.name.trim()) { alert("Give the asset a name, e.g. \"MacBook Air M2\"."); return; }
+    if (!a.assignedTo) { alert("Choose who this is assigned to."); return; }
+    update("assets", a.id ? rows.map(x=>x.id===a.id?a:x) : [{ ...a, id:uid() }, ...rows],
+      a.id ? `Updated asset: ${a.name}` : `Assigned ${a.name} to ${a.assignedTo}`);
+    setEdit(null);
+  };
+  const confirmReturn = () => {
+    update("assets", rows.map(x=>x.id===ret.id ? { ...x, status:"Returned", returnedOn:ret.date, returnCondition:ret.condition, returnNote:ret.note } : x),
+      `${ret.name} marked returned by ${ret.assignedTo}`);
+    setRet(null);
+  };
+  const activeEmp = data.employees.filter(e=>e.status==="Active");
+  const totalValue = rows.filter(a=>a.status!=="Returned").reduce((t,a)=>t+ +a.value, 0);
+  const filtered = rows.filter(a => (show==="all"?true: show==="assigned"?a.status!=="Returned": a.status==="Returned") && (!empFilter||a.assignedTo===empFilter));
+  const onFile = async (file, set) => {
+    if (!file) return;
+    const isImg = file.type.startsWith("image/");
+    const dataUrl = isImg ? await readImage(file, 1400, true, 0.82) : await readFile(file);
+    try { const st = await uploadFile(dataUrl, file.name); set(f=>({ ...f, fileId:st.fileId, fileMime:st.mime })); }
+    catch { alert("Couldn't upload the photo — check your connection."); }
+  };
+  return (<>
+    <Head title="Company Assets" sub={`${rows.filter(a=>a.status!=="Returned").length} currently issued · ${fmt(totalValue)} in circulation`} action={<Btn onClick={()=>setEdit(blank())}><Plus size={15}/>Assign asset</Btn>}/>
+    <div className="flex flex-wrap gap-2 mb-4 items-end">
+      {[["assigned","With employees"],["returned","Returned"],["all","All"]].map(([k,l])=><Btn key={k} variant={show===k?"primary":"ghost"} onClick={()=>setShow(k)}>{l}</Btn>)}
+      <div className="min-w-44"><Select label="Employee" options={["", ...activeEmp.map(e=>e.name)]} value={empFilter} onChange={e=>setEmpFilter(e.target.value)}/></div>
+    </div>
+    <BatchBar count={bAst.count} noun="asset" onClear={bAst.clear} onDelete={()=>{ const ids=new Set(bAst.selected); update("assets", rows.filter(x=>!ids.has(x.id)), `Deleted ${ids.size} asset record(s)`); bAst.clear(); }}/>
+    <Card><Table cols={[<SelBox key="a" on={bAst.allOn} onChange={bAst.toggleAll} title="Select all"/>,"Item","Assigned to","Value","Condition","Status",""]}>{filtered.length===0?<tr><td colSpan={7}><Empty msg="No assets recorded yet"/></td></tr>:filtered.map(a=>(
+      <Row key={a.id}>
+        <SelTd on={bAst.has(a.id)} onChange={()=>bAst.toggle(a.id)}/>
+        <Td className="font-medium">{a.name}<div className="text-xs text-slate-400">{a.category}{a.serial?` · ${a.serial}`:""}</div></Td>
+        <Td>{a.assignedTo}<div className="text-xs text-slate-400">since {a.assignedOn}</div></Td>
+        <Td className="font-medium">{fmt(a.value, a.currency)}</Td>
+        <Td className="text-xs text-slate-500">{a.status==="Returned" ? (a.returnCondition||"—") : a.condition}</Td>
+        <Td>{a.status==="Returned" ? <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">Returned {a.returnedOn}</span> : <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">With {a.assignedTo}</span>}</Td>
+        <Td><div className="flex items-center gap-1 justify-end">
+          {a.status!=="Returned" && <button onClick={()=>setRet({ id:a.id, name:a.name, assignedTo:a.assignedTo, date:today(), condition:"Good", note:"" })} className="text-xs text-sky-600 hover:underline whitespace-nowrap">Mark returned</button>}
+          {(a.fileId) && <button onClick={()=>openStored({fileId:a.fileId,mime:a.fileMime},a.name)} title="Open photo / receipt" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Paperclip size={14}/></button>}
+          <RowActions onEdit={()=>setEdit(a)} onDelete={()=>update("assets", rows.filter(x=>x.id!==a.id), `Removed asset record: ${a.name}`)}/>
+        </div></Td>
+      </Row>))}</Table></Card>
+    {edit && <Modal title={edit.id?"Edit asset":"Assign an asset"} onClose={()=>setEdit(null)}>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Item name" value={edit.name} onChange={e=>setEdit({...edit,name:e.target.value})} placeholder="e.g. MacBook Air M2"/>
+        <Select label="Category" options={ASSET_CATEGORIES} value={edit.category} onChange={e=>setEdit({...edit,category:e.target.value})}/>
+      </div>
+      <Select label="Assigned to" options={["", ...activeEmp.map(e=>e.name)]} value={edit.assignedTo} onChange={e=>setEdit({...edit,assignedTo:e.target.value})}/>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Value" type="number" value={edit.value} onChange={e=>setEdit({...edit,value:e.target.value})}/>
+        <Select label="Currency" options={CURRENCIES} value={edit.currency} onChange={e=>setEdit({...edit,currency:e.target.value})}/>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Serial / asset tag" value={edit.serial} onChange={e=>setEdit({...edit,serial:e.target.value})}/>
+        <Field label="Assigned on" type="date" value={edit.assignedOn} onChange={e=>setEdit({...edit,assignedOn:e.target.value})}/>
+      </div>
+      <Select label="Condition" options={ASSET_CONDITIONS} value={edit.condition} onChange={e=>setEdit({...edit,condition:e.target.value})}/>
+      <Area label="Notes" value={edit.notes} onChange={e=>setEdit({...edit,notes:e.target.value})}/>
+      <div><span className="text-xs text-slate-500 mb-1 block">Photo / receipt (optional)</span>
+        <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-sm text-slate-500"><Paperclip size={15}/>{edit.fileId?"Change file":"Attach a photo or receipt"}
+          <input type="file" accept="image/*,application/pdf" className="hidden" onChange={e=>onFile(e.target.files[0], setEdit)}/></label>
+        {edit.fileId && <StoredImg d={{fileId:edit.fileId,mime:edit.fileMime}} className="mt-2 h-24 rounded-lg border border-slate-200 object-cover"/>}
+      </div>
+      <Btn onClick={()=>save(edit)}><Check size={15}/>Save</Btn>
+    </Modal>}
+    {ret && <Modal title={`Mark returned · ${ret.name}`} onClose={()=>setRet(null)}>
+      <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm">Currently with <b>{ret.assignedTo}</b></div>
+      <Field label="Returned on" type="date" value={ret.date} onChange={e=>setRet({...ret,date:e.target.value})}/>
+      <Select label="Condition on return" options={ASSET_CONDITIONS} value={ret.condition} onChange={e=>setRet({...ret,condition:e.target.value})}/>
+      <Area label="Notes (damage, missing accessories, etc.)" value={ret.note} onChange={e=>setRet({...ret,note:e.target.value})}/>
+      <Btn onClick={confirmReturn}><Check size={15}/>Confirm return</Btn>
+    </Modal>}
+  </>);
+}
+function MyAssets({ data, me }) {
+  const mine = (data.assets||[]).filter(a=>a.assignedTo===me.name);
+  const held = mine.filter(a=>a.status!=="Returned");
+  const totalValue = held.reduce((t,a)=>t+ +a.value, 0);
+  return (<>
+    <Head title="My Assets" sub={`Company equipment currently issued to you · ${fmt(totalValue)} total value`}/>
+    <Card><Table cols={["Item","Category","Value","Condition","Since",""]}>{held.length===0?<tr><td colSpan={6}><Empty msg="Nothing currently assigned to you"/></td></tr>:held.map(a=>(
+      <Row key={a.id}>
+        <Td className="font-medium">{a.name}{a.serial&&<div className="text-xs text-slate-400">{a.serial}</div>}</Td>
+        <Td className="text-slate-500">{a.category}</Td>
+        <Td className="font-medium">{fmt(a.value, a.currency)}</Td>
+        <Td className="text-xs text-slate-500">{a.condition}</Td>
+        <Td className="text-slate-500">{a.assignedOn}</Td>
+        <Td>{a.fileId && <button onClick={()=>openStored({fileId:a.fileId,mime:a.fileMime},a.name)} className="text-xs text-sky-600 hover:underline">Photo / receipt</button>}</Td>
+      </Row>))}</Table></Card>
+    {mine.some(a=>a.status==="Returned") && <div className="mt-5">
+      <div className="text-xs uppercase tracking-wider text-slate-500 font-medium mb-2">Previously issued</div>
+      <Card><Table cols={["Item","Value","Returned on"]}>{mine.filter(a=>a.status==="Returned").map(a=>(
+        <Row key={a.id}><Td className="text-slate-500">{a.name}</Td><Td className="text-slate-500">{fmt(a.value, a.currency)}</Td><Td className="text-slate-500">{a.returnedOn}</Td></Row>))}</Table></Card>
+    </div>}
+    <p className="text-xs text-slate-400 mt-3">Please report any damage or loss to HR as soon as possible.</p>
+  </>);
+}
 function Gigs({ data, update, brand }) {
   const rows = data.gigs || [];
   const freelancers = (data.employees||[]).filter(e=>e.payType==="Freelance" && e.status==="Active");
