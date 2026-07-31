@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 30 Jul 2026 · todo-timezone-fix-v1";
+const APP_BUILD = "Build 30 Jul 2026 · reimb-refresh-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -3081,8 +3081,8 @@ function Payroll({ data, patch, update, brand }) {
     markSlipsPaid(bp.selected, { proof: bulkPay.proof, method: bulkPay.method });
     bp.clear(); setBulkPay(null);
   };
-  const auto = { lateDeduction:false, graceMin:30, ...(data.payrollAuto||{}) };
-  const setAuto = (next)=> patch({ payrollAuto: { ...next, graceMin:+next.graceMin||30 } }, "Updated payroll automation");
+  const auto = { lateDeduction:false, graceMin:30, reimbCutoffDay:28, ...(data.payrollAuto||{}) };
+  const setAuto = (next)=> patch({ payrollAuto: { ...next, graceMin:+next.graceMin||30, reimbCutoffDay:+next.reimbCutoffDay||28 } }, "Updated payroll automation");
   const withAllowance = data.payroll.filter(p => +p.allowances > 0);
   const clearAllowances = () => {
     const total = withAllowance.reduce((t,p)=>t + (+p.allowances||0), 0);
@@ -3110,6 +3110,24 @@ function Payroll({ data, patch, update, brand }) {
     const newAdvances=data.advances.map(a=>{ if(a.status==="Active"&&a.remaining>0&&names.has(a.employee)){ const d=Math.min(+a.installment,a.remaining); const rem=a.remaining-d; return {...a,remaining:rem,status:rem<=0?"Cleared":"Active"};} return a; });
     patch({ payroll:[...runs,...data.payroll], payables:newPayables, advances:newAdvances }, `Ran payroll for ${month} · ${runs.length} employee(s)`);
     setRunAsk(null);
+  };
+  // A slip is a snapshot taken the moment payroll ran. Anything approved for salary
+  // AFTER that — for the same employee, same month — just sits unsettled with nowhere
+  // to go until this runs: it re-scans for exactly those claims and folds them into
+  // the existing (still-unpaid) slip rather than creating a duplicate.
+  const [refreshAsk, setRefreshAsk] = useState(null);
+  const openRefresh = (slip) => {
+    const newOnes = data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===slip.employee && p.status==="Approved" && !p.settled && p.payVia==="salary" && (!p.payMonth || p.payMonth===slip.month));
+    setRefreshAsk({ slip, newOnes, total: newOnes.reduce((t,p)=>t+ +p.amount,0) });
+  };
+  const confirmRefresh = () => {
+    const { slip, newOnes, total } = refreshAsk;
+    const ids = newOnes.map(p=>p.id);
+    patch({
+      payroll: data.payroll.map(p=>p.id===slip.id ? { ...p, reimbursements: (+p.reimbursements||0) + total } : p),
+      payables: data.payables.map(p=>ids.includes(p.id) ? { ...p, settled:true, slipId:slip.id } : p),
+    }, `Added ${newOnes.length} new reimbursement(s) to ${slip.employee}'s ${slip.month} slip (+${fmt(total)})`);
+    setRefreshAsk(null);
   };
   const saveDed = () => {
     const tax=+editDed.tax||0, eobi=+editDed.eobi||0, pf=+editDed.pf||0, advance=+editDed.advance||0;
@@ -3139,6 +3157,11 @@ function Payroll({ data, patch, update, brand }) {
         <input type="checkbox" checked={!!auto.lateDeduction} onChange={e=>setAuto({...auto, lateDeduction:e.target.checked})}/>Deduct late arrivals</label>
       <div className="w-28"><Field label="Grace (min)" type="number" value={auto.graceMin} onChange={e=>setAuto({...auto, graceMin:e.target.value})}/></div>
     </div></Card>
+    <Card><div className="p-4 mb-4 flex flex-wrap items-center gap-3">
+      <div className="flex-1 min-w-56"><div className="font-semibold text-sm">Reimbursement cutoff</div>
+        <p className="text-xs text-slate-500 mt-0.5">Claims submitted on or before day {auto.reimbCutoffDay} of the month default to that month's payroll; later ones default to next month, since this month's run may already be locked in. HR can always override the month when approving.</p></div>
+      <div className="w-28"><Field label="Cutoff day" type="number" value={auto.reimbCutoffDay} onChange={e=>setAuto({...auto, reimbCutoffDay:e.target.value})}/></div>
+    </div></Card>
     {withAllowance.length>0 && <div className="mb-3 flex flex-wrap items-center gap-3 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
       <div className="text-sm text-amber-800 flex-1">{withAllowance.length} salary slip(s) still carry an automatic 10% allowance added by an older version. New payroll runs no longer add it.</div>
       <Btn variant="ghost" onClick={clearAllowances}><X size={15}/>Remove automatic allowance</Btn>
@@ -3154,7 +3177,7 @@ function Payroll({ data, patch, update, brand }) {
         <Td className="text-slate-500 text-xs">{empAcct(p.employee)||"— not on file —"}</Td>
         <Td>{p.paid?<span className="flex items-center gap-2"><Pill s="Paid"/>{p.proof&&<button onClick={(e)=>{e.stopPropagation();openStored(typeof p.proof==="string"?{img:p.proof}:{...p.proof},"payment-proof");}} title="Open payment proof" className="w-7 h-7 rounded border border-slate-200 overflow-hidden grid place-items-center hover:ring-2 hover:ring-sky-400"><StoredImg d={typeof p.proof==="string"?{img:p.proof}:{...p.proof}} className="w-7 h-7 object-cover"/></button>}</span>:<Pill s="Pending review"/>}</Td>
         <Td><button onClick={()=>setSlip(p)} className="text-sky-600 text-xs font-medium hover:underline">View slip</button></Td>
-        <Td><RowActions>{!p.paid && <button onClick={()=>openAdj(p)} title="Add increase / deduction with reason" className="px-2 py-1 rounded text-xs bg-sky-100 text-sky-700 hover:bg-sky-200">Adjust</button>}{!p.paid && <button onClick={()=>setEditDed({...p})} title="Tax / EOBI / PF / advance" className="px-2 py-1 rounded text-xs bg-slate-100 text-slate-600 hover:bg-slate-200">Deductions</button>}{!p.paid && <button onClick={()=>setPayProof({ ...p, proof:null })} title="Approve this slip and record the payment" className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Approve & pay</button>}{p.paid && <button onClick={()=>setPayProof({ ...p })} title="Update payment" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Edit3 size={14}/></button>}</RowActions></Td>
+        <Td><RowActions>{!p.paid && <button onClick={()=>openRefresh(p)} title="Check for reimbursements approved after this slip was run" className="px-2 py-1 rounded text-xs bg-violet-100 text-violet-700 hover:bg-violet-200">Refresh reimb.</button>}{!p.paid && <button onClick={()=>openAdj(p)} title="Add increase / deduction with reason" className="px-2 py-1 rounded text-xs bg-sky-100 text-sky-700 hover:bg-sky-200">Adjust</button>}{!p.paid && <button onClick={()=>setEditDed({...p})} title="Tax / EOBI / PF / advance" className="px-2 py-1 rounded text-xs bg-slate-100 text-slate-600 hover:bg-slate-200">Deductions</button>}{!p.paid && <button onClick={()=>setPayProof({ ...p, proof:null })} title="Approve this slip and record the payment" className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Approve & pay</button>}{p.paid && <button onClick={()=>setPayProof({ ...p })} title="Update payment" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Edit3 size={14}/></button>}</RowActions></Td>
       </Row>))}</Table></Card>
     {bulkPay && (()=>{ const chosen=data.payroll.filter(x=>bp.selected.includes(x.id)); const unpaid=chosen.filter(x=>!x.paid); return (
       <Modal title={`Mark ${unpaid.length} salary slip(s) paid`} onClose={()=>setBulkPay(null)}>
@@ -3200,6 +3223,18 @@ function Payroll({ data, patch, update, brand }) {
       {runAsk.targets.length>0 && <Btn onClick={doRun}><Check size={15}/>Run payroll for {runAsk.targets.length} employee{runAsk.targets.length>1?"s":""}</Btn>}
     </Modal>}
     {slip && <SlipModal slip={slip} brand={brand} data={data} sendable onClose={()=>setSlip(null)}/>}
+    {refreshAsk && <Modal title={`Refresh reimbursements · ${refreshAsk.slip.employee}`} onClose={()=>setRefreshAsk(null)}>
+      {refreshAsk.newOnes.length === 0
+        ? <div className="text-sm text-slate-600">Nothing new — every approved claim for {refreshAsk.slip.employee} this month is already on this slip.</div>
+        : <>
+          <div className="text-sm text-slate-600">These were approved for salary after this slip was run — add them now?</div>
+          <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm space-y-1.5">
+            {refreshAsk.newOnes.map(p=>(<div key={p.id} className="flex justify-between"><span>{p.desc.replace("Reimbursement: ","")}</span><span className="font-medium">{fmt(p.amount)}</span></div>))}
+            <div className="flex justify-between border-t border-slate-200 pt-1.5 font-semibold"><span>Total to add</span><span>{fmt(refreshAsk.total)}</span></div>
+          </div>
+          <Btn onClick={confirmRefresh}><Check size={15}/>Add {fmt(refreshAsk.total)} to this slip</Btn>
+        </>}
+    </Modal>}
     {adj && <Modal title={`Adjust pay · ${adj.employee}`} onClose={()=>setAdj(null)}>
       <p className="text-xs text-slate-500">Add any additional dues (bonus, overtime, allowance, arrears) or a deduction (fine, unpaid leave) with a reason. Each line appears on the payslip and is included in the final payable amount below.</p>
       <div className="flex flex-wrap gap-1.5">
@@ -4251,7 +4286,23 @@ function Payables({ data, update, patch, brand }) {
     setRej(null);
   };
   const months = Array.from({length:6}).map((_,i)=>{ const d=new Date(); d.setMonth(d.getMonth()+i); return d.toLocaleString("default",{month:"long",year:"numeric"}); });
-  const openApprove = (r)=> setAppr({ id:r.id, vendor:r.vendor, amount:r.amount, mode:"salary", month: months[0], date: today() });
+  // Claims submitted late in the month have a real chance of missing that month's
+  // payroll run entirely — approving them "for this month" would just leave them
+  // stranded unsettled. The cutoff picks a realistic default; HR can still override it.
+  const reimbCutoff = +((data.payrollAuto||{}).reimbCutoffDay) || 28;
+  const smartMonthFor = (r) => {
+    const day = new Date(r.due || today()).getDate();
+    const alreadyRanThisMonth = data.payroll.some(p=>p.employee===r.vendor && p.month===months[0]);
+    return (day <= reimbCutoff && !alreadyRanThisMonth) ? months[0] : months[1];
+  };
+  const openApprove = (r)=> setAppr({ id:r.id, vendor:r.vendor, amount:r.amount, mode:"salary", month: smartMonthFor(r), date: today(),
+    note: (() => {
+      const day = new Date(r.due || today()).getDate();
+      const alreadyRan = data.payroll.some(p=>p.employee===r.vendor && p.month===months[0]);
+      if (alreadyRan) return `${months[0]}'s payroll for ${r.vendor} has already run — earliest available is ${months[1]}.`;
+      if (day > reimbCutoff) return `Submitted on day ${day} — after the ${reimbCutoff}${reimbCutoff===1?"st":reimbCutoff===2?"nd":reimbCutoff===3?"rd":"th"} cutoff, so the earliest payroll is ${months[1]}.`;
+      return `Submitted on day ${day} — within this month's cutoff, so it can go into ${months[0]}'s payroll.`;
+    })() });
   const confirmApprove = ()=>{
     const a = appr;
     setRows(rows.map(x=>{
@@ -4294,9 +4345,10 @@ function Payables({ data, update, patch, brand }) {
       </div>); })()}
       <Select label="How should this be paid?" options={["salary","direct"]} value={appr.mode} onChange={e=>setAppr({...appr,mode:e.target.value})}/>
       {appr.mode==="salary"
-        ? <Select label="Add to which month's salary?" options={months} value={appr.month} onChange={e=>setAppr({...appr,month:e.target.value})}/>
+        ? <><Select label="Add to which month's salary?" options={months} value={appr.month} onChange={e=>setAppr({...appr,month:e.target.value})}/>
+            {appr.note && <p className="text-xs text-violet-600 bg-violet-50 border border-violet-200 rounded-lg px-3 py-2">{appr.note}</p>}</>
         : <Field label="Pay on date (today = instant)" type="date" value={appr.date} onChange={e=>setAppr({...appr,date:e.target.value})}/>}
-      <p className="text-xs text-slate-400">{appr.mode==="salary" ? "It will be added to that month's payslip when you run payroll for that month." : "It will be marked paid directly on this date (outside salary)."}</p>
+      <p className="text-xs text-slate-400">{appr.mode==="salary" ? "It will be added to that month's payslip when you run payroll for that month. If payroll for that month has already run, use \u201cRefresh reimb.\u201d on the slip in Payroll to fold it in." : "It will be marked paid directly on this date (outside salary)."}</p>
       <Btn onClick={confirmApprove}><Check size={15}/>Approve</Btn>
     </Modal>}
   </>);
