@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 30 Jul 2026 · reimb-refresh-v1";
+const APP_BUILD = "Build 30 Jul 2026 · viewas-fix-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -2607,7 +2607,16 @@ function UsersAccess({ data, update }) {
   };
   const doReset = () => { setUsers(users.map(x=>x.id===reset.id?{...x,password:reset.password,mustChange:true}:x), `Reset password for ${reset.username}`); setReset(null); };
   const toggle = (u) => setUsers(users.map(x=>x.id===u.id?{...x,active:!x.active}:x), `${u.active?"Deactivated":"Reactivated"} ${u.username}`);
-  const unlinkedEmps = data.employees.filter(e=>e.status==="Active" && !users.some(u=>u.empId===e.id));
+  // Which profiles can be picked depends on the role being edited: an "employee"
+  // login must exclusively own one profile (that's their whole identity in the
+  // portal). An HR/admin login just wants to PEEK at a profile — it's completely
+  // normal for that same person to already have their own separate employee-role
+  // login, so that must not make them disappear from the HR account's picker.
+  const empPickerFor = (ed) => data.employees.filter(e => {
+    if (e.status !== "Active") return false;
+    if (ed && ed.role !== "employee") return !users.some(u => u.empId===e.id && u.id!==ed.id && u.role!=="employee");
+    return !users.some(u => u.empId===e.id && u.id!==(ed && ed.id));
+  });
   return (<>
     <Head title="Users & Access" sub="Create a login for each person — they sign in with the username & password you set" action={<Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Create user</Btn>}/>
     <Card><Table cols={["Username","Role","Linked to","Status",""]}>
@@ -2633,8 +2642,10 @@ function UsersAccess({ data, update }) {
       <label className="block"><span className="text-xs text-slate-500 mb-1 block">{edit.role==="employee" ? "Which staff member is this login for?" : "Link to their own employee profile (optional)"}</span>
         <select value={edit.empId||""} onChange={e=>setEdit({...edit,empId:e.target.value})} className={inputCls}>
           <option value="">{edit.role==="employee" ? "— select employee —" : "— not linked —"}</option>
-          {edit.id && data.employees.find(e=>e.id===edit.empId) && !unlinkedEmps.find(e=>e.id===edit.empId) && <option value={edit.empId}>{data.employees.find(e=>e.id===edit.empId).name}</option>}
-          {unlinkedEmps.map(e=><option key={e.id} value={e.id}>{e.name}</option>)}
+          {(() => { const picker = empPickerFor(edit); return (<>
+            {edit.id && data.employees.find(e=>e.id===edit.empId) && !picker.find(e=>e.id===edit.empId) && <option value={edit.empId}>{data.employees.find(e=>e.id===edit.empId).name}</option>}
+            {picker.map(e=><option key={e.id} value={e.id}>{e.name}</option>)}
+          </>); })()}
         </select>
         <span className="text-xs text-slate-400 mt-1 block">{edit.role==="employee"
           ? "Each employee login shows only that person's profile, payslips, attendance and claims."
