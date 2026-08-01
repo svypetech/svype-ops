@@ -71,7 +71,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 30 Jul 2026 · assets-v1";
+const APP_BUILD = "Build 31 Jul 2026 · save-resilience-v1";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -82,6 +82,14 @@ let _serverDoc = null;   // the doc as the server has it after our last confirme
 let _saveQueue = [];
 let _saving = false;
 function initSaveState(doc, rev) { _serverDoc = doc; _rev = rev || 0; }
+// A pending write is persisted here BEFORE it's even attempted on the network. If the
+// request fails — a dead WiFi moment, a phone losing signal, the tab being closed
+// mid-save — the change is not lost: it sits here until it can finish sending, even
+// across a full page refresh or the app being closed and reopened later.
+const PENDING_KEY = "svype_pending_outbox_v1";
+function savePending(patchDoc, baseRev) { try { localStorage.setItem(PENDING_KEY, JSON.stringify({ patchDoc, baseRev, ts: Date.now() })); } catch {} }
+function clearPending() { try { localStorage.removeItem(PENDING_KEY); } catch {} }
+function loadPending() { try { const raw = localStorage.getItem(PENDING_KEY); return raw ? JSON.parse(raw) : null; } catch { return null; } }
 async function _gzipBody(str) {
   try {
     if (typeof CompressionStream === "undefined") return null;
@@ -112,9 +120,18 @@ async function _putState(doc, baseRev, base) {
   let body = json;
   const gz = await _gzipBody(json);          // typically 2–4× smaller → 2–4× faster upload
   if (gz) { headers["Content-Encoding"] = "gzip"; body = gz; }
-  const res = await fetch("/api/state", { method: "PUT", headers, body });
+  let res;
+  try {
+    res = await fetch("/api/state", { method: "PUT", headers, body });
+  } catch (e) {
+    // fetch() itself throwing means the request never reached the server at all —
+    // no WiFi, no signal, DNS hiccup. Tagged distinctly so the caller retries
+    // automatically instead of treating it as a real rejection.
+    throw new Error("NETWORK_ERROR:" + (e && e.message || "offline"));
+  }
   const data = await res.json().catch(() => ({}));
   if (res.status === 409) return { conflict: true, doc: data.doc, rev: +data.rev || 0 };
+  if (res.status >= 500) throw new Error("NETWORK_ERROR:server " + res.status);   // transient server hiccup — also worth retrying
   if (!res.ok) throw new Error(data.error || "Save failed");
   return { conflict: false, rev: +data.rev || 0 };
 }
@@ -127,6 +144,76 @@ function enqueueSave(mutate, onMerged) {
     _drainSaves();
   });
 }
+// One full attempt at sending a batch: handles conflict-retries (re-applying the
+// same mutations against fresher server state) but does NOT handle network failures
+// — those are the caller's job, because a network failure calls for waiting and
+// trying again, not recomputing anything.
+async function _attemptBatch(batch) {
+  let attempts = 0, hadConflict = false;
+  while (attempts < 6) {
+    attempts++;
+    const base = _serverDoc;
+    let next = base || undefined;
+    for (const b of batch) next = b.mutate(next);
+    const patchDoc = {};
+    if (base && typeof base === "object") { for (const k of Object.keys(next)) if (next[k] !== base[k]) patchDoc[k] = next[k]; }
+    savePending(base && typeof base === "object" ? patchDoc : next, _rev);   // safety net BEFORE the network call
+    const r = await _putState(next, _rev, base);
+    if (r.conflict) { hadConflict = true; _serverDoc = r.doc; _rev = r.rev; continue; }
+    _serverDoc = next; _rev = r.rev; _stateCache.doc = next; clearPending();
+    if (hadConflict) { const om = batch.find(b=>b.onMerged); om && om.onMerged(next); }
+    return;
+  }
+  throw new Error("could not resolve conflicts after several retries");
+}
+let _offlineRetryTimer = null;
+let _offlineRetryStreak = 0;
+function _scheduleOfflineRetry(batch, delayMs) {
+  clearTimeout(_offlineRetryTimer);
+  _offlineRetryTimer = setTimeout(() => _retryUntilOnline(batch), delayMs);
+}
+// Once the fast retries are exhausted, this keeps trying quietly in the background —
+// starting at 30s, backing off to a slower cadence (capped at 5 minutes) the longer
+// it stays offline so a phone left disconnected for hours isn't hammering the network
+// every 30s — and instantly the moment the browser reports the connection is back.
+// It never gives up: the change stays safe in the outbox for as long as it takes.
+async function _retryUntilOnline(batch) {
+  try {
+    await _attemptBatch(batch);
+    _offlineRetryStreak = 0;
+    _setSaveStatus("saved");
+    batch.forEach(b=>b.resolve && b.resolve(true));
+  } catch (e) {
+    const msg = e?.message || "";
+    if (msg.startsWith("NETWORK_ERROR")) {
+      _setSaveStatus("offline");
+      _offlineRetryStreak++;
+      const next = Math.min(30000 * Math.pow(1.6, _offlineRetryStreak - 1), 300000);
+      _scheduleOfflineRetry(batch, next);
+    } else {
+      _offlineRetryStreak = 0;
+      _setSaveStatus("error");
+      batch.forEach(b=>b.reject && b.reject(e));
+      alert("⚠️ Your last change could not be saved: " + msg + "\n\nOpen Settings → Backup → Storage health if this keeps happening.");
+    }
+  }
+}
+if (typeof window !== "undefined") {
+  window.addEventListener("online", () => { if (_offlineRetryTimer) { clearTimeout(_offlineRetryTimer); _offlineRetryTimer = setTimeout(() => _drainSaves(), 300); } });
+}
+// Runs once at startup. If an earlier save never made it to the server — the tab was
+// closed mid-failure, the phone lost signal and the page got refreshed — this is what
+// finishes the job instead of the change simply being gone. Fire-and-forget: it never
+// blocks the app from loading normally.
+async function _recoverPending() {
+  const pending = loadPending();
+  if (!pending || !pending.patchDoc) return;
+  const batch = [{ mutate: (cur) => ({ ...(cur || {}), ...pending.patchDoc }) }];
+  try { await _attemptBatch(batch); }
+  catch (e) {
+    if (String(e?.message || "").startsWith("NETWORK_ERROR")) { _setSaveStatus("offline"); _scheduleOfflineRetry(batch, 5000); }
+  }
+}
 async function _drainSaves() {
   if (_saving) return; _saving = true;
   try {
@@ -134,32 +221,44 @@ async function _drainSaves() {
       // Coalesce everything queued right now into ONE server write — ticking ten
       // checkboxes quickly becomes one or two PUTs instead of ten (much faster).
       const batch = _saveQueue.splice(0, _saveQueue.length);
-      try {
-        let attempts = 0, done = false, hadConflict = false;
-        while (!done && attempts < 6) {
-          attempts++;
-          const base = _serverDoc;
-          let next = base || undefined;
-          for (const b of batch) next = b.mutate(next);
-          const r = await _putState(next, _rev, base);
-          if (r.conflict) { hadConflict = true; _serverDoc = r.doc; _rev = r.rev; continue; }
-          _serverDoc = next; _rev = r.rev; _stateCache.doc = next; done = true;
-          if (hadConflict) { const om = batch.find(b=>b.onMerged); om && om.onMerged(next); } // re-sync UI with merged result
+      // A handful of quick retries first — most WiFi/mobile-data blips clear up
+      // within a few seconds, and this window is what used to have ZERO retries at
+      // all: one dropped packet was enough to show a scary failure immediately.
+      // Blocking retries stay short on purpose — a couple of seconds is enough to
+      // ride out a truly momentary blip invisibly. Anything longer than that hands
+      // off to the non-blocking background retry below rather than trapping someone
+      // on a locked screen for half a minute.
+      const delays = [1000, 2000];
+      let lastErr = null, ok = false;
+      for (let i = 0; i <= delays.length && !ok; i++) {
+        try { await _attemptBatch(batch); ok = true; }
+        catch (e) {
+          lastErr = e;
+          const msg = e?.message || "";
+          if (!msg.startsWith("NETWORK_ERROR")) break;   // a real rejection — no point retrying blindly
+          if (i < delays.length) await new Promise(r => setTimeout(r, delays[i]));
         }
-        if (!done) throw new Error("could not save after several retries");
-        batch.forEach(b=>b.resolve && b.resolve(true));
-      } catch (e) {
-        batch.forEach(b=>b.reject && b.reject(e));
-        _saveQueue.forEach(q=>q.reject && q.reject(e)); _saveQueue = [];
-        _setSaveStatus("error");
-        const raw = e?.message || "save failed";
-        if (String(raw).startsWith("TOO_LARGE:")) {
-          alert("⚠️ Your change could not be saved because the data record has grown too large (" + String(raw).split(":")[1] + " MB).\n\nThis happens when uploaded files (CNICs, contracts, receipts) are stored inside the main record.\n\nFIX — open Settings → Backup → Storage health and press “Move uploaded files to storage”. It takes a moment and only needs doing once, then saving will work normally again.");
-        } else {
-          alert("⚠️ Your last change could NOT be saved to the server, so it will be lost on refresh.\n\nFirst try: reload the page and do it again.\nIf it keeps happening, open Settings → Backup → Storage health and run “Move uploaded files to storage”.\n\n(Technical detail: " + raw + ")");
-        }
+      }
+      if (ok) { batch.forEach(b=>b.resolve && b.resolve(true)); continue; }
+
+      const raw = lastErr?.message || "save failed";
+      if (raw.startsWith("NETWORK_ERROR")) {
+        // Still offline after the quick retries. The change is already sitting safely
+        // in the outbox — hand off to the slow background retry instead of alarming
+        // the user or blocking them from continuing to work.
+        _setSaveStatus("offline");
+        _scheduleOfflineRetry(batch, 30000);
         return;
       }
+      _saveQueue.forEach(q=>q.reject && q.reject(lastErr)); _saveQueue = [];
+      _setSaveStatus("error");
+      if (raw.startsWith("TOO_LARGE:")) {
+        alert("⚠️ Your change could not be saved because the data record has grown too large (" + raw.split(":")[1] + " MB).\n\nThis happens when uploaded files (CNICs, contracts, receipts) are stored inside the main record.\n\nFIX — open Settings → Backup → Storage health and press “Move uploaded files to storage”. It takes a moment and only needs doing once, then saving will work normally again.");
+      } else {
+        batch.forEach(b=>b.reject && b.reject(lastErr));
+        alert("⚠️ Your last change could not be saved: " + raw + "\n\nOpen Settings → Backup → Storage health if this keeps happening.");
+      }
+      return;
     }
     _setSaveStatus("saved");
   } finally { _saving = false; }
@@ -695,6 +794,11 @@ export default function App() {
     const d = await DB.get("svype_db", null);
     let merged = d ? { ...SEED, ...d } : SEED;
     initSaveState(d || null, _stateCache.rev); // conflict-safe saves start from the fetched revision
+    const pendingFromEarlier = loadPending();
+    if (pendingFromEarlier && pendingFromEarlier.patchDoc) {
+      merged = { ...merged, ...pendingFromEarlier.patchDoc };   // show the recovered change immediately
+      _recoverPending();                                        // and finish sending it in the background
+    }
     setData(merged);
     if (!d && serverFounders === false) DB.set("svype_db", merged); // only seed empty doc on a genuine fresh install
     const b = await DB.get("svype_brand", null);
@@ -1063,8 +1167,10 @@ class ErrorBoundary extends React.Component {
   }
 }
 function SaveStatus() {
-  // BLOCKING save dialog: while a save is in flight the whole screen is locked —
-  // nothing else can be done until the server confirms. Brief green tick on success.
+  // "saving"/"updating"/"error" stay BLOCKING (as before) — those are short-lived or
+  // need explicit acknowledgement. "offline" is deliberately NOT blocking: the change
+  // is already safe in this device's local outbox and will keep retrying by itself,
+  // so there is no reason to stop someone from continuing to work while it does.
   const [st, setSt] = useState(null);
   const [show, setShow] = useState(false);
   useEffect(() => {
@@ -1077,8 +1183,13 @@ function SaveStatus() {
     return () => onSaveStatus(null);
   }, []);
   if (!show || !st) return null;
-  const wrap = "fixed inset-0 z-[200] grid place-items-center";
   const card = "bg-white rounded-2xl shadow-2xl px-8 py-6 flex flex-col items-center gap-3 min-w-[260px] text-center";
+  if (st === "offline") return (
+    <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-[200] bg-white border border-amber-200 shadow-xl rounded-full pl-3 pr-4 py-2 flex items-center gap-2.5 max-w-[92vw]">
+      <span className="relative flex h-2.5 w-2.5 shrink-0"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"/><span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-500"/></span>
+      <span className="text-xs text-slate-700">You're offline — your change is saved on this device and will finish sending automatically.</span>
+    </div>);
+  const wrap = "fixed inset-0 z-[200] grid place-items-center";
   if (st === "saving") return (<div className={wrap} style={{background:"rgba(15,23,42,.45)"}}>
     <div className={card}><Loader2 size={30} className="animate-spin text-sky-600"/><div className="font-semibold text-slate-900">Saving…</div><div className="text-xs text-slate-500">Please wait — don't close this tab.</div></div></div>);
   if (st === "updating") return (<div className={wrap} style={{background:"rgba(15,23,42,.45)"}}>
