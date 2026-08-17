@@ -46,6 +46,32 @@ const DB = {
 // and the list it wants (next). We derive exactly what was added / edited / deleted and
 // apply ONLY those changes to the freshest list (current). Rows added meanwhile by anyone
 // else always survive — a slightly-stale tab can no longer wipe other people's entries.
+// Decisions and completions are one-way doors. A tab holding a slightly older copy of
+// a row may still edit that row, but it must never be able to drag an HR approval back
+// to "Awaiting", or un-tick a task that has already been finished, purely because its
+// own copy of the row predates that change. This is what made approvals appear to
+// "come back" as pending on the employee's screen, and completed to-dos reappear
+// days later asking why they weren't done.
+function protectRow(cur, next) {
+  if (!cur || !next) return next;
+  let out = next;
+  // check-in / check-out time corrections: a decided request never reverts to Pending
+  for (const f of ["timeReq", "outReq"]) {
+    const c = cur[f], n = next[f];
+    if (c && c.status && c.status !== "Pending" && (!n || n.status === "Pending")) out = { ...out, [f]: c };
+  }
+  // leave / WFH / expense style rows: keep the decision that has actually been made
+  if (cur.status && cur.status !== "Pending" && next.status === "Pending" && (cur.decidedOn || cur.decidedAt)) {
+    out = { ...out, status: cur.status, decidedOn: cur.decidedOn, decidedAt: cur.decidedAt };
+  }
+  // an attendance day already confirmed present is not pushed back to "Requested"
+  if (cur.status === "Present" && next.status === "Requested") out = { ...out, status: "Present", office: next.office || cur.office };
+  // a finished task stays finished
+  if (cur.done && cur.completedAt && !next.done && !next.completedAt) {
+    out = { ...out, done: true, status: cur.status || "Completed", completedOn: cur.completedOn, completedAt: cur.completedAt };
+  }
+  return out;
+}
 function mergeRows(current, before, next) {
   if (!Array.isArray(current) || !Array.isArray(before) || !Array.isArray(next)) return next;
   if (next.some(r=>!r || r.id==null) || before.some(r=>!r || r.id==null) || current.some(r=>!r || r.id==null)) return next;
@@ -53,9 +79,10 @@ function mergeRows(current, before, next) {
   const nextIds = new Map(next.map(r=>[r.id, r]));
   // deletions this tab explicitly made: present before, absent in next
   let out = current.filter(r=> !(beforeIds.has(r.id) && !nextIds.has(r.id)) );
-  // edits: rows this tab still lists — take its version
+  // edits: rows this tab still lists — take its version, minus anything that would
+  // undo a decision or a completion already recorded on the fresher row
   const outIds = new Set(out.map(r=>r.id));
-  out = out.map(r=> nextIds.has(r.id) ? nextIds.get(r.id) : r);
+  out = out.map(r=> nextIds.has(r.id) ? protectRow(r, nextIds.get(r.id)) : r);
   // additions: rows this tab has that the fresh list doesn't
   const additions = next.filter(r=>!outIds.has(r.id));
   if (additions.length) {
@@ -71,7 +98,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 31 Jul 2026 · save-resilience-v1";
+const APP_BUILD = "Build 17 Aug 2026 · v2 full-feature (tested)";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -87,7 +114,23 @@ function initSaveState(doc, rev) { _serverDoc = doc; _rev = rev || 0; }
 // mid-save — the change is not lost: it sits here until it can finish sending, even
 // across a full page refresh or the app being closed and reopened later.
 const PENDING_KEY = "svype_pending_outbox_v1";
-function savePending(patchDoc, baseRev) { try { localStorage.setItem(PENDING_KEY, JSON.stringify({ patchDoc, baseRev, ts: Date.now() })); } catch {} }
+// Alongside the change itself we remember what THIS tab believed those lists looked
+// like just before it. That baseline is what lets a recovered save be re-applied as
+// "only my own additions, edits and deletions" rather than as a wholesale overwrite of
+// the list with an old snapshot — the overwrite being exactly how an HR approval or a
+// ticked-off task could silently disappear hours later.
+function savePending(patchDoc, baseRev, base) {
+  try {
+    const beforeKeys = {};
+    if (base && typeof base === "object" && patchDoc && typeof patchDoc === "object") {
+      for (const k of Object.keys(patchDoc)) if (Array.isArray(base[k])) beforeKeys[k] = base[k];
+    }
+    localStorage.setItem(PENDING_KEY, JSON.stringify({ patchDoc, beforeKeys, baseRev, ts: Date.now() }));
+  } catch {
+    // localStorage full (the baseline can be large) — keep the change itself at minimum.
+    try { localStorage.setItem(PENDING_KEY, JSON.stringify({ patchDoc, baseRev, ts: Date.now() })); } catch {}
+  }
+}
 function clearPending() { try { localStorage.removeItem(PENDING_KEY); } catch {} }
 function loadPending() { try { const raw = localStorage.getItem(PENDING_KEY); return raw ? JSON.parse(raw) : null; } catch { return null; } }
 async function _gzipBody(str) {
@@ -157,7 +200,7 @@ async function _attemptBatch(batch) {
     for (const b of batch) next = b.mutate(next);
     const patchDoc = {};
     if (base && typeof base === "object") { for (const k of Object.keys(next)) if (next[k] !== base[k]) patchDoc[k] = next[k]; }
-    savePending(base && typeof base === "object" ? patchDoc : next, _rev);   // safety net BEFORE the network call
+    savePending(base && typeof base === "object" ? patchDoc : next, _rev, base);   // safety net BEFORE the network call
     const r = await _putState(next, _rev, base);
     if (r.conflict) { hadConflict = true; _serverDoc = r.doc; _rev = r.rev; continue; }
     _serverDoc = next; _rev = r.rev; _stateCache.doc = next; clearPending();
@@ -208,7 +251,22 @@ if (typeof window !== "undefined") {
 async function _recoverPending() {
   const pending = loadPending();
   if (!pending || !pending.patchDoc) return;
-  const batch = [{ mutate: (cur) => ({ ...(cur || {}), ...pending.patchDoc }) }];
+  // A change that has been sitting unsent for over a week is not worth replaying: by
+  // then it is far more likely to overwrite good data than to rescue anything.
+  if (pending.ts && Date.now() - pending.ts > 7 * 86400000) { clearPending(); return; }
+  const beforeKeys = pending.beforeKeys || {};
+  const batch = [{ mutate: (cur) => {
+    const out = { ...(cur || {}) };
+    for (const [k, v] of Object.entries(pending.patchDoc)) {
+      const now = out[k];
+      if (Array.isArray(now) && Array.isArray(v)) {
+        // With a baseline: a true 3-way merge — apply only what this tab actually
+        // changed. Without one: upsert only, so nothing newer is ever dropped.
+        out[k] = Array.isArray(beforeKeys[k]) ? mergeRows(now, beforeKeys[k], v) : mergeRows(now, v, v);
+      } else out[k] = v;
+    }
+    return out;
+  } }];
   try { await _attemptBatch(batch); }
   catch (e) {
     if (String(e?.message || "").startsWith("NETWORK_ERROR")) { _setSaveStatus("offline"); _scheduleOfflineRetry(batch, 5000); }
@@ -431,6 +489,27 @@ function StoredImg({ d, className }) {
   return <img src={src} className={className}/>;
 }
 
+// ===== Profile pictures =====
+// A person's photo lives on their employee record as { fileId, mime } (stored in file
+// storage, not inside the main data record) — or, if the upload service is unreachable
+// at the moment of choosing it, as a small inline data URL so it still works.
+function Avatar({ emp, photo, name, size = 36, rounded = "rounded-full", className = "" }) {
+  const p = photo || (emp && emp.photo) || null;
+  const label = ((name || (emp && emp.name) || "?").trim()[0] || "?").toUpperCase();
+  return (
+    <div className={`${rounded} overflow-hidden shrink-0 bg-sky-100 text-sky-700 grid place-items-center font-bold ${className}`}
+      style={{ width: size, height: size, fontSize: Math.round(size * 0.42) }}>
+      {p ? <StoredImg d={typeof p === "string" ? { img: p } : p} className="w-full h-full object-cover"/> : label}
+    </div>
+  );
+}
+// Square-crop + shrink a chosen photo, push it to file storage, fall back to inline.
+async function preparePhoto(file) {
+  const img = await readImage(file, 512, true, 0.85);
+  try { const st = await uploadFile(img, "profile-photo.jpg"); return { fileId: st.fileId, mime: st.mime }; }
+  catch { return img; }
+}
+
 // Open a stored data URL (PDF/image/etc.) in a new tab.
 function openDataUrl(dataUrl, name) {
   if (!dataUrl) { alert("This document has no stored file — it was uploaded before an earlier fix and only its name was saved. Please ask HR to re-upload it."); return; }
@@ -563,10 +642,13 @@ function currentMonthInfo(from){
 }
 
 // Build invoices for the upcoming billing cycle.
-// HARD RULE: invoices are created ONLY when explicitly instructed (the "Generate now"
-// button passes force=true). Any call without force is a no-op — there is no automatic
-// path, on any date, ever.
-function generateRetainerInvoices(db, force){
+// Runs two ways: automatically (an HR/admin session checks the current cycle shortly
+// after load and every few hours), and manually via the "Generate now" button. Both are
+// idempotent — an invoice for the same client + cycle can never be created twice. When
+// HR deliberately clears an unpaid invoice, that client's cycle is stamped as skipped so
+// the automatic pass does NOT quietly recreate it; only the manual button (which passes
+// overrideSkips) brings it back.
+function generateRetainerInvoices(db, force, overrideSkips = false){
   if (!force) return db;
   const now = new Date();
   const pre = nextMonthInfo(now);      // Prepaid: pays for the UPCOMING month
@@ -582,6 +664,7 @@ function generateRetainerInvoices(db, force){
     // skipped clients whose invoices had been deleted — prepaid clients kept getting
     // skipped because their upcoming-month cycle was still stamped as "generated".)
     if (inv.some(i => i.retainerId === r.id && i.monthKey === key)) return r;
+    if (!overrideSkips && r.skipCycle === key) return r;   // HR cleared this cycle on purpose
     const base = +r.amount || 0, carry = +r.carry || 0;
     inv.push({ id: uid(), retainerId: r.id, client: r.client, number: `RET-${key.replace("-", "")}-${inv.length + 1}`, monthKey: key, month: label, billing: r.billing||"Prepaid", base, carry, total: base + carry, currency: r.currency || "PKR", status: "Unpaid", paidAmount: 0, account: "", date: issue, due, paidDate: "" });
     changed = true; return { ...r, carry: 0, lastGenCycle: key };
@@ -590,30 +673,81 @@ function generateRetainerInvoices(db, force){
 }
 
 /* ---------------- notifications + search ---------------- */
-function adminNotes(data) {
-  const out = [];
-  data.retainerInvoices.filter(i=>i.status!=="Paid").forEach(i=>out.push({ text:`${i.client}: retainer ${fmt(i.total,i.currency)} unpaid`, tab:"retainers" }));
-  data.receivables.filter(r=>r.status==="Overdue").forEach(r=>out.push({ text:`${r.client}: receivable overdue`, tab:"receivables" }));
-  data.payables.filter(p=>p.kind==="reimbursement" && p.status==="Pending").forEach(p=>out.push({ text:`${p.vendor}: reimbursement to approve`, tab:"payables" }));
-  data.leaves.filter(l=>l.status==="Pending").forEach(l=>out.push({ text:`${l.employee}: ${l.type||""} leave ${l.from} → ${l.to} (${dayCount(l.from,l.to)}d) awaiting approval`, tab:"requests" }));
-  (data.attendance||[]).filter(a=>a.timeReq && a.timeReq.status==="Pending").forEach(a=>out.push({ text:`${a.employee}: check-in time correction for ${a.date} awaiting approval`, tab:"requests" }));
-  (data.attendance||[]).filter(a=>a.outReq && a.outReq.status==="Pending").forEach(a=>out.push({ text:`${a.employee}: check-out time correction for ${a.date} awaiting approval`, tab:"requests" }));
-  (data.wfhRequests||[]).filter(w=>w.status==="Pending").forEach(w=>out.push({ text:`${w.employee}: work from home on ${w.date} awaiting approval`, tab:"requests" }));
-  (data.payables||[]).filter(p=>p.kind==="reimbursement" && p.status==="Pending" && (p.appeals||[]).length>0).forEach(p=>out.push({ text:`${p.vendor} appealed a rejected claim: ${p.desc.replace("Reimbursement: ","")}`, tab:"payables" }));
-  data.requests.filter(r=>r.status!=="Done").forEach(r=>out.push({ text:`${r.employee}: ${r.type}`, tab:"requests" }));
-  data.employees.forEach(e=>(e.docs||[]).forEach(d=>{ if(d.expiry){ const dd=daysUntil(d.expiry); if(dd<=30) out.push({ text:`${e.name}: ${d.name} ${dd<0?"expired":"expires in "+dd+"d"}`, tab:"employees" }); }}));
+// One notification engine for the whole portal. Every item carries a stable id and,
+// wherever the data allows, a timestamp — that's what makes the bell able to show a
+// real unread count (WhatsApp-style) instead of a number that never goes down.
+// "Live" items (you haven't checked in, HR: someone's missing) describe a condition
+// that's true right now; they carry the moment the condition began today, so they
+// light the badge once per day and clear once the bell is opened.
+const hmNow = () => { const d=new Date(); return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
+const addMinHM = (hm, mins) => { const [h,m]=String(hm||"09:00").split(":").map(Number); const t=(h*60+m+mins+1440)%1440; return `${pad2(Math.floor(t/60))}:${pad2(t%60)}`; };
+const atToday = (hm) => `${today()}T${hm||"00:00"}:00`;
+function watchCfg(data) { return { enabled:false, startTime:"09:30", graceMin:30, endTime:"18:00", outGraceMin:60, weekendDays:[0,6], remindEmployee:true, ...(data.attendanceWatch||{}) }; }
+const isWeekendToday = (cfg) => (cfg.weekendDays||[0,6]).includes(new Date().getDay());
+const onApprovedLeave = (data, name, t) => (data.leaves||[]).some(l=>l.employee===name && l.status==="Approved" && l.from<=t && t<=l.to);
+
+// The three "required tasks" watched for one employee. Used by both the employee's own
+// bell/dashboard and HR's — same rules, so the two sides never disagree.
+function dutyStatus(data, emp) {
+  const cfg = watchCfg(data);
+  const t = today(), now = hmNow();
+  const out = { in:false, out:false, work:false };
+  if (isWeekendToday(cfg) || !emp || emp.status!=="Active" || emp.payType==="Freelance") return out;
+  if (onApprovedLeave(data, emp.name, t)) return out;
+  const a = (data.attendance||[]).find(x=>x.employee===emp.name && x.date===t);
+  if (a && a.status==="Leave") return out;
+  const inDue = addMinHM(cfg.startTime, +cfg.graceMin||0);
+  const outDue = addMinHM(cfg.endTime, +cfg.outGraceMin||0);
+  if (now >= inDue && now < cfg.endTime && !(a && a.checkIn)) out.in = inDue;
+  if (now >= outDue && a && a.checkIn && !a.checkOut) out.out = outDue;
+  if (now >= cfg.endTime && !(data.timesheets||[]).some(x=>x.employee===emp.name && x.date===t)) out.work = cfg.endTime;
   return out;
 }
+
 function empNotes(data, me) {
   const out = [];
-  (data.requests||[]).filter(r=>r.employee===me.name && r.status==="Done").slice(0,3).forEach(r=>out.push({ text:`Your ${r.type} is ready — collect it from HR`, tab:"payslips" }));
-  (data.attendance||[]).filter(a=>a.employee===me.name && a.timeReq && a.timeReq.status!=="Pending").slice(-3).forEach(a=>out.push({ text:`Your check-in correction for ${a.date} was ${a.timeReq.status==="Approved"?"approved ✓":"declined — the recorded time stands"}`, tab:"attendance" }));
-  (data.attendance||[]).filter(a=>a.employee===me.name && a.outReq && a.outReq.status!=="Pending").slice(-3).forEach(a=>out.push({ text:`Your check-out correction for ${a.date} was ${a.outReq.status==="Approved"?"approved ✓":"declined — the recorded time stands"}`, tab:"attendance" }));
-  (data.timesheets||[]).filter(t=>t.employee===me.name && (t.replies||[]).length).slice(0,3).forEach(t=>out.push({ text:`${t.replies[t.replies.length-1].by} replied on your work update (${t.date})`, tab:"timesheets" }));
-  (data.wfhRequests||[]).filter(w=>w.employee===me.name && w.status!=="Pending").slice(-3).forEach(w=>out.push({ text:`Your work-from-home request for ${w.date} was ${w.status==="Approved"?"approved ✓":"declined"}`, tab:"attendance" }));
-  (data.payables||[]).filter(p=>p.kind==="reimbursement" && p.vendor===me.name && p.status==="Rejected").slice(-3).forEach(p=>out.push({ text:`Your claim "${p.desc.replace("Reimbursement: ","")}" was rejected${p.finalRejected?" (final)":" — you can appeal"}`, tab:"expenses" }));
-  [...data.leaves].filter(l=>l.employee===me.name && l.status!=="Pending").sort((a,b)=>(b.decidedOn||"").localeCompare(a.decidedOn||"")).slice(0,5).forEach(l=>out.push({ text:`Your ${l.type||""} leave (${l.from} → ${l.to}) was ${l.status==="Approved"?"approved ✓":"declined"}`, tab:"attendance" }));
-  data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===me.name && p.status!=="Pending").slice(0,5).forEach(p=>out.push({ text:`Expense claim: ${p.status}`, tab:"expenses" }));
+  const t = today();
+  // --- live reminders for today ---
+  const duty = dutyStatus(data, me);
+  if (duty.in)  out.push({ id:`rem-in-${t}`,  urgent:true, at:atToday(duty.in),  text:"You haven't checked in today — check in now so your attendance is recorded.", tab:"attendance" });
+  if (duty.out) out.push({ id:`rem-out-${t}`, urgent:true, at:atToday(duty.out), text:"You haven't checked out — remember to check out before you finish.", tab:"attendance" });
+  if (duty.work)out.push({ id:`rem-work-${t}`,urgent:true, at:atToday(duty.work),text:"Work update pending — log what you worked on today in your Daily Work Log.", tab:"timesheet" });
+  const od = (data.todos||[]).filter(x=>x.owner===me.name && !x.done && !x.completedAt && x.date < t).length;
+  if (od) out.push({ id:`rem-todo-${t}`, urgent:true, at:atToday("09:00"), text:`${od} task(s) from previous days are still open — tick them off or carry them over with a reason.`, tab:"todos" });
+  // --- announcements ---
+  (data.announcements||[]).slice(0,5).forEach(an=>out.push({ id:"ann-"+an.id, at:an.createdAt||an.date, text:`📢 ${an.title}`, tab:"dash" }));
+  // --- decisions & replies about me ---
+  (data.requests||[]).filter(r=>r.employee===me.name && r.status==="Done").slice(0,3).forEach(r=>out.push({ id:"req-"+r.id, at:r.decidedAt||r.decidedOn, text:`Your ${r.type} is ready — collect it from HR`, tab:"payslips" }));
+  (data.attendance||[]).filter(a=>a.employee===me.name && a.timeReq && a.timeReq.status!=="Pending").slice(-3).forEach(a=>out.push({ id:"tin-"+a.id, at:a.timeReq.decidedAt||a.timeReq.decidedOn, text:`Your check-in correction for ${a.date} was ${a.timeReq.status==="Approved"?"approved ✓":"declined — the recorded time stands"}`, tab:"attendance" }));
+  (data.attendance||[]).filter(a=>a.employee===me.name && a.outReq && a.outReq.status!=="Pending").slice(-3).forEach(a=>out.push({ id:"tout-"+a.id, at:a.outReq.decidedAt||a.outReq.decidedOn, text:`Your check-out correction for ${a.date} was ${a.outReq.status==="Approved"?"approved ✓":"declined — the recorded time stands"}`, tab:"attendance" }));
+  (data.timesheets||[]).filter(x=>x.employee===me.name && (x.replies||[]).length).slice(0,3).forEach(x=>{ const last=x.replies[x.replies.length-1]; out.push({ id:"tsr-"+x.id+"-"+(x.replies.length), at:last.at, text:`${last.by} replied on your work update (${x.date})`, tab:"timesheets" }); });
+  (data.wfhRequests||[]).filter(w=>w.employee===me.name && w.status!=="Pending").slice(-3).forEach(w=>out.push({ id:"wfh-"+w.id, at:w.decidedAt||w.decidedOn, text:`Your work-from-home request for ${w.date} was ${w.status==="Approved"?"approved ✓":"declined"}`, tab:"attendance" }));
+  (data.payables||[]).filter(p=>p.kind==="reimbursement" && p.vendor===me.name && p.status==="Rejected").slice(-3).forEach(p=>out.push({ id:"clm-"+p.id, at:p.decidedAt||p.decidedOn, text:`Your claim "${(p.desc||"").replace("Reimbursement: ","")}" was rejected${p.finalRejected?" (final)":" — you can appeal"}`, tab:"expenses" }));
+  [...(data.leaves||[])].filter(l=>l.employee===me.name && l.status!=="Pending").sort((a,b)=>(b.decidedOn||"").localeCompare(a.decidedOn||"")).slice(0,5).forEach(l=>out.push({ id:"lv-"+l.id, at:l.decidedAt||l.decidedOn, text:`Your ${l.type||""} leave (${l.from} → ${l.to}) was ${l.status==="Approved"?"approved ✓":"declined"}`, tab:"attendance" }));
+  (data.payroll||[]).filter(p=>p.employee===me.name && p.paid).slice(0,2).forEach(p=>out.push({ id:"slip-"+p.id, at:p.paidOn, text:`Your ${p.month} salary has been paid — the slip is in Payslips`, tab:"payslips" }));
+  return out;
+}
+function adminNotes(data) {
+  const out = [];
+  const t = today();
+  // --- live: who's missing a required task right now (mirrors employee reminders) ---
+  (data.employees||[]).filter(e=>e.status==="Active").forEach(e=>{
+    const duty = dutyStatus(data, e);
+    if (duty.in)  out.push({ id:`hr-in-${e.id}-${t}`,  urgent:true, at:atToday(duty.in),  text:`${e.name} hasn't checked in today`, tab:"attendance" });
+    if (duty.out) out.push({ id:`hr-out-${e.id}-${t}`, urgent:true, at:atToday(duty.out), text:`${e.name} hasn't checked out`, tab:"attendance" });
+    if (duty.work)out.push({ id:`hr-work-${e.id}-${t}`,urgent:true, at:atToday(duty.work),text:`${e.name} hasn't logged a work update today`, tab:"timesheets" });
+  });
+  // --- awaiting approval ---
+  (data.leaves||[]).filter(l=>l.status==="Pending").forEach(l=>out.push({ id:"aL-"+l.id, at:l.requestedOn, text:`${l.employee}: ${l.type||""} leave ${l.from} → ${l.to} (${dayCount(l.from,l.to)}d) awaiting approval`, tab:"requests" }));
+  (data.attendance||[]).filter(a=>a.timeReq && a.timeReq.status==="Pending").forEach(a=>out.push({ id:"aT-"+a.id, at:a.timeReq.submittedAt, text:`${a.employee}: check-in time correction for ${a.date} awaiting approval`, tab:"requests" }));
+  (data.attendance||[]).filter(a=>a.outReq && a.outReq.status==="Pending").forEach(a=>out.push({ id:"aO-"+a.id, at:a.outReq.submittedAt, text:`${a.employee}: check-out time correction for ${a.date} awaiting approval`, tab:"requests" }));
+  (data.wfhRequests||[]).filter(w=>w.status==="Pending").forEach(w=>out.push({ id:"aW-"+w.id, at:w.requestedOn, text:`${w.employee}: work from home on ${w.date} awaiting approval`, tab:"requests" }));
+  (data.payables||[]).filter(p=>p.kind==="reimbursement" && p.status==="Pending").forEach(p=>out.push({ id:"aP-"+p.id, at:p.submittedAt||p.date, text:`${p.vendor}: reimbursement to approve${(p.appeals||[]).length?" (appealed)":""}`, tab:"payables" }));
+  (data.requests||[]).filter(r=>r.status!=="Done" && r.status!=="Declined").forEach(r=>out.push({ id:"aR-"+r.id, at:r.date, text:`${r.employee}: ${r.type}`, tab:"requests" }));
+  // --- money & records ---
+  (data.retainerInvoices||[]).filter(i=>i.status!=="Paid").forEach(i=>out.push({ id:"ri-"+i.id, at:i.date, text:`${i.client}: retainer ${fmt(i.total,i.currency)} unpaid`, tab:"retainers" }));
+  (data.receivables||[]).filter(r=>r.status==="Overdue").forEach(r=>out.push({ id:"rc-"+r.id, at:r.due, text:`${r.client}: receivable overdue`, tab:"receivables" }));
+  (data.employees||[]).forEach(e=>(e.docs||[]).forEach(d=>{ if(d.expiry){ const dd=daysUntil(d.expiry); if(dd<=30) out.push({ id:"doc-"+e.id+"-"+d.id, at:d.expiry, text:`${e.name}: ${d.name} ${dd<0?"expired":"expires in "+dd+"d"}`, tab:"employees" }); }}));
   return out;
 }
 function searchAll(data, q) {
@@ -867,6 +1001,20 @@ export default function App() {
     return () => { clearInterval(iv); window.removeEventListener("focus", tick); document.removeEventListener("visibilitychange", onVis); };
   }, []);
 
+  // Retainer invoices generate THEMSELVES: whenever an HR/admin session is open, the
+  // current billing cycle is checked shortly after load and every few hours after, and
+  // any missing invoice is created. The "Generate now" button in Retainers still works
+  // and stays as the manual override. Generation is idempotent (an invoice for the same
+  // client + cycle is never created twice) and runs through the same conflict-safe save
+  // queue as everything else — if nothing is missing, no write happens at all.
+  useEffect(() => {
+    if (loading || !session || session.role === "employee") return;
+    const gen = () => { try { commit((cur)=>generateRetainerInvoices(cur, true), null); } catch {} };
+    const t0 = setTimeout(gen, 5000);
+    const iv = setInterval(gen, 6 * 3600 * 1000);
+    return () => { clearTimeout(t0); clearInterval(iv); };
+  }, [loading, session]);
+
   const role = session?.role || null;
   const meId = session?.empId || null;
   const who = () => role === "employee" ? (data.employees.find(e=>e.id===meId)?.name || session?.username || "Employee") : (ROLES[role] || "System");
@@ -937,7 +1085,10 @@ export default function App() {
   const allTabs = isEmp ? empVisible.map(n=>n.id) : groups.flatMap(g=>g.tabs);
   const active = allTabs.includes(tab) ? tab : "dash";
   const activeGroup = isEmp ? null : groupOfTab(active);
-  const notes = isEmp && me ? empNotes(data, me) : adminNotes(data);
+  const notes = [
+    ...(chat.totalUnread > 0 ? [{ id:"chat-unread", urgent:true, text:`💬 ${chat.totalUnread} unread message${chat.totalUnread>1?"s":""} in Team Chat`, tab:"chat" }] : []),
+    ...(isEmp && me ? empNotes(data, me) : adminNotes(data)),
+  ];
   const props = { data, update, patch, mutateData: commit, role, brand, saveBrand, me, restore, wipe, session, go:setTab };
 
   return (
@@ -979,10 +1130,10 @@ export default function App() {
           {!isEmp ? <GlobalSearch data={data} go={setTab}/> : <div className="font-semibold text-sm text-slate-700">Team Portal</div>}
           <div className="flex-1"/>
           {viewAs==="employee" && <span className="text-xs px-2.5 py-1 rounded-full bg-amber-100 text-amber-700 font-medium mr-1 hidden sm:inline">Viewing as {me?.name || "employee"}</span>}
-          <NotifBell items={notes} go={setTab}/>
+          <NotifBell items={notes} go={setTab} session={session}/>
           <div className="relative">
-            <button onClick={()=>setAcctMenu(v=>!v)} className="w-8 h-8 rounded-full bg-slate-200 text-slate-700 grid place-items-center text-xs font-bold hover:bg-slate-300" title="Account">
-              {(session?.username||"?")[0].toUpperCase()}
+            <button onClick={()=>setAcctMenu(v=>!v)} className="rounded-full hover:ring-2 hover:ring-slate-300" title="Account">
+              <Avatar emp={me || data.employees.find(e=>e.id===meId)} name={session?.username} size={32}/>
             </button>
             {acctMenu && <>
               <div className="fixed inset-0 z-40" onClick={()=>setAcctMenu(false)}/>
@@ -1089,23 +1240,56 @@ function GlobalSearch({ data, go }) {
     </div>
   );
 }
-function NotifBell({ items, go }) {
+function NotifBell({ items, go, session }) {
   const [open, setOpen] = useState(false);
+  const key = "svype_notif_seen_" + (session?.username || "anon");
+  const [seen, setSeen] = useState(() => { try { return localStorage.getItem(key) || ""; } catch { return ""; } });
+  const shownSeenRef = useRef(seen); // what "new" means for the currently-open panel
+  // Newest first; items without a timestamp sink to the bottom and never light the badge.
+  const sorted = [...items].sort((a,b)=>String(b.at||"").localeCompare(String(a.at||"")));
+  const unread = sorted.filter(i=>i.at && String(i.at) > seen).length;
+  const urgent = sorted.filter(i=>i.urgent);
+  const rest = sorted.filter(i=>!i.urgent);
+  const toggle = () => setOpen(o => {
+    const next = !o;
+    if (next) {
+      shownSeenRef.current = seen;                       // highlight what's new since last time
+      const now = new Date().toISOString();              // …then mark everything as read
+      try { localStorage.setItem(key, now); } catch {}
+      setSeen(now);
+    }
+    return next;
+  });
+  const when = (at) => { if (!at) return ""; const s=String(at); return s.length<=10 ? prettyShortDate(s) : dtOf(s); };
+  const Item = ({ n }) => (
+    <button onClick={()=>{go(n.tab);setOpen(false);}} className="w-full text-left px-4 py-2.5 hover:bg-slate-50 text-sm border-b border-slate-100 last:border-0 flex items-start gap-2">
+      {n.at && String(n.at) > shownSeenRef.current && <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-sky-500 shrink-0"/>}
+      <span className="flex-1">{n.text}{n.at && <span className="block text-xs text-slate-400 mt-0.5">{when(n.at)}</span>}</span>
+    </button>
+  );
   return (
     <div className="relative">
-      <button onClick={()=>setOpen(o=>!o)} className="relative p-2 rounded-lg text-slate-500 hover:bg-slate-100"><Bell size={19}/>
-        {items.length>0 && <span className="absolute -top-0.5 -right-0.5 min-w-4 h-4 px-1 rounded-full bg-rose-500 text-white text-xs grid place-items-center">{items.length}</span>}</button>
+      <button onClick={toggle} className="relative p-2 rounded-lg text-slate-500 hover:bg-slate-100"><Bell size={19}/>
+        {unread>0 && <span className="absolute -top-0.5 -right-0.5 min-w-4 h-4 px-1 rounded-full bg-rose-500 text-white text-xs grid place-items-center">{unread>99?"99+":unread}</span>}</button>
       {open && <>
         <div className="fixed inset-0 z-20" onClick={()=>setOpen(false)}/>
-        <div className="absolute right-0 z-30 mt-1 w-72 max-w-[calc(100vw-2rem)] bg-white border border-slate-200 rounded-xl shadow-lg overflow-hidden">
+        <div className="absolute right-0 z-30 mt-1 w-80 max-w-[calc(100vw-2rem)] bg-white border border-slate-200 rounded-xl shadow-lg overflow-hidden">
           <div className="px-4 py-2.5 border-b border-slate-200 font-semibold text-sm">Notifications</div>
-          {items.length===0?<div className="px-4 py-6 text-sm text-slate-400 text-center">You're all caught up</div>:
-            <div className="max-h-80 overflow-y-auto">{items.map((n,i)=>(
-              <button key={i} onClick={()=>{go(n.tab);setOpen(false);}} className="w-full text-left px-4 py-2.5 hover:bg-slate-50 text-sm border-b border-slate-100 last:border-0">{n.text}</button>))}</div>}
+          {sorted.length===0?<div className="px-4 py-6 text-sm text-slate-400 text-center">You're all caught up</div>:
+            <div className="max-h-96 overflow-y-auto">
+              {urgent.length>0 && <>
+                <div className="px-4 pt-2.5 pb-1 text-xs uppercase tracking-wider text-amber-600 font-medium bg-amber-50/60">Needs your attention</div>
+                {urgent.map(n=><Item key={n.id} n={n}/>)}
+              </>}
+              {rest.length>0 && urgent.length>0 && <div className="px-4 pt-2.5 pb-1 text-xs uppercase tracking-wider text-slate-400 font-medium">Updates</div>}
+              {rest.map(n=><Item key={n.id} n={n}/>)}
+            </div>}
         </div></>}
     </div>
   );
 }
+// "17 Aug" style for date-only stamps in the bell
+function prettyShortDate(d) { const x=new Date(d+"T00:00:00"); return isNaN(x)?d:x.toLocaleDateString([], { month:"short", day:"numeric" }); }
 
 /* ---------------- first-run: create founding accounts ---------------- */
 function FirstRunSetup({ data, brand, onCreate }) {
@@ -1555,13 +1739,18 @@ function Letterhead({ brand }) {
     </div></div>);
 }
 function DocSheet({ brand, body, signed, setSigned }) {
-  const sig = brand.signatories.find(s=>s.id===signed?.sigId);
-  const stamp = brand.stamps.find(s=>s.id===signed?.stampId);
+  // A brand record saved by an older version may have no signatories/stamps arrays at
+  // all — without these defaults, opening ANY document tab (offers, letters, proposals,
+  // quotations) crashed outright on such a record.
+  const sigs = brand.signatories || [];
+  const stamps = brand.stamps || [];
+  const sig = sigs.find(s=>s.id===signed?.sigId);
+  const stamp = stamps.find(s=>s.id===signed?.stampId);
   return (<div>
     <div className="flex flex-wrap gap-2 mb-3">
-      <select value={signed?.sigId||""} onChange={e=>setSigned({...signed,sigId:e.target.value})} className="bg-white border border-slate-300 rounded-lg px-3 py-1.5 text-xs text-slate-700 outline-none focus:border-sky-500"><option value="">No signature</option>{brand.signatories.map(s=><option key={s.id} value={s.id}>✍ {s.name}</option>)}</select>
-      <select value={signed?.stampId||""} onChange={e=>setSigned({...signed,stampId:e.target.value})} className="bg-white border border-slate-300 rounded-lg px-3 py-1.5 text-xs text-slate-700 outline-none focus:border-sky-500"><option value="">No stamp</option>{brand.stamps.map(s=><option key={s.id} value={s.id}>● {s.label}</option>)}</select>
-      {(!brand.signatories.length && !brand.stamps.length) && <span className="text-xs text-slate-400 self-center">Add signatures & stamps under Brand & Signatures</span>}
+      <select value={signed?.sigId||""} onChange={e=>setSigned({...signed,sigId:e.target.value})} className="bg-white border border-slate-300 rounded-lg px-3 py-1.5 text-xs text-slate-700 outline-none focus:border-sky-500"><option value="">No signature</option>{sigs.map(s=><option key={s.id} value={s.id}>✍ {s.name}</option>)}</select>
+      <select value={signed?.stampId||""} onChange={e=>setSigned({...signed,stampId:e.target.value})} className="bg-white border border-slate-300 rounded-lg px-3 py-1.5 text-xs text-slate-700 outline-none focus:border-sky-500"><option value="">No stamp</option>{stamps.map(s=><option key={s.id} value={s.id}>● {s.label}</option>)}</select>
+      {(!sigs.length && !stamps.length) && <span className="text-xs text-slate-400 self-center">Add signatures & stamps under Brand & Signatures</span>}
     </div>
     <div className="bg-white text-slate-900 rounded-lg p-7 text-sm leading-relaxed border border-slate-200 shadow-md"><Letterhead brand={brand}/>
       <div className="whitespace-pre-wrap" style={{minHeight:120}}>{body}</div>
@@ -1591,16 +1780,23 @@ function checkInOut(mutateData, name, which, onResult, remoteAllowed = false, wf
     const officeName = atOffice ? near.office : (wfhToday ? "Work from home" : "Remote");
     const stampedLoc = loc ? { ...loc, office: officeName, ...(near ? { distance: Math.round(near.distance) } : {}) } : null;
     const now = new Date().toISOString();
-    const stamp = which==="in"
-      ? { checkIn:now, location:stampedLoc, office:officeName, ...(wfhToday ? { wfh:true, wfhReqId:wfhToday.id, status: wfhToday.status==="Approved" ? "Present" : "Requested" } : {}) }
-      : { checkOut:now, checkOutLocation:stampedLoc, checkOutOffice:officeName };
     // FUNCTIONAL mutation: recomputed against the freshest data on every save retry, so
     // simultaneous check-ins from many employees merge instead of overwriting each other.
     mutateData((cur) => {
       const list = cur.attendance || [];
+      // The work-from-home request is re-read from the CURRENT data here, not from the
+      // copy this screen was rendered with. Checking in on a screen that hadn't yet
+      // caught up with HR's approval used to stamp the day back to "Requested" — which
+      // is why an already-approved WFH day kept reading as still awaiting approval.
+      const wfhNow = wfhToday ? (wfhFor(cur, name, today()) || wfhToday) : null;
+      const stamp = which==="in"
+        ? { checkIn:now, location:stampedLoc, office:officeName, ...(wfhNow ? { wfh:true, wfhReqId:wfhNow.id, status: wfhNow.status==="Approved" ? "Present" : "Requested" } : {}) }
+        : { checkOut:now, checkOutLocation:stampedLoc, checkOutOffice:officeName };
       const ex = list.find(a=>a.employee===name && a.date===today());
+      // Never demote a day HR has already confirmed present.
+      const keepStatus = (a) => (a.status === "Present" && stamp.status === "Requested") ? "Present" : (stamp.status || "Present");
       const attendance = ex
-        ? list.map(a=>a===ex ? { ...a, status:"Present", ...stamp } : a)
+        ? list.map(a=>a===ex ? { ...a, ...stamp, status: keepStatus(a) } : a)
         : [...list, { id:uid(), employee:name, date:today(), status:"Present", checkIn:null, checkOut:null, location:null, office:null, checkOutLocation:null, checkOutOffice:null, ...stamp }];
       return { ...cur, attendance };
     }, `${name} checked ${which} · ${officeName}`);
@@ -1738,11 +1934,24 @@ function CheckInCard({ data, mutateData, me }) {
     <div className="mt-3 text-xs text-slate-400">{me.remoteAllowed ? "You\u2019re approved for work from home — you can check in from anywhere. Your location is recorded when available." : `Check-in and check-out require being within ${GEOFENCE_RADIUS_M}m of a Svype office.`}</div>
   </div></Card>);
 }
-function EmpDashboard({ data, update, mutateData, session, me }) {
+function EmpDashboard({ data, update, mutateData, session, me, go }) {
   const myClaims = data.payables.filter(p=>p.kind==="reimbursement" && p.vendor===me.name && p.status!=="Paid").length;
+  // The same duties the bell watches, surfaced right on the home screen so nobody has
+  // to open the bell to find out they forgot to check in.
+  const duty = dutyStatus(data, me);
+  const nudges = [
+    duty.in  && { text:"You haven't checked in today.", cta:"Check in now", tab:"attendance" },
+    duty.out && { text:"You haven't checked out yet.", cta:"Check out", tab:"attendance" },
+    duty.work&& { text:"Work update pending for today.", cta:"Log your work", tab:"timesheet" },
+  ].filter(Boolean);
   return (<>
     <Head title={`Hi, ${me.name.split(" ")[0]}`} sub={`${me.role} · ${me.dept}`}/>
     <div className="space-y-5">
+      {nudges.length>0 && <div className="space-y-2">{nudges.map((n,i)=>(
+        <div key={i} className="flex items-center justify-between gap-3 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
+          <div className="text-sm text-amber-800 flex items-center gap-2"><Bell size={15} className="shrink-0"/>{n.text}</div>
+          <button onClick={()=>go && go(n.tab)} className="text-xs font-medium text-amber-800 bg-amber-100 hover:bg-amber-200 rounded-lg px-3 py-1.5 whitespace-nowrap">{n.cta} →</button>
+        </div>))}</div>}
       <CheckInCard data={data} mutateData={mutateData} me={me}/>
       <TodoCard data={data} mutateData={mutateData} session={session} me={me}/>
       <div><div className="text-xs uppercase tracking-wider text-slate-500 mb-2 font-medium">Leave balance</div><LeaveBalances data={data} name={me.name}/></div>
@@ -1752,14 +1961,31 @@ function EmpDashboard({ data, update, mutateData, session, me }) {
       {myClaims>0 && <div className="text-sm text-slate-500">You have {myClaims} expense claim(s) awaiting approval.</div>}
     </div></>);
 }
-function EmpProfile({ data, update, me }) {
+function EmpProfile({ data, update, mutateData, me }) {
   const [req, setReq] = useState(null);
   const [cert, setCert] = useState(null);
+  const [phBusy, setPhBusy] = useState(false);
+  const setPhoto = async (f) => {
+    if (!f) return;
+    setPhBusy(true);
+    try {
+      const photo = await preparePhoto(f);
+      await mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).map(e=>e.id===me.id?{...e, photo}:e) }), `${me.name} updated their profile photo`);
+    } catch { alert("Couldn't save that photo — check your connection and try again."); }
+    setPhBusy(false);
+  };
   const submit = () => { update("requests", [{ id:uid(), employee:me.name, type:"Profile update", note:req, status:"Open", date:today() }, ...data.requests], `${me.name} requested a profile change`); setReq(null); };
   const submitCert = () => { update("requests", [{ id:uid(), employee:me.name, type:cert.type, note:cert.note, status:"Requested", date:today() }, ...data.requests], `${me.name} requested ${cert.type}`); setCert(null); };
   return (<>
     <Head title="My Profile" sub="Your records on file" action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>setCert({ type:"Salary Certificate", note:"" })}><FileSignature size={15}/>Request certificate</Btn><Btn variant="ghost" onClick={()=>setReq("")}><Edit3 size={15}/>Request edit</Btn></div>}/>
-    <div className="flex items-center gap-4 mb-6"><div className="w-14 h-14 rounded-2xl bg-sky-100 text-sky-700 grid place-items-center font-bold text-xl">{me.name[0]}</div><div><div className="text-lg font-bold text-slate-900">{me.name}</div><div className="text-sm text-slate-500">{me.role} · {me.dept}</div></div></div>
+    <div className="flex items-center gap-4 mb-6">
+      <label className="relative cursor-pointer group" title="Change profile photo">
+        <Avatar emp={me} size={64} rounded="rounded-2xl"/>
+        <span className="absolute inset-0 rounded-2xl bg-slate-900/45 text-white text-[10px] font-medium grid place-items-center opacity-0 group-hover:opacity-100 transition">{phBusy?"Saving…":"Change"}</span>
+        <input type="file" accept="image/*" className="hidden" disabled={phBusy} onChange={e=>{setPhoto(e.target.files[0]); e.target.value="";}}/>
+      </label>
+      <div><div className="text-lg font-bold text-slate-900">{me.name}</div><div className="text-sm text-slate-500">{me.role} · {me.dept}</div><div className="text-xs text-slate-400 mt-0.5">Tap your photo to change it</div></div>
+    </div>
     <div className="grid sm:grid-cols-2 gap-4 mb-6">{[["Email",me.email],["Phone",me.phone],["CNIC",me.cnic],["Salary",fmt(me.salary)],["Joined",me.joined],["Status",me.status],["Check-in policy", me.remoteAllowed?"Anywhere (WFH)":"Office only"], ...(me.onNotice?[["Employment","On notice period"],["Notice given",me.noticeGivenOn||"—"],["Last working day",me.lastWorkingDay||"—"]]:[])].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-xs text-slate-500">{k}</div><div className="font-medium mt-0.5">{v||"—"}</div></div></Card>))}</div>
     <div className="text-xs uppercase tracking-wider text-slate-500 mb-2 font-medium">My documents</div>
     <Card><div className="p-4">{(!me.docs||me.docs.length===0)?<Empty msg="No documents on file"/>:<div className="grid sm:grid-cols-3 gap-3">{me.docs.map(d=>(<button key={d.id} onClick={()=>openStored(d, d.name)} className="text-left bg-slate-50 border border-slate-200 rounded-lg overflow-hidden hover:border-sky-400 hover:shadow-sm transition">{(d.img||(d.fileId&&String(d.mime||"").startsWith("image/")))?<StoredImg d={d} className="w-full h-32 object-cover"/>:<div className="h-32 grid place-items-center text-slate-400"><FileText/></div>}<div className="p-2 text-xs truncate flex items-center gap-1"><span className="text-sky-600">↗</span>{d.name}{d.expiry&&<span className="block text-slate-400">exp {d.expiry}</span>}</div></button>))}</div>}</div></Card>
@@ -2293,7 +2519,7 @@ function TeamTodos({ data, go }) {
       const mine=of(n); const openN=mine.filter(x=>!x.done&&x.date===t).length; const doneN=mine.filter(x=>x.completedOn===t).length;
       const carrying=mine.filter(x=>!x.done&&(x.carry>0||x.date<t)).length; const planned=mine.some(x=>x.createdOn===t||x.date===t);
       return (<Card key={n}><button onClick={()=>setOpenP(n)} className="p-5 text-left w-full hover:bg-slate-50 rounded-xl transition">
-        <div className="flex items-center justify-between"><div className="font-semibold">{n}</div>{planned?<span className="text-xs px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">planned today</span>:<span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">no plan yet</span>}</div>
+        <div className="flex items-center justify-between"><div className="font-semibold flex items-center gap-2"><Avatar emp={data.employees.find(e=>e.name===n)} name={n} size={28}/>{n}</div>{planned?<span className="text-xs px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">planned today</span>:<span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">no plan yet</span>}</div>
         <div className="text-xs text-slate-500 mt-2">{doneN} done · {openN} open today</div>
         <div className={`text-xs mt-0.5 ${carrying?"text-amber-600":"text-slate-400"}`}>{carrying?`${carrying} task(s) carrying forward`:"nothing carrying over"}</div>
       </button></Card>);
@@ -2364,6 +2590,24 @@ function Dashboard({ data, role, go, mutateData, session, me }) {
     </div></Card>);
   return (<>
     <Head title="Dashboard" sub={`Welcome back · ${ROLES[role]} · ${new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long"})}`}/>
+    {(()=>{ // Who's missing a required task RIGHT NOW — the same rules as the bell.
+      const watch = activeEmp.map(e=>({ e, d: dutyStatus(data, e) })).filter(x=>x.d.in||x.d.out||x.d.work);
+      if (!watch.length) return null;
+      const noIn = watch.filter(x=>x.d.in).map(x=>x.e.name);
+      const noOut = watch.filter(x=>x.d.out).map(x=>x.e.name);
+      const noWork = watch.filter(x=>x.d.work).map(x=>x.e.name);
+      const line = (label, names, tab) => names.length ? (
+        <button onClick={()=>go(tab)} className="w-full text-left flex items-start gap-2 py-1 text-sm hover:bg-amber-100/50 rounded px-1">
+          <span className="text-amber-800 font-medium whitespace-nowrap">{label}:</span>
+          <span className="text-amber-700">{names.join(", ")}</span>
+        </button>) : null;
+      return (<div className="mb-6 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
+        <div className="flex items-center gap-2 text-sm font-semibold text-amber-800 mb-1"><Bell size={15}/>Team watch · today</div>
+        {line("Not checked in", noIn, "attendance")}
+        {line("Not checked out", noOut, "attendance")}
+        {line("No work update", noWork, "timesheets")}
+      </div>);
+    })()}
     <div className="mb-6"><TodoCard data={data} mutateData={mutateData} session={session} me={me}/></div>
     <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">{stats.map(s2=>{const I=s2.icon;return(<Card key={s2.label}><button onClick={()=>go(s2.tab)} className="p-5 text-left w-full hover:bg-slate-50 rounded-xl transition"><I className="text-sky-600 mb-3" size={20}/><div className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900 break-words">{s2.value}</div><div className="text-xs text-slate-500 mt-1">{s2.label}</div><div className="text-xs text-slate-400 mt-0.5">{s2.sub}</div></button></Card>);})}</div>
     <div className="grid md:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -2670,7 +2914,7 @@ function ClientRetainerCard({ c, data, patch }) {
       <Field label="WhatsApp (for sending invoices)" value={edit.whatsapp} onChange={e=>setEdit({...edit,whatsapp:e.target.value})}/>
       <div className="grid grid-cols-2 gap-3"><Field label="Carried forward" type="number" value={edit.carry} onChange={e=>setEdit({...edit,carry:e.target.value})}/><Select label="Status" options={["Active","Paused"]} value={edit.status} onChange={e=>setEdit({...edit,status:e.target.value})}/></div>
       <Btn onClick={save}><Check size={15}/>Save retainer</Btn>
-      <p className="text-xs text-slate-400">Invoices are never created automatically — press “Generate now” in Retainers when you want them.</p>
+      <p className="text-xs text-slate-400">Retainer invoices for the current billing cycle are generated automatically (and never duplicated). “Generate now” in Retainers works as a manual override.</p>
     </Modal>}
   </div></Card>);
 }
@@ -2909,7 +3153,7 @@ function Employees({ data, update, mutateData }) {
     {noEmail>0 && <div className="mb-3 text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">{noEmail} active employee(s) have no email address — their salary slips can't be emailed until you add one.</div>}
     <BatchBar count={be.count} noun="employee" onClear={be.clear} onDelete={()=>{ const ids=new Set(be.selected); mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(x=>!ids.has(x.id)) }), `Removed ${ids.size} employee(s)`); be.clear(); }}/>
     <Card><Table cols={[<SelBox key="a" on={be.allOn} onChange={be.toggleAll} title="Select all"/>,"Name","Role","Email","Account / IBAN","Salary","Status",""]}>{filtered.length===0?<tr><td colSpan={8}><Empty msg="No employees"/></td></tr>:filtered.map(e=>(
-      <Row key={e.id} onClick={()=>setOpen(e.id)}><SelTd on={be.has(e.id)} onChange={()=>be.toggle(e.id)}/><Td><div className="font-medium">{e.name}</div>{e.payType==="Freelance"&&<span className="text-xs px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700 mr-1">Freelance</span>}{e.onNotice&&<span className="text-xs text-amber-600 mt-0.5">On notice{e.lastWorkingDay?` · last day ${e.lastWorkingDay}`:""}</span>}</Td><Td className="text-slate-500">{e.role}</Td><Td className="text-xs">{e.email?<span className="text-slate-600">{e.email}</span>:<button onClick={(ev)=>{ev.stopPropagation();setEdit(e);}} className="text-amber-600 hover:underline">add email</button>}</Td><Td className="text-slate-500">{e.account||"—"}</Td><Td className="text-slate-500">{fmt(e.salary)}</Td><Td><Pill s={e.status}/></Td><Td><RowActions onEdit={()=>setEdit(e)} onDelete={()=>mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(r=>r.id!==e.id) }), `Removed employee ${e.name}`)}/></Td></Row>))}</Table></Card>
+      <Row key={e.id} onClick={()=>setOpen(e.id)}><SelTd on={be.has(e.id)} onChange={()=>be.toggle(e.id)}/><Td><div className="flex items-center gap-2.5"><Avatar emp={e} size={30}/><div><div className="font-medium">{e.name}</div>{e.payType==="Freelance"&&<span className="text-xs px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700 mr-1">Freelance</span>}{e.onNotice&&<span className="text-xs text-amber-600 mt-0.5">On notice{e.lastWorkingDay?` · last day ${e.lastWorkingDay}`:""}</span>}</div></div></Td><Td className="text-slate-500">{e.role}</Td><Td className="text-xs">{e.email?<span className="text-slate-600">{e.email}</span>:<button onClick={(ev)=>{ev.stopPropagation();setEdit(e);}} className="text-amber-600 hover:underline">add email</button>}</Td><Td className="text-slate-500">{e.account||"—"}</Td><Td className="text-slate-500">{fmt(e.salary)}</Td><Td><Pill s={e.status}/></Td><Td><RowActions onEdit={()=>setEdit(e)} onDelete={()=>mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(r=>r.id!==e.id) }), `Removed employee ${e.name}`)}/></Td></Row>))}</Table></Card>
     {edit && <EmployeeForm edit={edit} setEdit={setEdit} save={save}/>}
   </>);
 }
@@ -2935,7 +3179,25 @@ function EmployeeForm({ edit, setEdit, save }) {
     setUploading(false);
   };
   const setDocExpiry = (id, v) => setEdit({ ...edit, docs: edit.docs.map(d=>d.id===id?{...d,expiry:v}:d) });
+  const [phBusy, setPhBusy] = useState(false);
+  const pickPhoto = async (f) => {
+    if (!f) return;
+    setPhBusy(true);
+    try { const photo = await preparePhoto(f); setEdit((cur)=>({ ...cur, photo })); }
+    catch { setUpErr("Couldn't read that photo — try a different one."); }
+    setPhBusy(false);
+  };
   return <Modal title={edit.id?"Edit employee":"Add employee"} onClose={()=>setEdit(null)}>
+    <div className="flex items-center gap-3">
+      <Avatar emp={edit} size={56} rounded="rounded-2xl"/>
+      <div className="flex items-center gap-2">
+        <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-dashed border-slate-300 cursor-pointer hover:border-sky-500 text-xs text-slate-500">
+          {phBusy?<Loader2 size={13} className="animate-spin"/>:<Paperclip size={13}/>}{edit.photo?"Change photo":"Add profile photo"}
+          <input type="file" accept="image/*" className="hidden" disabled={phBusy} onChange={e=>{pickPhoto(e.target.files[0]); e.target.value="";}}/>
+        </label>
+        {edit.photo && <button onClick={()=>setEdit({...edit, photo:null})} className="text-xs text-slate-400 hover:text-rose-500">Remove</button>}
+      </div>
+    </div>
     <Field label="Full name" value={edit.name} onChange={e=>setEdit({...edit,name:e.target.value})}/>
     <div className="grid grid-cols-2 gap-3"><Field label="Role" value={edit.role} onChange={e=>setEdit({...edit,role:e.target.value})}/><Field label="Department" value={edit.dept} onChange={e=>setEdit({...edit,dept:e.target.value})}/></div>
     <div className="grid grid-cols-2 gap-3"><Field label="Email" value={edit.email} onChange={e=>setEdit({...edit,email:e.target.value})}/><Field label="Phone" value={edit.phone} onChange={e=>setEdit({...edit,phone:e.target.value})}/></div>
@@ -2977,7 +3239,7 @@ function EmployeeProfile({ emp, data, onBack, onEdit }) {
   const tabs = [["overview","Overview"],["docs","Documents"],["payroll","Payroll"],["advances","Advances"],["letters","Letters"]];
   return (<>
     <button onClick={onBack} className="flex items-center gap-1 text-sm text-slate-500 hover:text-sky-600 mb-4"><ChevronLeft size={16}/>Back to employees</button>
-    <div className="flex flex-wrap items-start justify-between gap-3 mb-6"><div className="flex items-center gap-4"><div className="w-14 h-14 rounded-2xl bg-sky-100 text-sky-700 grid place-items-center font-bold text-xl shrink-0">{emp.name[0]}</div><div><h2 className="text-xl font-bold tracking-tight text-slate-900">{emp.name}</h2><p className="text-sm text-slate-500">{emp.role} · {emp.dept}</p></div></div><Btn variant="ghost" onClick={onEdit}><Edit3 size={15}/>Edit</Btn></div>
+    <div className="flex flex-wrap items-start justify-between gap-3 mb-6"><div className="flex items-center gap-4"><Avatar emp={emp} size={56} rounded="rounded-2xl"/><div><h2 className="text-xl font-bold tracking-tight text-slate-900">{emp.name}</h2><p className="text-sm text-slate-500">{emp.role} · {emp.dept}</p></div></div><Btn variant="ghost" onClick={onEdit}><Edit3 size={15}/>Edit</Btn></div>
     <div className="flex gap-1 mb-5 border-b border-slate-200 overflow-x-auto">{tabs.map(([k,l])=>(<button key={k} onClick={()=>setT(k)} className={`px-4 py-2 text-sm border-b-2 -mb-px whitespace-nowrap ${t===k?"border-sky-600 text-sky-700 font-medium":"border-transparent text-slate-500 hover:text-slate-800"}`}>{l}</button>))}</div>
     {t==="overview" && <div className="grid sm:grid-cols-2 gap-4">{[["Email",emp.email],["Phone",emp.phone],["CNIC",emp.cnic],["Salary",fmt(emp.salary)],["Provident fund",(emp.pf||0)+"%"],["Joined",emp.joined],["Bank",emp.bankName],["Account / IBAN",emp.account]].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-xs text-slate-500">{k}</div><div className="font-medium mt-0.5">{v||"—"}</div></div></Card>))}</div>}
     {t==="docs" && <Card><div className="p-4">{(!emp.docs||emp.docs.length===0)?<Empty msg="No documents on file."/>:<div className="grid sm:grid-cols-3 gap-3">{emp.docs.map(d=>{const dd=d.expiry?daysUntil(d.expiry):null;return(<button key={d.id} onClick={()=>openStored(d, d.name)} className="text-left bg-slate-50 border border-slate-200 rounded-lg overflow-hidden hover:border-sky-400 hover:shadow-sm transition">{(d.img||(d.fileId&&String(d.mime||"").startsWith("image/")))?<StoredImg d={d} className="w-full h-32 object-cover"/>:<div className="h-32 grid place-items-center text-slate-400"><FileText/></div>}<div className="p-2 text-xs"><div className="truncate flex items-center gap-1"><span className="text-sky-600">↗</span>{d.name}</div>{d.expiry&&<div className={dd<=30?"text-rose-600":"text-slate-400"}>exp {d.expiry}{dd<=30?` · ${dd<0?"expired":dd+"d"}`:""}</div>}</div></button>);})}</div>}</div></Card>}
@@ -3003,7 +3265,7 @@ function Attendance({ data, update, mutateData }) {
     try { await mutateData((cur)=>({ ...cur, attendance:(cur.attendance||[]).flatMap(x=>{
         if (x.id!==id) return [x];
         if (sv==="Rejected" && x.viaRequest && !x.checkIn && !x.checkOut) return [];
-        const upd={ ...x, [field]:{ ...x[field], status:sv, decidedOn:today() } };
+        const upd={ ...x, [field]:{ ...x[field], status:sv, decidedOn:today(), decidedAt:new Date().toISOString() } };
         if (sv==="Approved" && x.viaRequest) return [{ ...upd, status:"Present", office:x.office||"Added by HR approval" }];
         return [upd];
       }) }), `Check-in correction ${sv.toLowerCase()} for ${rec?.employee} (${rec?.date}) — they have been notified`); }
@@ -3021,7 +3283,7 @@ function Attendance({ data, update, mutateData }) {
     return <div className="text-xs text-slate-400">correction declined</div>;
   };
   const [busyLeave,setBusyLeave]=useState(null);
-  const setStatus=async (id,s)=>{ const l=data.leaves.find(x=>x.id===id); setBusyLeave(id); try { await mutateData((cur)=>({ ...cur, leaves:(cur.leaves||[]).map(x=>x.id===id?{...x,status:s,decidedOn:today()}:x) }), `Leave ${s.toLowerCase()} for ${l?.employee} — they have been notified`); } finally { setBusyLeave(null); } };
+  const setStatus=async (id,s)=>{ const l=data.leaves.find(x=>x.id===id); setBusyLeave(id); try { await mutateData((cur)=>({ ...cur, leaves:(cur.leaves||[]).map(x=>x.id===id?{...x,status:s,decidedOn:today(),decidedAt:new Date().toISOString()}:x) }), `Leave ${s.toLowerCase()} for ${l?.employee} — they have been notified`); } finally { setBusyLeave(null); } };
   const locLink = (loc) => loc && loc.lat ? `https://www.google.com/maps?q=${loc.lat},${loc.lng}` : null;
   const [day, setDay] = useState("");
   const [histEmp, setHistEmp] = useState("");
@@ -3280,40 +3542,75 @@ function MyProjects({ data, me }) {
     <p className="text-xs text-slate-400 mt-3">Payment is released once HR approves a delivered project.</p>
   </>);
 }
-function Payroll({ data, patch, update, brand }) {
+function Payroll({ data, patch, update, mutateData, brand }) {
   const [slip, setSlip] = useState(null);
   const [payProof, setPayProof] = useState(null);
   const [editDed, setEditDed] = useState(null);
   const [adj, setAdj] = useState(null);
+  const [editPay, setEditPay] = useState(null);
+  const [reopen, setReopen] = useState(null);
   const month = monthLabel();
   // Payroll is guarded: it shows exactly who will be processed and can never produce a
   // second slip (or a second advance deduction) for someone already run this month.
   const bp = useBatch(data.payroll);
   const [bulkPay, setBulkPay] = useState(null);
   // Paying a salary also pays the reimbursements that were folded into it.
+  // Every payroll write below is FUNCTIONAL — it recalculates against the freshest
+  // data at the moment of saving rather than against whatever this screen happened to
+  // be showing. A payroll screen left open while anything else changed used to write
+  // its whole stale slip list back, which is how one person's manual increase could
+  // end up applied across the board.
   const markSlipsPaid = (slipIds, { proof, method }) => {
     const ids = new Set(slipIds);
-    patch({
-      payroll: data.payroll.map(x=>ids.has(x.id) && !x.paid ? { ...x, paid:true, payMethod:method, proof:proof||x.proof, paidOn:today() } : x),
-      payables: data.payables.map(p=>ids.has(p.slipId) && p.status!=="Paid" ? { ...p, status:"Paid", settled:true, paidDate:today() } : p),
-    }, `Marked ${ids.size} salary slip(s) paid`);
+    return mutateData((cur)=>({
+      ...cur,
+      payroll: (cur.payroll||[]).map(x=>ids.has(x.id) && !x.paid ? { ...x, paid:true, payMethod:method, proof:proof||x.proof, paidOn:today() } : x),
+      payables: (cur.payables||[]).map(p=>ids.has(p.slipId) && p.status!=="Paid" ? { ...p, status:"Paid", settled:true, paidDate:today() } : p),
+    }), `Marked ${ids.size} salary slip(s) paid`);
+  };
+  // Undo a payment that shouldn't have been approved. The slip goes back to "pending
+  // review" and becomes fully editable again; the reimbursements it settled go back to
+  // Approved-and-unsettled so they aren't lost. Nothing is deleted, and the reversal is
+  // written to the activity log with the reason.
+  const doReopen = () => {
+    const { slip: sl, reason } = reopen;
+    mutateData((cur)=>({
+      ...cur,
+      payroll: (cur.payroll||[]).map(x=>x.id===sl.id ? {
+        ...x, paid:false, paidOn:null, payMethod:null, proof:null,
+        reopened: [...(x.reopened||[]), { at:new Date().toISOString(), reason:(reason||"").trim(), wasPaidOn:x.paidOn||null }],
+      } : x),
+      payables: (cur.payables||[]).map(p=>p.slipId===sl.id ? { ...p, status:"Approved", settled:true, paidDate:null } : p),
+    }), `Reopened ${sl.employee}'s ${sl.month} salary slip${(reason||"").trim()?` — ${reason.trim()}`:""}`);
+    setReopen(null);
+  };
+  // Correct the pay figures themselves — basic and allowances — on a slip that was
+  // generated with the wrong numbers.
+  const savePayEdit = () => {
+    const basic = +editPay.basic||0, allowances = +editPay.allowances||0, reimbursements = +editPay.reimbursements||0;
+    mutateData((cur)=>({ ...cur, payroll:(cur.payroll||[]).map(x=>x.id===editPay.id ? { ...x, basic, allowances, reimbursements } : x) }),
+      `Corrected pay figures on ${editPay.employee}'s ${editPay.month} slip`);
+    setEditPay(null);
   };
   // Deleting a slip undoes what it did: reimbursements go back to Approved and any
   // advance installment it took is returned.
   const deleteSlips = (slipIds) => {
     const ids = new Set(slipIds);
-    const gone = data.payroll.filter(x=>ids.has(x.id));
-    const refund = {};
-    gone.forEach(sl=>{ if (+sl.advance) refund[sl.employee] = (refund[sl.employee]||0) + (+sl.advance||0); });
-    const used = {};
-    patch({
-      payroll: data.payroll.filter(x=>!ids.has(x.id)),
-      payables: data.payables.map(p=>ids.has(p.slipId) ? { ...p, settled:false, status:"Approved", slipId:null, paidDate:null } : p),
-      advances: data.advances.map(a=>{
-        const owed = refund[a.employee]; if (!owed || used[a.employee]) return a;
-        used[a.employee] = true;
-        return { ...a, remaining:(+a.remaining||0) + owed, status:"Active" };
-      }),
+    return mutateData((cur)=>{
+      const gone = (cur.payroll||[]).filter(x=>ids.has(x.id));
+      const refund = {};
+      gone.forEach(sl=>{ if (+sl.advance) refund[sl.employee] = (refund[sl.employee]||0) + (+sl.advance||0); });
+      const used = {};
+      return {
+        ...cur,
+        payroll: (cur.payroll||[]).filter(x=>!ids.has(x.id)),
+        payables: (cur.payables||[]).map(p=>ids.has(p.slipId) ? { ...p, settled:false, status:"Approved", slipId:null, paidDate:null } : p),
+        advances: (cur.advances||[]).map(a=>{
+          const owed = refund[a.employee]; if (!owed || used[a.employee]) return a;
+          used[a.employee] = true;
+          return { ...a, remaining:(+a.remaining||0) + owed, status:"Active" };
+        }),
+      };
     }, `Deleted ${ids.size} salary slip(s) — reimbursements and advances restored`);
   };
   const doBulkPay = () => {
@@ -3326,7 +3623,7 @@ function Payroll({ data, patch, update, brand }) {
   const clearAllowances = () => {
     const total = withAllowance.reduce((t,p)=>t + (+p.allowances||0), 0);
     if (!confirm(`Remove the automatic allowance from ${withAllowance.length} salary slip(s)?\n\nThese were created by an older version that added 10% automatically. Removing it lowers those slips by ${fmt(total)} in total. Nothing else changes — you can still add increases manually with a reason.`)) return;
-    update("payroll", data.payroll.map(p => +p.allowances > 0 ? { ...p, allowances: 0 } : p), `Removed automatic allowance from ${withAllowance.length} slip(s)`);
+    mutateData((cur)=>({ ...cur, payroll:(cur.payroll||[]).map(p => +p.allowances > 0 ? { ...p, allowances: 0 } : p) }), `Removed automatic allowance from ${withAllowance.length} slip(s)`);
   };
   const [runAsk, setRunAsk] = useState(null);
   const askRun = () => {
@@ -3345,9 +3642,19 @@ function Payroll({ data, patch, update, brand }) {
     const slipOf = Object.fromEntries(runs.map(r=>[r.employee, r.id]));
     // Settled means "already inside a payslip" so it can't be counted twice. It is only
     // marked Paid once that salary is actually paid.
-    const newPayables=data.payables.map(p=>ids.includes(p.id)?{...p,settled:true,slipId:slipOf[p.vendor]||null}:p);
-    const newAdvances=data.advances.map(a=>{ if(a.status==="Active"&&a.remaining>0&&names.has(a.employee)){ const d=Math.min(+a.installment,a.remaining); const rem=a.remaining-d; return {...a,remaining:rem,status:rem<=0?"Cleared":"Active"};} return a; });
-    patch({ payroll:[...runs,...data.payroll], payables:newPayables, advances:newAdvances }, `Ran payroll for ${month} · ${runs.length} employee(s)`);
+    mutateData((cur)=>{
+      // A second guard at save time: if someone else already ran payroll for one of
+      // these people this month while this screen was open, that person is skipped
+      // rather than given a duplicate slip.
+      const existing = new Set((cur.payroll||[]).filter(p=>p.month===month).map(p=>p.employee));
+      const fresh = runs.filter(r=>!existing.has(r.employee));
+      return {
+        ...cur,
+        payroll:[...fresh, ...(cur.payroll||[])],
+        payables:(cur.payables||[]).map(p=>ids.includes(p.id)?{...p,settled:true,slipId:slipOf[p.vendor]||null}:p),
+        advances:(cur.advances||[]).map(a=>{ if(a.status==="Active"&&a.remaining>0&&names.has(a.employee)){ const d=Math.min(+a.installment,a.remaining); const rem=a.remaining-d; return {...a,remaining:rem,status:rem<=0?"Cleared":"Active"};} return a; }),
+      };
+    }, `Ran payroll for ${month} · ${runs.length} employee(s)`);
     setRunAsk(null);
   };
   // A slip is a snapshot taken the moment payroll ran. Anything approved for salary
@@ -3362,16 +3669,17 @@ function Payroll({ data, patch, update, brand }) {
   const confirmRefresh = () => {
     const { slip, newOnes, total } = refreshAsk;
     const ids = newOnes.map(p=>p.id);
-    patch({
-      payroll: data.payroll.map(p=>p.id===slip.id ? { ...p, reimbursements: (+p.reimbursements||0) + total } : p),
-      payables: data.payables.map(p=>ids.includes(p.id) ? { ...p, settled:true, slipId:slip.id } : p),
-    }, `Added ${newOnes.length} new reimbursement(s) to ${slip.employee}'s ${slip.month} slip (+${fmt(total)})`);
+    mutateData((cur)=>({
+      ...cur,
+      payroll: (cur.payroll||[]).map(p=>p.id===slip.id ? { ...p, reimbursements: (+p.reimbursements||0) + total } : p),
+      payables: (cur.payables||[]).map(p=>ids.includes(p.id) ? { ...p, settled:true, slipId:slip.id } : p),
+    }), `Added ${newOnes.length} new reimbursement(s) to ${slip.employee}'s ${slip.month} slip (+${fmt(total)})`);
     setRefreshAsk(null);
   };
   const saveDed = () => {
     const tax=+editDed.tax||0, eobi=+editDed.eobi||0, pf=+editDed.pf||0, advance=+editDed.advance||0;
     const deductions = tax+eobi+pf+advance;
-    update("payroll", data.payroll.map(x=>x.id===editDed.id?{...x,tax,eobi,pf,advance,deductions}:x), `Adjusted deductions for ${editDed.employee} (${editDed.month})`);
+    mutateData((cur)=>({ ...cur, payroll:(cur.payroll||[]).map(x=>x.id===editDed.id?{...x,tax,eobi,pf,advance,deductions}:x) }), `Adjusted deductions for ${editDed.employee} (${editDed.month})`);
     setEditDed(null);
   };
   // adjustments (increase or deduction with a reason)
@@ -3380,7 +3688,7 @@ function Payroll({ data, patch, update, brand }) {
   const rmAdjLine = (id) => setAdj(a=>({ ...a, list:a.list.filter(l=>l.id!==id) }));
   const saveAdj = () => {
     const adjustments = adj.list.filter(l=>l.reason && l.amount).map(l=>({ id:l.id, reason:l.reason, amount: (l.sign==="-"?-1:1)*Math.abs(+l.amount||0) }));
-    update("payroll", data.payroll.map(x=>x.id===adj.id?{...x,adjustments}:x), `Adjusted pay for ${adj.employee} (${adj.month})`);
+    mutateData((cur)=>({ ...cur, payroll:(cur.payroll||[]).map(x=>x.id===adj.id?{...x,adjustments}:x) }), `Adjusted pay for ${adj.employee} (${adj.month})`);
     setAdj(null);
   };
   const openAdj = (p) => setAdj({ id:p.id, employee:p.employee, month:p.month, list: (p.adjustments||[]).map(a=>({ id:a.id||uid(), reason:a.reason, amount:Math.abs(a.amount), sign: a.amount<0?"-":"+" })) });
@@ -3416,7 +3724,7 @@ function Payroll({ data, patch, update, brand }) {
         <Td className="text-slate-500 text-xs">{empAcct(p.employee)||"— not on file —"}</Td>
         <Td>{p.paid?<span className="flex items-center gap-2"><Pill s="Paid"/>{p.proof&&<button onClick={(e)=>{e.stopPropagation();openStored(typeof p.proof==="string"?{img:p.proof}:{...p.proof},"payment-proof");}} title="Open payment proof" className="w-7 h-7 rounded border border-slate-200 overflow-hidden grid place-items-center hover:ring-2 hover:ring-sky-400"><StoredImg d={typeof p.proof==="string"?{img:p.proof}:{...p.proof}} className="w-7 h-7 object-cover"/></button>}</span>:<Pill s="Pending review"/>}</Td>
         <Td><button onClick={()=>setSlip(p)} className="text-sky-600 text-xs font-medium hover:underline">View slip</button></Td>
-        <Td><RowActions>{!p.paid && <button onClick={()=>openRefresh(p)} title="Check for reimbursements approved after this slip was run" className="px-2 py-1 rounded text-xs bg-violet-100 text-violet-700 hover:bg-violet-200">Refresh reimb.</button>}{!p.paid && <button onClick={()=>openAdj(p)} title="Add increase / deduction with reason" className="px-2 py-1 rounded text-xs bg-sky-100 text-sky-700 hover:bg-sky-200">Adjust</button>}{!p.paid && <button onClick={()=>setEditDed({...p})} title="Tax / EOBI / PF / advance" className="px-2 py-1 rounded text-xs bg-slate-100 text-slate-600 hover:bg-slate-200">Deductions</button>}{!p.paid && <button onClick={()=>setPayProof({ ...p, proof:null })} title="Approve this slip and record the payment" className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Approve & pay</button>}{p.paid && <button onClick={()=>setPayProof({ ...p })} title="Update payment" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Edit3 size={14}/></button>}</RowActions></Td>
+        <Td><RowActions>{!p.paid && <button onClick={()=>openRefresh(p)} title="Check for reimbursements approved after this slip was run" className="px-2 py-1 rounded text-xs bg-violet-100 text-violet-700 hover:bg-violet-200">Refresh reimb.</button>}{!p.paid && <button onClick={()=>setEditPay({ id:p.id, employee:p.employee, month:p.month, basic:p.basic, allowances:p.allowances, reimbursements:p.reimbursements||0 })} title="Correct basic pay / allowances on this slip" className="px-2 py-1 rounded text-xs bg-amber-100 text-amber-700 hover:bg-amber-200">Edit pay</button>}{!p.paid && <button onClick={()=>openAdj(p)} title="Add increase / deduction with reason" className="px-2 py-1 rounded text-xs bg-sky-100 text-sky-700 hover:bg-sky-200">Adjust</button>}{!p.paid && <button onClick={()=>setEditDed({...p})} title="Tax / EOBI / PF / advance" className="px-2 py-1 rounded text-xs bg-slate-100 text-slate-600 hover:bg-slate-200">Deductions</button>}{!p.paid && <button onClick={()=>setPayProof({ ...p, proof:null })} title="Approve this slip and record the payment" className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Approve & pay</button>}{p.paid && <button onClick={()=>setReopen({ slip:p, reason:"" })} title="Approved by mistake? Reopen this slip so it can be corrected" className="px-2 py-1 rounded text-xs bg-rose-100 text-rose-700 hover:bg-rose-200">Reopen</button>}{p.paid && <button onClick={()=>setPayProof({ ...p })} title="Update payment" className="p-1.5 rounded text-slate-400 hover:text-sky-600 hover:bg-slate-100"><Edit3 size={14}/></button>}</RowActions></Td>
       </Row>))}</Table></Card>
     {bulkPay && (()=>{ const chosen=data.payroll.filter(x=>bp.selected.includes(x.id)); const unpaid=chosen.filter(x=>!x.paid); return (
       <Modal title={`Mark ${unpaid.length} salary slip(s) paid`} onClose={()=>setBulkPay(null)}>
@@ -3462,6 +3770,24 @@ function Payroll({ data, patch, update, brand }) {
       {runAsk.targets.length>0 && <Btn onClick={doRun}><Check size={15}/>Run payroll for {runAsk.targets.length} employee{runAsk.targets.length>1?"s":""}</Btn>}
     </Modal>}
     {slip && <SlipModal slip={slip} brand={brand} data={data} sendable onClose={()=>setSlip(null)}/>}
+    {editPay && <Modal title={`Correct pay figures · ${editPay.employee}`} onClose={()=>setEditPay(null)}>
+      <p className="text-xs text-slate-500">For {editPay.month}. Use this when the slip itself was generated with the wrong numbers — a salary that had changed, or a reimbursement total that didn't come through. Bonuses, fines and one-off amounts belong under <b>Adjust</b> instead, so they show as their own line with a reason.</p>
+      <Field label="Basic pay" type="number" value={editPay.basic} onChange={e=>setEditPay({...editPay, basic:e.target.value})}/>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Allowances" type="number" value={editPay.allowances} onChange={e=>setEditPay({...editPay, allowances:e.target.value})}/>
+        <Field label="Reimbursements" type="number" value={editPay.reimbursements} onChange={e=>setEditPay({...editPay, reimbursements:e.target.value})}/>
+      </div>
+      <div className="text-sm text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">New net pay: <b>{fmt((+editPay.basic||0) + (+editPay.allowances||0) + (+editPay.reimbursements||0) + adjTotal(data.payroll.find(x=>x.id===editPay.id)||{}) - (+(data.payroll.find(x=>x.id===editPay.id)?.deductions)||0))}</b></div>
+      <p className="text-xs text-slate-400">The employee's saved salary on their profile is not changed by this — only this one slip. Change it on their profile if the new figure is permanent.</p>
+      <Btn onClick={savePayEdit}><Check size={15}/>Save corrected figures</Btn>
+    </Modal>}
+    {reopen && <Modal title={`Reopen slip · ${reopen.slip.employee}`} onClose={()=>setReopen(null)}>
+      <p className="text-sm text-slate-600">This slip for <b>{reopen.slip.month}</b> is currently marked paid{reopen.slip.paidOn?` (on ${reopen.slip.paidOn})`:""} at <b>{fmt(netPay(reopen.slip))}</b>. Reopening puts it back to <b>pending review</b> so every figure can be corrected, and clears the recorded payment and proof.</p>
+      <div className="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">Nothing is deleted. Any reimbursements this slip settled stay attached to it and go back to <b>Approved</b>, so they aren't paid twice or lost. Advance installments already taken are left as they are — delete the slip instead if you need those returned.</div>
+      <Area label="Why is this being reopened? (goes on the record)" value={reopen.reason} onChange={e=>setReopen({...reopen, reason:e.target.value})}/>
+      {(reopen.slip.reopened||[]).length>0 && <div className="text-xs text-slate-500">Previously reopened {reopen.slip.reopened.length} time(s) — most recently {dtOf(reopen.slip.reopened[reopen.slip.reopened.length-1].at)}.</div>}
+      <Btn variant="danger" onClick={doReopen}><Edit3 size={15}/>Reopen this slip for editing</Btn>
+    </Modal>}
     {refreshAsk && <Modal title={`Refresh reimbursements · ${refreshAsk.slip.employee}`} onClose={()=>setRefreshAsk(null)}>
       {refreshAsk.newOnes.length === 0
         ? <div className="text-sm text-slate-600">Nothing new — every approved claim for {refreshAsk.slip.employee} this month is already on this slip.</div>
@@ -3954,42 +4280,73 @@ function Quotations({ data, update, brand }) {
 
 function retainerInvoiceHTML(inv, brand) {
   const money = (n) => `${inv.currency || "PKR"} ${Number(n||0).toLocaleString()}`;
-  const logo = brand.logo ? `<img src="${brand.logo}" style="height:54px;object-fit:contain"/>` : "";
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${inv.number}</title>
-  <style>
-    *{font-family:Arial,Helvetica,sans-serif;color:#0f172a;box-sizing:border-box}
-    body{margin:0;padding:40px}
-    .hd{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:3px solid ${brand.accent||"#0284c7"};padding-bottom:16px;margin-bottom:24px}
-    .co{font-size:20px;font-weight:bold}.tag{color:#64748b;font-size:12px}
-    .meta{text-align:right;font-size:12px;color:#475569}
-    h1{font-size:26px;letter-spacing:1px;margin:0 0 4px}
-    table{width:100%;border-collapse:collapse;margin-top:20px}
-    th,td{text-align:left;padding:10px;border-bottom:1px solid #e2e8f0;font-size:14px}
-    th{background:#f8fafc;color:#475569;text-transform:uppercase;font-size:11px}
-    .tot{text-align:right;font-size:18px;font-weight:bold;margin-top:18px}
-    .foot{margin-top:40px;color:#64748b;font-size:12px}
-    .pill{display:inline-block;padding:3px 10px;border-radius:6px;font-size:12px;background:#fef3c7;color:#b45309}
+  const accent = brand.accent || "#0284c7";
+  const dark = darkenHex(accent);
+  const statusChip = inv.status === "Paid"
+    ? `<span style="background:#dcfce7;color:#15803d;padding:3px 12px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:1px">PAID</span>`
+    : `<span style="background:#fef3c7;color:#b45309;padding:3px 12px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:1px">PAYMENT DUE</span>`;
+  const metaRow = (k,v,i2) => `<tr style="background:${i2%2?"#f1f5f9":"#fff"}"><td class="mk">${k}</td><td class="mv">${v}</td></tr>`;
+  const meta = [
+    metaRow("Invoice No.", inv.number||"", 0),
+    metaRow("Billing Month", inv.month||"—", 1),
+    metaRow("Issued", inv.date||today(), 2),
+    metaRow("Due", inv.due||"—", 3),
+  ].join("");
+  const paidPart = +inv.paidAmount > 0 && inv.status !== "Paid"
+    ? `<tr><td>Received to date</td><td class="r" style="color:#15803d">− ${money(inv.paidAmount)}</td></tr>` : "";
+  const balance = inv.status === "Paid" ? 0 : Math.max(0, (+inv.total||0) - (+inv.paidAmount||0));
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${inv.number}</title><style>
+    @page{margin:14mm}
+    body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial;color:#0f172a;margin:0;padding:36px 40px}
+    .top{display:flex;justify-content:space-between;align-items:flex-start;gap:20px}
+    .logo{width:70px;height:70px;object-fit:contain;border-radius:10px}
+    .logofallback{width:70px;height:70px;border-radius:10px;background:${dark};color:#fff;font-size:26px;font-weight:800;display:flex;align-items:center;justify-content:center}
+    .coblock{font-size:11px;color:#64748b;margin-top:8px;line-height:1.5}
+    .brandword{font-size:36px;font-weight:800;color:${accent};letter-spacing:2px;text-align:right;line-height:1}
+    .brandsub{font-size:11px;font-weight:700;letter-spacing:6px;color:#64748b;text-align:right;margin-top:4px}
+    hr{border:none;border-top:1px solid #e2e8f0;margin:20px 0}
+    .row2{display:flex;justify-content:space-between;gap:24px;align-items:flex-start}
+    .billto-label{font-size:11px;font-weight:700;letter-spacing:2px;color:${accent};margin-bottom:4px}
+    .billto-name{font-size:19px;font-weight:700}
+    .meta{border-collapse:collapse;min-width:260px}
+    .meta td{padding:6px 12px;font-size:12px}
+    .mk{color:#64748b;font-weight:600}.mv{text-align:right;font-weight:600}
+    .bar{background:${dark};color:#fff;font-size:11px;font-weight:700;letter-spacing:2px;padding:9px 14px;margin-top:24px;text-transform:uppercase}
+    table.items{width:100%;border-collapse:collapse;font-size:13px}
+    table.items th{background:${accent};color:#fff;text-align:left;padding:9px 14px;font-size:11px;letter-spacing:.04em;text-transform:uppercase}
+    table.items td{padding:11px 14px;border-bottom:1px solid #eef2f7}
+    .r{text-align:right}
+    .totalbar{background:${dark};color:#fff;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;font-size:12.5px}
+    .totalbar .words{max-width:60%}
+    .totalbar .amt{font-size:18px;font-weight:800;white-space:nowrap}
+    .totalbar .amtlabel{font-size:10px;letter-spacing:2px;opacity:.85;display:block;text-align:right}
+    .note{margin-top:18px;font-size:12.5px;color:#334155}
+    .foot{margin-top:30px;border-top:1px solid #e2e8f0;padding-top:14px;text-align:center;color:#94a3b8;font-size:11px}
+    .foot a{color:${accent};text-decoration:none}
+    @media print{body{padding:0}}
   </style></head><body>
-  <div class="hd"><div style="display:flex;gap:12px;align-items:center">${logo}<div><div class="co">${brand.company||""}</div><div class="tag">${brand.tagline||""}</div></div></div>
-  <div class="meta">${(brand.offices||[]).map(o=>`${o.city}: ${o.address}`).join("<br>")||brand.address||""}<br>${[brand.phone,brand.email,brand.website].filter(Boolean).join(" &middot; ")||brand.contact||""}</div></div>
-  <h1>INVOICE</h1>
-  <div style="display:flex;justify-content:space-between;font-size:13px;color:#475569;margin-top:8px">
-    <div><b>Billed to:</b><br>${inv.client||""}</div>
-    <div style="text-align:right">
-      <b>Invoice #:</b> ${inv.number}<br>
-      <b>Billing month:</b> ${inv.month||"—"}<br>
-      <b>Issued:</b> ${inv.date||today()}<br>
-      <b>Due:</b> ${inv.due||"—"}
+    <div class="top">
+      <div>
+        ${brand.logo ? `<img class="logo" src="${brand.logo}">` : `<div class="logofallback">${(brand.company||"?")[0].toUpperCase()}</div>`}
+        <div class="coblock">${(brand.offices||[]).map(o=>`<b>${o.city}</b> · ${o.address}`).join("<br>")||brand.address||""}</div>
+      </div>
+      <div><div class="brandword">INVOICE</div><div class="brandsub">${(brand.company||"").split(" ")[0].toUpperCase()}</div><div style="text-align:right;margin-top:10px">${statusChip}</div></div>
     </div>
-  </div>
-  <table><thead><tr><th>Description</th><th style="text-align:right">Amount</th></tr></thead>
-  <tbody>
-    <tr><td>Monthly retainer — ${inv.month||""}</td><td style="text-align:right">${money(inv.base)}</td></tr>
-    ${+inv.carry ? `<tr><td>Brought forward (previous balance)</td><td style="text-align:right">${money(inv.carry)}</td></tr>` : ""}
-  </tbody></table>
-  <div class="tot">Total due: ${money(inv.total)}</div>
-  <div class="foot">Status: <span class="pill">${inv.status}</span><br><br>Kindly transfer the amount due and share the receipt. Thank you for your business.</div>
-  <script>window.onload=()=>{setTimeout(()=>window.print(),300)}</script>
+    <hr/>
+    <div class="row2">
+      <div><div class="billto-label">BILL TO</div><div class="billto-name">${inv.client||""}</div><div style="font-size:12px;color:#64748b;margin-top:2px">Monthly retainer · ${inv.billing||"Prepaid"}</div></div>
+      <table class="meta">${meta}</table>
+    </div>
+    <div class="bar">Retainer · ${inv.month||""}</div>
+    <table class="items"><thead><tr><th>Description</th><th class="r">Amount (${inv.currency||"PKR"})</th></tr></thead><tbody>
+      <tr><td><b>Monthly retainer — ${inv.month||""}</b></td><td class="r"><b>${money(inv.base)}</b></td></tr>
+      ${+inv.carry ? `<tr><td>Brought forward (previous balance)</td><td class="r">${money(inv.carry)}</td></tr>` : ""}
+      ${paidPart}
+    </tbody></table>
+    <div class="totalbar"><div class="words">In Words: ${amountInWords(balance || inv.total)} Only</div><div><span class="amtlabel">${inv.status==="Paid"?"TOTAL (SETTLED)":"BALANCE DUE"}</span><span class="amt">${money(inv.status==="Paid" ? inv.total : balance)}</span></div></div>
+    <div class="note">Kindly transfer the amount due and share the payment receipt. Thank you for your continued business.</div>
+    <div class="foot"><a href="mailto:${brand.email||""}">${brand.email||""}</a> &middot; <a href="https://${brand.website||""}">${brand.website||""}</a> &middot; ${brand.company||""}</div>
+    <script>window.onload=()=>{setTimeout(()=>window.print(),300)}</script>
   </body></html>`;
 }
 function openInvoicePDF(inv, brand) {
@@ -4089,12 +4446,17 @@ function Retainers({ data, update, patch, brand, go }) {
     const unpaid = invs.filter(i=>i.status!=="Paid" && i.status!=="Partial");
     const openRecv = (data.receivables||[]).filter(r=>r.status!=="Paid");
     if (!unpaid.length && !openRecv.length) { alert("Nothing to clear — no unpaid invoices and no open receivables."); return; }
-    if (!confirm(`This will delete:\n\n• ${unpaid.length} unpaid retainer invoice(s)\n• ${openRecv.length} open receivable entr(ies)\n\nPaid and partially-paid records are kept (they are your record of money received). Nothing regenerates on its own — you can re-create them any time with Generate now. Continue?`)) return;
+    if (!confirm(`This will delete:\n\n• ${unpaid.length} unpaid retainer invoice(s)\n• ${openRecv.length} open receivable entr(ies)\n\nPaid and partially-paid records are kept (they are your record of money received). Cleared invoices will NOT be recreated automatically — the automatic generator skips a cycle you have deliberately cleared. Use Generate now if you ever want them back. Continue?`)) return;
     const keepIds = new Set(invs.filter(i=>i.status==="Paid"||i.status==="Partial").map(i=>i.id));
     const keepRecvIds = new Set(openRecv.map(r=>r.id));
+    // Stamp each retainer whose current-cycle invoice was just cleared, so the automatic
+    // generator doesn't recreate it a few hours later. "Generate now" can still bring it back.
+    const skipByRet = {};
+    unpaid.forEach(i=>{ if (i.retainerId) skipByRet[i.retainerId] = i.monthKey; });
     patch({
       retainerInvoices: invs.filter(i=>keepIds.has(i.id)),
       receivables: (data.receivables||[]).filter(r=>!keepRecvIds.has(r.id)),
+      retainers: rets.map(r=>skipByRet[r.id] ? { ...r, skipCycle: skipByRet[r.id] } : r),
     }, `Cleared ${unpaid.length} unpaid invoices and ${openRecv.length} open receivables`);
   };
   const blank = { client:"", whatsapp:"", amount:"", currency:"PKR", billing:"Prepaid", billingDay:1, status:"Active", carry:0 };
@@ -4107,8 +4469,8 @@ function Retainers({ data, update, patch, brand, go }) {
   };
   const [billAsk, setBillAsk] = useState(null); // { [retainerId]: "Prepaid"|"Postpaid" }
   const runGeneration = (db) => {
-    const after = generateRetainerInvoices(db, true); // only ever runs when you click
-    if (after !== db) patch({ retainerInvoices: after.retainerInvoices, retainers: after.retainers }, `Generated retainer invoices`);
+    const after = generateRetainerInvoices(db, true, true); // manual click overrides any cleared cycle
+    if (after !== db) patch({ retainerInvoices: after.retainerInvoices, retainers: (after.retainers||[]).map(r=>({ ...r, skipCycle: undefined })), }, `Generated retainer invoices`);
     else alert("Nothing new to generate — every active client already has an invoice for their billing period.\n\nPrepaid clients are billed for the upcoming month, postpaid clients for the month just finished.");
   };
   const [genAsk, setGenAsk] = useState(null);
@@ -4166,7 +4528,7 @@ function Retainers({ data, update, patch, brand, go }) {
     patch(patchObj, `Payment recorded for ${pay.client} (${pay.number})${shortfall>0 && carryChoice==="receivable" ? ` — ${fmt(shortfall,pay.currency)} added to Receivables` : ""}`); setPay(null);
   };
   return (<>
-    <Head title="Retainers" sub="Invoices are created only when you click Generate now (never on refresh). Issued 1st, due 5th of next month." action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>go("accounts")}><Landmark size={15}/>Accounts</Btn><Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn></div>}/>
+    <Head title="Retainers" sub="Invoices for the current cycle are generated automatically while the portal is open — Generate now remains as a manual override. Issued 1st, due 5th of next month." action={<div className="flex gap-2"><Btn variant="ghost" onClick={()=>go("accounts")}><Landmark size={15}/>Accounts</Btn><Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add client</Btn></div>}/>
     <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="invoices"?"primary":"ghost"} onClick={()=>setView("invoices")}>Invoices</Btn><Btn variant={view==="clients"?"primary":"ghost"} onClick={()=>setView("clients")}>Clients</Btn>{view==="invoices" && <><Btn variant="ghost" onClick={genDue}><Repeat size={15}/>Generate now</Btn><Btn variant="ghost" onClick={newManual}><Plus size={15}/>Create invoice</Btn><Btn variant="ghost" onClick={clearUnpaid}><X size={15}/>Clear unpaid & receivables</Btn></>}</div>
     {view==="clients" ? (
       <>
@@ -4373,7 +4735,9 @@ function customInvoiceHTML(inv, brand, bank) {
   ].filter(([,v])=>v).map(([k,v],i2)=>`<tr style="background:${i2%2?"#f1f5f9":"#fff"}"><td class="mk">${k}</td><td class="mv" style="font-weight:700">${v}</td></tr>`).join("");
   const noteLines = String(inv.notes||"").split("\n").map(l=>l.trim()).filter(Boolean);
   return `<!doctype html><html><head><meta charset="utf-8"><title>${inv.number}</title><style>
-    body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial;color:#0f172a;margin:0;padding:40px 44px}
+    @page{margin:14mm}
+    body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial;color:#0f172a;margin:0;padding:36px 40px}
+    .coblock{font-size:11px;color:#64748b;margin-top:8px;line-height:1.5}
     .top{display:flex;justify-content:space-between;align-items:flex-start;gap:20px}
     .logo{width:76px;height:76px;object-fit:contain;border-radius:10px}
     .logofallback{width:76px;height:76px;border-radius:10px;background:${dark};color:#fff;font-size:28px;font-weight:800;display:flex;align-items:center;justify-content:center}
@@ -4409,8 +4773,11 @@ function customInvoiceHTML(inv, brand, bank) {
     @media print{body{padding:0}}
   </style></head><body>
     <div class="top">
-      ${brand.logo ? `<img class="logo" src="${brand.logo}">` : `<div class="logofallback">${(brand.company||"?")[0].toUpperCase()}</div>`}
-      <div><div class="brandword">INVOICE</div><div class="brandsub">${(brand.company||"").split(" ")[0].toUpperCase()}</div></div>
+      <div>
+        ${brand.logo ? `<img class="logo" src="${brand.logo}">` : `<div class="logofallback">${(brand.company||"?")[0].toUpperCase()}</div>`}
+        <div class="coblock">${(brand.offices||[]).map(o=>`<b>${o.city}</b> · ${o.address}`).join("<br>")||brand.address||""}</div>
+      </div>
+      <div><div class="brandword">${(inv.type||"Invoice").toUpperCase()}</div><div class="brandsub">${(brand.company||"").split(" ")[0].toUpperCase()}</div></div>
     </div>
     <hr/>
     <div class="row2">
@@ -4605,13 +4972,13 @@ function Requests({ data, update, mutateData, go }) {
   const [kind, setKind] = useState("all");     // all | leave | cert | reimb
   const [st, setSt] = useState("open");        // open | decided | all
   const [busyId, setBusyId] = useState(null);
-  const setReqStatus = async (id,sv)=>{ setBusyId("R"+id); try { await mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).map(r=>r.id===id?{...r,status:sv,decidedOn:today()}:r) }), `Request marked ${sv}`); } finally { setBusyId(null); } };
+  const setReqStatus = async (id,sv)=>{ setBusyId("R"+id); try { await mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).map(r=>r.id===id?{...r,status:sv,decidedOn:today(),decidedAt:new Date().toISOString()}:r) }), `Request marked ${sv}`); } finally { setBusyId(null); } };
   const setWfh = async (id,sv)=>{
     const w = (data.wfhRequests||[]).find(x=>x.id===id);
     setBusyId("W"+id);
     try { await mutateData((cur)=>({
       ...cur,
-      wfhRequests:(cur.wfhRequests||[]).map(x=>x.id===id?{...x,status:sv,decidedOn:today()}:x),
+      wfhRequests:(cur.wfhRequests||[]).map(x=>x.id===id?{...x,status:sv,decidedOn:today(),decidedAt:new Date().toISOString()}:x),
       // Approving puts the day on the attendance sheet; declining takes the pending row off it.
       attendance:(cur.attendance||[]).flatMap(x=>{
         if (x.wfhReqId !== id) return [x];
@@ -4630,13 +4997,13 @@ function Requests({ data, update, mutateData, go }) {
         // declining removes the placeholder so attendance stays clean (the decision is
         // still recorded in the activity log).
         if (sv === "Rejected" && x.viaRequest && !x.checkIn && !x.checkOut && !(field==="timeReq" ? x.outReq : x.timeReq)) return [];
-        const upd = { ...x, [field]: { ...x[field], status:sv, decidedOn:today() } };
+        const upd = { ...x, [field]: { ...x[field], status:sv, decidedOn:today(), decidedAt:new Date().toISOString() } };
         if (sv === "Approved" && x.viaRequest) return [{ ...upd, status:"Present", office: x.office || "Added by HR approval" }];
         return [upd];
       }) }),
       `Check-in correction ${sv.toLowerCase()} for ${a?.employee} (${a?.date}) — they have been notified`); } finally { setBusyId(null); }
   };
-  const setLeave = async (id,sv)=>{ const l=data.leaves.find(x=>x.id===id); setBusyId("L"+id); try { await mutateData((cur)=>({ ...cur, leaves:(cur.leaves||[]).map(x=>x.id===id?{...x,status:sv,decidedOn:today()}:x) }), `Leave ${sv.toLowerCase()} for ${l?.employee} — they have been notified`); } finally { setBusyId(null); } };
+  const setLeave = async (id,sv)=>{ const l=data.leaves.find(x=>x.id===id); setBusyId("L"+id); try { await mutateData((cur)=>({ ...cur, leaves:(cur.leaves||[]).map(x=>x.id===id?{...x,status:sv,decidedOn:today(),decidedAt:new Date().toISOString()}:x) }), `Leave ${sv.toLowerCase()} for ${l?.employee} — they have been notified`); } finally { setBusyId(null); } };
   const delReq = (id)=>mutateData((cur)=>({ ...cur, requests:(cur.requests||[]).filter(x=>x.id!==id) }));
   // Merge the three request streams into one tracked list
   const rows = [
@@ -4689,7 +5056,7 @@ function Requests({ data, update, mutateData, go }) {
 }
 function Announcements({ data, update }) {
   const rows = data.announcements; const [f, setF] = useState(null); const [confirmId, setConfirmId] = useState(null);
-  const save = ()=>{ update("announcements", [{ id:uid(), title:f.title, body:f.body, date:today() }, ...rows], `Posted announcement: ${f.title}`); setF(null); };
+  const save = ()=>{ update("announcements", [{ id:uid(), title:f.title, body:f.body, date:today(), createdAt:new Date().toISOString() }, ...rows], `Posted announcement: ${f.title}`); setF(null); };
   return (<>
     <Head title="Announcements" sub="Posted to every team member's home screen" action={<Btn onClick={()=>setF({title:"",body:""})}><Plus size={15}/>New post</Btn>}/>
     <div className="space-y-3">{rows.length===0?<Card><Empty msg="No announcements yet"/></Card>:rows.map(an=>(<Card key={an.id}><div className="p-5 flex justify-between gap-4"><div><div className="font-semibold">{an.title}</div><div className="text-sm text-slate-600 mt-1">{an.body}</div><div className="text-xs text-slate-400 mt-2">{an.date}</div></div>{confirmId===an.id?<span className="flex items-center gap-1 self-start shrink-0"><button onClick={()=>{update("announcements",rows.filter(x=>x.id!==an.id));setConfirmId(null);}} className="text-xs font-medium text-white bg-rose-600 hover:bg-rose-700 rounded px-2 py-1">Delete?</button><button onClick={()=>setConfirmId(null)} className="text-xs text-slate-500 px-1">No</button></span>:<button onClick={()=>setConfirmId(an.id)} className="text-slate-400 hover:text-rose-500 shrink-0"><Trash2 size={16}/></button>}</div></Card>))}</div>
