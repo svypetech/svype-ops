@@ -19,6 +19,7 @@ const attendanceRt = require("./routes/attendance");
 const { startAttendanceWatch } = require("./lib/attendanceWatch");
 const { startBackupSchedule } = require("./lib/backupJob");
 const ai = require("./routes/ai");
+const announce = require("./routes/announce");
 const { crud } = require("./routes/crud");
 
 const app = express();
@@ -38,6 +39,7 @@ app.use("/api/files", files);
 app.use("/api/backup", backup);
 app.use("/api/attendance", attendanceRt);
 app.use("/api/ai", ai);
+app.use("/api/announce", announce);
 
 // generic CRUD modules
 app.use("/api/employees", crud("employees", ["name","role","dept","email","phone","cnic","salary","pf","joined","status","bankName","account","docs"], { jsonCols:["docs"] }));

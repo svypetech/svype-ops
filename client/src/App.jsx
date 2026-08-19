@@ -98,7 +98,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 17 Aug 2026 · v2 full-feature (tested)";
+const APP_BUILD = "Build 18 Aug 2026 · announce-email (tested)";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -704,6 +704,8 @@ function dutyStatus(data, emp) {
   return out;
 }
 
+// An announcement is visible to a person unless HR deliberately hid it from them.
+const annVisibleTo = (an, name) => !(an.excluded||[]).some(n=>String(n).trim().toLowerCase()===String(name||"").trim().toLowerCase());
 function empNotes(data, me) {
   const out = [];
   const t = today();
@@ -715,7 +717,7 @@ function empNotes(data, me) {
   const od = (data.todos||[]).filter(x=>x.owner===me.name && !x.done && !x.completedAt && x.date < t).length;
   if (od) out.push({ id:`rem-todo-${t}`, urgent:true, at:atToday("09:00"), text:`${od} task(s) from previous days are still open — tick them off or carry them over with a reason.`, tab:"todos" });
   // --- announcements ---
-  (data.announcements||[]).slice(0,5).forEach(an=>out.push({ id:"ann-"+an.id, at:an.createdAt||an.date, text:`📢 ${an.title}`, tab:"dash" }));
+  (data.announcements||[]).filter(an=>annVisibleTo(an, me.name)).slice(0,5).forEach(an=>out.push({ id:"ann-"+an.id, at:an.createdAt||an.date, text:`📢 ${an.title}`, tab:"dash" }));
   // --- decisions & replies about me ---
   (data.requests||[]).filter(r=>r.employee===me.name && r.status==="Done").slice(0,3).forEach(r=>out.push({ id:"req-"+r.id, at:r.decidedAt||r.decidedOn, text:`Your ${r.type} is ready — collect it from HR`, tab:"payslips" }));
   (data.attendance||[]).filter(a=>a.employee===me.name && a.timeReq && a.timeReq.status!=="Pending").slice(-3).forEach(a=>out.push({ id:"tin-"+a.id, at:a.timeReq.decidedAt||a.timeReq.decidedOn, text:`Your check-in correction for ${a.date} was ${a.timeReq.status==="Approved"?"approved ✓":"declined — the recorded time stands"}`, tab:"attendance" }));
@@ -1680,6 +1682,40 @@ function LeaveBalances({ data, name }) {
   </div>);
 }
 
+// The whole team's leave position at a glance, for HR/admin. Reuses the exact same
+// entitlement + usage math as the employee's own balance cards and the approval column,
+// so all three places always agree. Freelancers are left out — they have no leave quota.
+function LeaveBalanceBoard({ data }) {
+  const yr = new Date().getFullYear();
+  const types = ["Casual","Sick","Annual","Bereavement"];
+  const emps = (data.employees||[]).filter(e=>e.status==="Active" && e.payType!=="Freelance");
+  const rows = emps.map(e=>{
+    const used = leaveUsed(data, e.name, yr);
+    const cells = types.map(t=>{ const ent=entitlementFor(t,yr); return { t, ent, used:used[t]||0, left:Math.max(0, ent-(used[t]||0)) }; });
+    const totalLeft = cells.reduce((s2,c)=>s2+c.left,0);
+    const totalEnt = cells.reduce((s2,c)=>s2+c.ent,0);
+    // Unpaid days actually taken this year: Unpaid-type leaves + overflow days on other types
+    const unpaid = (data.leaves||[]).filter(l=>l.employee===e.name && l.status==="Approved" && String(l.from||"").startsWith(String(yr)))
+      .reduce((s2,l)=> s2 + (l.type==="Unpaid" ? dayCount(l.from,l.to) : (+l.unpaidDays||0)), 0);
+    const pending = (data.leaves||[]).filter(l=>l.employee===e.name && l.status==="Pending").length;
+    return { e, cells, totalLeft, totalEnt, unpaid, pending };
+  });
+  const cellCls = (c)=> c.left===0 ? "text-rose-600 font-semibold" : c.left<=1 ? "text-amber-600 font-semibold" : "text-slate-700";
+  return (<>
+    <Card><Table cols={["Employee","Casual","Sick","Annual","Bereavement","Total remaining","Unpaid taken",""]}>
+      {rows.length===0?<tr><td colSpan={8}><Empty msg="No active salaried employees"/></td></tr>:rows.map(({e,cells,totalLeft,totalEnt,unpaid,pending})=>(
+        <Row key={e.id}>
+          <Td><div className="flex items-center gap-2.5"><Avatar emp={e} size={28}/><div className="font-medium">{e.name}</div></div></Td>
+          {cells.map(c=>(<Td key={c.t}><span className={cellCls(c)} title={`${c.used} of ${c.ent} used`}>{c.left}</span><span className="text-xs text-slate-400"> / {c.ent}</span></Td>))}
+          <Td><span className={`font-bold ${totalLeft===0?"text-rose-600":"text-slate-900"}`}>{totalLeft}</span><span className="text-xs text-slate-400"> / {totalEnt}</span></Td>
+          <Td>{unpaid>0?<span className="text-xs text-rose-600 font-medium">{unpaid} day{unpaid>1?"s":""} (deducted)</span>:<span className="text-xs text-slate-400">—</span>}</Td>
+          <Td>{pending>0?<span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">{pending} pending</span>:null}</Td>
+        </Row>))}
+    </Table></Card>
+    <p className="text-xs text-slate-400 mt-3">Numbers show what is left of this year's entitlement. Once a category runs out, further approved days in it are automatically unpaid and deducted from salary.{new Date().getFullYear()===2026?" 2026 entitlements are prorated for Aug–Dec; full entitlement (6 casual · 8 sick · 12 annual) applies from 2027.":""}</p>
+  </>);
+}
+
 /* ---------------- payroll calc ---------------- */
 // Late arrival policy: 30 minutes' grace, then salary is deducted per hour for the
 // time beyond it. Only HR-approved check-in times count (effIn), so a corrected
@@ -1956,7 +1992,7 @@ function EmpDashboard({ data, update, mutateData, session, me, go }) {
       <TodoCard data={data} mutateData={mutateData} session={session} me={me}/>
       <div><div className="text-xs uppercase tracking-wider text-slate-500 mb-2 font-medium">Leave balance</div><LeaveBalances data={data} name={me.name}/></div>
       <Card><div className="px-5 py-4 border-b border-slate-200 font-semibold text-sm flex items-center gap-2"><Megaphone size={15} className="text-sky-600"/>Announcements</div>
-        {data.announcements.length===0?<Empty msg="No announcements"/>:<div className="divide-y divide-slate-100">{data.announcements.map(an=>(<div key={an.id} className="px-5 py-3"><div className="font-medium text-sm">{an.title}</div><div className="text-sm text-slate-600 mt-0.5">{an.body}</div><div className="text-xs text-slate-400 mt-1">{an.date}</div></div>))}</div>}
+        {(()=>{const anns=(data.announcements||[]).filter(an=>annVisibleTo(an, me.name));return anns.length===0?<Empty msg="No announcements"/>:<div className="divide-y divide-slate-100">{anns.map(an=>(<div key={an.id} className="px-5 py-3"><div className="font-medium text-sm">{an.title}</div><div className="text-sm text-slate-600 mt-0.5">{an.body}</div><div className="text-xs text-slate-400 mt-1">{an.date}</div></div>))}</div>;})()}
       </Card>
       {myClaims>0 && <div className="text-sm text-slate-500">You have {myClaims} expense claim(s) awaiting approval.</div>}
     </div></>);
@@ -3241,7 +3277,8 @@ function EmployeeProfile({ emp, data, onBack, onEdit }) {
     <button onClick={onBack} className="flex items-center gap-1 text-sm text-slate-500 hover:text-sky-600 mb-4"><ChevronLeft size={16}/>Back to employees</button>
     <div className="flex flex-wrap items-start justify-between gap-3 mb-6"><div className="flex items-center gap-4"><Avatar emp={emp} size={56} rounded="rounded-2xl"/><div><h2 className="text-xl font-bold tracking-tight text-slate-900">{emp.name}</h2><p className="text-sm text-slate-500">{emp.role} · {emp.dept}</p></div></div><Btn variant="ghost" onClick={onEdit}><Edit3 size={15}/>Edit</Btn></div>
     <div className="flex gap-1 mb-5 border-b border-slate-200 overflow-x-auto">{tabs.map(([k,l])=>(<button key={k} onClick={()=>setT(k)} className={`px-4 py-2 text-sm border-b-2 -mb-px whitespace-nowrap ${t===k?"border-sky-600 text-sky-700 font-medium":"border-transparent text-slate-500 hover:text-slate-800"}`}>{l}</button>))}</div>
-    {t==="overview" && <div className="grid sm:grid-cols-2 gap-4">{[["Email",emp.email],["Phone",emp.phone],["CNIC",emp.cnic],["Salary",fmt(emp.salary)],["Provident fund",(emp.pf||0)+"%"],["Joined",emp.joined],["Bank",emp.bankName],["Account / IBAN",emp.account]].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-xs text-slate-500">{k}</div><div className="font-medium mt-0.5">{v||"—"}</div></div></Card>))}</div>}
+    {t==="overview" && <><div className="grid sm:grid-cols-2 gap-4">{[["Email",emp.email],["Phone",emp.phone],["CNIC",emp.cnic],["Salary",fmt(emp.salary)],["Provident fund",(emp.pf||0)+"%"],["Joined",emp.joined],["Bank",emp.bankName],["Account / IBAN",emp.account]].map(([k,v])=>(<Card key={k}><div className="p-4"><div className="text-xs text-slate-500">{k}</div><div className="font-medium mt-0.5">{v||"—"}</div></div></Card>))}</div>
+    {emp.payType!=="Freelance" && <div className="mt-6"><div className="text-xs uppercase tracking-wider text-slate-500 mb-2 font-medium">Leave balance · {new Date().getFullYear()}</div><LeaveBalances data={data} name={emp.name}/></div>}</>}
     {t==="docs" && <Card><div className="p-4">{(!emp.docs||emp.docs.length===0)?<Empty msg="No documents on file."/>:<div className="grid sm:grid-cols-3 gap-3">{emp.docs.map(d=>{const dd=d.expiry?daysUntil(d.expiry):null;return(<button key={d.id} onClick={()=>openStored(d, d.name)} className="text-left bg-slate-50 border border-slate-200 rounded-lg overflow-hidden hover:border-sky-400 hover:shadow-sm transition">{(d.img||(d.fileId&&String(d.mime||"").startsWith("image/")))?<StoredImg d={d} className="w-full h-32 object-cover"/>:<div className="h-32 grid place-items-center text-slate-400"><FileText/></div>}<div className="p-2 text-xs"><div className="truncate flex items-center gap-1"><span className="text-sky-600">↗</span>{d.name}</div>{d.expiry&&<div className={dd<=30?"text-rose-600":"text-slate-400"}>exp {d.expiry}{dd<=30?` · ${dd<0?"expired":dd+"d"}`:""}</div>}</div></button>);})}</div>}</div></Card>}
     {t==="payroll" && <Card><Table cols={["Month","Basic","Net","Status"]}>{slips.length===0?<tr><td colSpan={4}><Empty msg="No payroll history"/></td></tr>:slips.map(p=>(<Row key={p.id}><Td>{p.month}</Td><Td>{fmt(p.basic)}</Td><Td className="font-semibold">{fmt(netPay(p))}</Td><Td><Pill s={p.paid?"Paid":"Pending"}/></Td></Row>))}</Table></Card>}
     {t==="advances" && <Card><Table cols={["Date","Total","Installment","Remaining","Status"]}>{advs.length===0?<tr><td colSpan={5}><Empty msg="No advances"/></td></tr>:advs.map(a=>(<Row key={a.id}><Td className="text-slate-500">{a.date}</Td><Td>{fmt(a.total)}</Td><Td>{fmt(a.installment)}</Td><Td>{fmt(a.remaining)}</Td><Td><Pill s={a.status}/></Td></Row>))}</Table></Card>}
@@ -3293,7 +3330,7 @@ function Attendance({ data, update, mutateData }) {
   const bh = useBatch(history);
   return (<>
     <Head title="Attendance & Leave" sub="Team marking, check-in/out log, and leave approvals"/>
-    <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="attendance"?"primary":"ghost"} onClick={()=>setView("attendance")}>Today's attendance</Btn><Btn variant={view==="history"?"primary":"ghost"} onClick={()=>setView("history")}>Check-in/out log</Btn><Btn variant={view==="leave"?"primary":"ghost"} onClick={()=>setView("leave")}>Leave requests</Btn></div>
+    <div className="flex flex-wrap gap-2 mb-4"><Btn variant={view==="attendance"?"primary":"ghost"} onClick={()=>setView("attendance")}>Today's attendance</Btn><Btn variant={view==="history"?"primary":"ghost"} onClick={()=>setView("history")}>Check-in/out log</Btn><Btn variant={view==="leave"?"primary":"ghost"} onClick={()=>setView("leave")}>Leave requests</Btn><Btn variant={view==="balances"?"primary":"ghost"} onClick={()=>setView("balances")}>Leave balances</Btn></div>
     {view==="attendance"?(
       <Card><Table cols={["Employee","Today","In / Out","Office","Location",""]}>{data.employees.filter(e=>e.status==="Active").map(e=>{const a=data.attendance.find(x=>x.employee===e.name&&x.date===today());const ll=locLink(a?.location);const lo=locLink(a?.checkOutLocation);return(
         <Row key={e.id}><Td className="font-medium">{e.name}</Td><Td>{a?<span className="text-xs text-slate-600">{a.status}<div className="text-xs text-slate-400">{a.markedBy?"set by HR":a.checkIn?"checked in":""}</div></span>:<span className="text-slate-400 text-xs">Not marked</span>}</Td><Td className="text-xs text-slate-500">{effIn(a)?timeOf(effIn(a)):"—"} / {effOut(a)?timeOf(effOut(a)):"—"}<TimeReqActions a={a}/><TimeReqActions a={a} field="outReq" label="check-out"/>{a?.wfh&&<div className="text-xs text-indigo-600">work from home{a.status==="Requested"?" · awaiting approval":""}</div>}</Td><Td className="text-xs text-slate-600">{a?.office||a?.checkOutOffice||"—"}</Td><Td className="text-xs"><div className="flex flex-col gap-0.5">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>in</a>:null}{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>out</a>:null}{!ll&&!lo&&<span className="text-slate-400">—</span>}</div></Td>
@@ -3313,6 +3350,8 @@ function Attendance({ data, update, mutateData }) {
       <BatchBar count={bh.count} noun="record" onClear={bh.clear} onDelete={()=>{ const ids=new Set(bh.selected); update("attendance", (data.attendance||[]).filter(x=>!ids.has(x.id)), `Deleted ${ids.size} attendance record(s)`); bh.clear(); }}/>
       <Card><Table cols={[<SelBox key="a" on={bh.allOn} onChange={bh.toggleAll} title="Select all"/>,"Date","Employee","Office","Check-in","Check-out","In loc","Out loc"]}>{history.length===0?<tr><td colSpan={8}><Empty msg={day?`No attendance recorded on ${day}`:"No attendance recorded yet"}/></td></tr>:history.map(a=>{const ll=locLink(a.location);const lo=locLink(a.checkOutLocation);return(
         <Row key={a.id}><SelTd on={bh.has(a.id)} onChange={()=>bh.toggle(a.id)}/><Td className="text-slate-500 whitespace-nowrap">{a.date}</Td><Td className="font-medium">{a.employee}</Td><Td className="text-xs text-slate-600">{a.office||a.checkOutOffice||"—"}</Td><Td className="text-slate-500">{effIn(a)?timeOf(effIn(a)):"—"}<TimeReqActions a={a}/><TimeReqActions a={a} field="outReq" label="check-out"/>{a?.wfh&&<div className="text-xs text-indigo-600">work from home{a.status==="Requested"?" · awaiting approval":""}</div>}</Td><Td className="text-slate-500">{effOut(a)?timeOf(effOut(a)):"—"}{a.outReq?.status==="Pending"&&<div className="text-xs text-amber-600">check-out correction pending</div>}{a.outReq?.status==="Approved"&&<div className="text-xs text-emerald-600">corrected · was {a.checkOut?timeOf(a.checkOut):"—"}</div>}</Td><Td className="text-xs">{ll?<a href={ll} target="_blank" rel="noopener" className="text-sky-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td><Td className="text-xs">{lo?<a href={lo} target="_blank" rel="noopener" className="text-emerald-600 hover:underline flex items-center gap-1"><MapPin size={11}/>view</a>:<span className="text-slate-400">—</span>}</Td></Row>);})}</Table></Card></>
+    ):view==="balances"?(
+      <LeaveBalanceBoard data={data}/>
     ):(
       <Card><Table cols={["Employee","Type & reason","From","To","Days","Balance left","Status",""]}>{data.leaves.length===0?<tr><td colSpan={8}><Empty msg="No leave requests"/></td></tr>:data.leaves.map(l=>(
         <Row key={l.id}><Td className="font-medium">{l.employee}</Td><Td className="text-slate-500">{l.type}{l.reason&&<div className="text-xs text-slate-400 max-w-[200px] truncate">{l.reason}</div>}</Td><Td className="text-slate-500">{l.from}</Td><Td className="text-slate-500">{l.to}</Td><Td>{dayCount(l.from,l.to)}</Td><Td className="text-xs text-slate-500">{LEAVE_POLICY[l.type]?`${Math.max(0,leaveLeft(data,l.employee,l.type))} left`:"—"}</Td><Td><Pill s={l.status}/></Td>
@@ -5056,11 +5095,44 @@ function Requests({ data, update, mutateData, go }) {
 }
 function Announcements({ data, update }) {
   const rows = data.announcements; const [f, setF] = useState(null); const [confirmId, setConfirmId] = useState(null);
-  const save = ()=>{ update("announcements", [{ id:uid(), title:f.title, body:f.body, date:today(), createdAt:new Date().toISOString() }, ...rows], `Posted announcement: ${f.title}`); setF(null); };
+  const [busy, setBusy] = useState(false);
+  const team = (data.employees||[]).filter(e=>e.status==="Active");
+  const toggleEx = (name) => setF(cur=>({ ...cur, excluded: (cur.excluded||[]).includes(name) ? cur.excluded.filter(n=>n!==name) : [...(cur.excluded||[]), name] }));
+  const save = async ()=>{
+    if (!f.title.trim()) { alert("Give the announcement a title."); return; }
+    const excluded = f.excluded || [];
+    setBusy(true);
+    // Post in the portal first — the announcement must exist even if the email fails.
+    await update("announcements", [{ id:uid(), title:f.title, body:f.body, date:today(), createdAt:new Date().toISOString(), excluded, emailed: !!f.sendEmail }, ...rows], `Posted announcement: ${f.title}${excluded.length?` (hidden from ${excluded.join(", ")})`:""}`);
+    if (f.sendEmail) {
+      try {
+        const r = await apiReq("POST", "/announce/send", { title:f.title, body:f.body, exclude:excluded });
+        const bits = [`Emailed to ${r.sent} team member${r.sent===1?"":"s"}`];
+        if (r.excluded) bits.push(`${r.excluded} excluded`);
+        if (r.noEmail && r.noEmail.length) bits.push(`no email on file for ${r.noEmail.join(", ")}`);
+        alert(`Announcement posted. ${bits.join(" · ")}.`);
+      } catch(e) {
+        alert(`The announcement is posted on the portal, but the email couldn't be sent: ${e.message||e}`);
+      }
+    }
+    setBusy(false); setF(null);
+  };
   return (<>
-    <Head title="Announcements" sub="Posted to every team member's home screen" action={<Btn onClick={()=>setF({title:"",body:""})}><Plus size={15}/>New post</Btn>}/>
-    <div className="space-y-3">{rows.length===0?<Card><Empty msg="No announcements yet"/></Card>:rows.map(an=>(<Card key={an.id}><div className="p-5 flex justify-between gap-4"><div><div className="font-semibold">{an.title}</div><div className="text-sm text-slate-600 mt-1">{an.body}</div><div className="text-xs text-slate-400 mt-2">{an.date}</div></div>{confirmId===an.id?<span className="flex items-center gap-1 self-start shrink-0"><button onClick={()=>{update("announcements",rows.filter(x=>x.id!==an.id));setConfirmId(null);}} className="text-xs font-medium text-white bg-rose-600 hover:bg-rose-700 rounded px-2 py-1">Delete?</button><button onClick={()=>setConfirmId(null)} className="text-xs text-slate-500 px-1">No</button></span>:<button onClick={()=>setConfirmId(an.id)} className="text-slate-400 hover:text-rose-500 shrink-0"><Trash2 size={16}/></button>}</div></Card>))}</div>
-    {f && <Modal title="New announcement" onClose={()=>setF(null)}><Field label="Title" value={f.title} onChange={e=>setF({...f,title:e.target.value})}/><Area label="Message" value={f.body} onChange={e=>setF({...f,body:e.target.value})}/><Btn onClick={save}><Check size={15}/>Post</Btn></Modal>}
+    <Head title="Announcements" sub="Posted to every team member's home screen — and optionally emailed to them too" action={<Btn onClick={()=>setF({title:"",body:"",sendEmail:true,excluded:[]})}><Plus size={15}/>New post</Btn>}/>
+    <div className="space-y-3">{rows.length===0?<Card><Empty msg="No announcements yet"/></Card>:rows.map(an=>(<Card key={an.id}><div className="p-5 flex justify-between gap-4"><div><div className="font-semibold">{an.title}</div><div className="text-sm text-slate-600 mt-1">{an.body}</div><div className="text-xs text-slate-400 mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">{an.date}{an.emailed && <span className="text-emerald-600">✉ emailed to the team</span>}{(an.excluded||[]).length>0 && <span className="text-amber-600">hidden from: {an.excluded.join(", ")}</span>}</div></div>{confirmId===an.id?<span className="flex items-center gap-1 self-start shrink-0"><button onClick={()=>{update("announcements",rows.filter(x=>x.id!==an.id));setConfirmId(null);}} className="text-xs font-medium text-white bg-rose-600 hover:bg-rose-700 rounded px-2 py-1">Delete?</button><button onClick={()=>setConfirmId(null)} className="text-xs text-slate-500 px-1">No</button></span>:<button onClick={()=>setConfirmId(an.id)} className="text-slate-400 hover:text-rose-500 shrink-0"><Trash2 size={16}/></button>}</div></Card>))}</div>
+    {f && <Modal title="New announcement" onClose={()=>busy?null:setF(null)}>
+      <Field label="Title" value={f.title} onChange={e=>setF({...f,title:e.target.value})}/>
+      <Area label="Message" value={f.body} onChange={e=>setF({...f,body:e.target.value})}/>
+      <label className="flex items-center gap-2 text-sm text-slate-700 cursor-pointer"><input type="checkbox" checked={!!f.sendEmail} onChange={e=>setF({...f,sendEmail:e.target.checked})} className="accent-sky-600"/>Also email this to the team's registered addresses</label>
+      <div>
+        <div className="text-xs font-medium text-slate-500 mb-1.5">Exclude specific people <span className="font-normal text-slate-400">— they won't get the email and won't see this in the portal</span></div>
+        <div className="flex flex-wrap gap-1.5 max-h-32 overflow-y-auto">{team.map(e=>{ const on=(f.excluded||[]).includes(e.name); return (
+          <button key={e.id} onClick={()=>toggleEx(e.name)} className={`px-2.5 py-1 rounded-full text-xs border transition ${on?"bg-rose-50 border-rose-300 text-rose-700 line-through":"bg-white border-slate-200 text-slate-600 hover:border-slate-400"}`}>{e.name}</button>);})}
+        </div>
+        {(f.excluded||[]).length>0 && <div className="text-xs text-amber-600 mt-1.5">Hidden from {f.excluded.length} {f.excluded.length===1?"person":"people"}: {f.excluded.join(", ")}</div>}
+      </div>
+      <Btn onClick={save} disabled={busy}>{busy?<Loader2 size={15} className="animate-spin"/>:<Check size={15}/>}{busy?"Posting…":f.sendEmail?"Post & email":"Post"}</Btn>
+    </Modal>}
   </>);
 }
 
