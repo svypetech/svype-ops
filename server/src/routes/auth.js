@@ -49,6 +49,18 @@ router.post("/login", async (req, res) => {
   if (!u || !(await bcrypt.compare(password || "", u.password)))
     return res.status(401).json({ error: "Incorrect username or password" });
   if (!u.active) return res.status(403).json({ error: "Account deactivated. Contact HR." });
+  // An employee account is only as alive as the employee record behind it: once HR
+  // marks someone Inactive (or offboarding auto-deactivates them after their last
+  // working day), their login stops working immediately — even if nobody remembered
+  // to switch off the user account itself.
+  if (u.emp_id) {
+    try {
+      const a = await pool.query("SELECT doc FROM app_state WHERE id=1");
+      const emp = ((a.rows[0]?.doc || {}).employees || []).find(e => String(e.id) === String(u.emp_id));
+      if (emp && emp.status !== "Active")
+        return res.status(403).json({ error: "Your portal access has ended along with your employment. Please contact HR if you think this is a mistake." });
+    } catch {}
+  }
   res.json({ token: sign(u), user: pub(u) });
 });
 

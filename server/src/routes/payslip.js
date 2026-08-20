@@ -39,6 +39,14 @@ const fileNameFor = (slip) =>
 router.post("/email", auth, async (req, res) => {
   const { slip, brand, employee, to, subject, body } = req.body || {};
   if (!slip || !to) return res.status(400).json({ error: "Missing the payslip or the employee's email address." });
+  // Former employees receive nothing from the portal — including payslips. If a final
+  // settlement genuinely needs emailing, HR can reactivate the person for a moment.
+  try {
+    const a = await pool.query("SELECT doc FROM app_state WHERE id=1");
+    const emp = ((a.rows[0]?.doc || {}).employees || []).find(e => e.name === slip.employee);
+    if (emp && emp.status !== "Active")
+      return res.status(403).json({ error: `${slip.employee} is no longer an active employee — the portal doesn't send anything to former staff. Download the PDF instead, or reactivate them briefly if it truly must be emailed.` });
+  } catch {}
 
   let cfg = null;
   try {

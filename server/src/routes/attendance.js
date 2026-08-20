@@ -15,7 +15,7 @@ router.get("/watch-status", auth, async (req, res) => {
 });
 
 router.post("/watch-test", auth, async (req, res) => {
-  try { res.json({ ok: true, pending: await notify(req.body && req.body.kind === "out" ? "out" : "in") }); }
+  try { res.json({ ok: true, pending: await notify(["out","worklog"].includes(req.body && req.body.kind) ? req.body.kind : "in") }); }
   catch (e) { res.status(400).json({ error: e.message || "Could not send the alert." }); }
 });
 

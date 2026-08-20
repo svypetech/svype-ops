@@ -5,6 +5,7 @@
 const express = require("express");
 const { pool } = require("../db");
 const { auth, staffOnly } = require("../middleware/auth");
+const { emailHTML, emailText, PORTAL_URL } = require("../lib/emailTemplate");
 
 const router = express.Router();
 const cleanPass = (p) => String(p || "").replace(/\s+/g, "");
@@ -60,19 +61,20 @@ router.post("/send", auth, staffOnly, async (req, res) => {
       auth: { user: cfg.user, pass: cleanPass(cfg.pass) },
     });
     const company = brand.company || "Svype OS";
+    const opts = {
+      brand, badge: "Announcement", tone: "info",
+      heading: String(title).trim(),
+      intro: String(body || "").trim(),
+      cta: { label: "Open the portal", url: PORTAL_URL },
+      note: "This announcement is also on your portal dashboard.",
+    };
     await tx.sendMail({
       from: fromHeader(cfg, brand),
       to: fromHeader(cfg, brand),                       // the visible To: is the sender itself
       bcc: to.map((r) => r.email),                      // real recipients stay private
-      subject: `📢 ${String(title).trim()} — ${company}`,
-      text: `${String(title).trim()}\n\n${String(body || "").trim()}\n\n—\nThis announcement was posted on the ${company} portal.`,
-      html: `<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;color:#0f172a">
-        <div style="background:${esc(brand.accent || "#0284c7")};color:#fff;border-radius:10px 10px 0 0;padding:14px 20px;font-size:12px;font-weight:700;letter-spacing:2px">${esc(company).toUpperCase()} · ANNOUNCEMENT</div>
-        <div style="border:1px solid #e2e8f0;border-top:none;border-radius:0 0 10px 10px;padding:20px">
-          <div style="font-size:18px;font-weight:700;margin-bottom:8px">${esc(title)}</div>
-          <div style="font-size:14px;line-height:1.6;white-space:pre-wrap">${esc(body)}</div>
-          <div style="margin-top:18px;padding-top:12px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8">Posted on the ${esc(company)} portal · you can also see it on your dashboard.</div>
-        </div></div>`,
+      subject: `\u{1F4E2} ${String(title).trim()} — ${company}`,
+      text: emailText(opts),
+      html: emailHTML(opts),
     });
     try { await pool.query("INSERT INTO audit (who, action) VALUES ($1,$2)", [req.user?.username || "system", `Emailed announcement "${String(title).trim()}" to ${to.length} recipient(s)${excluded.length ? `, excluded ${excluded.join(", ")}` : ""}`]); } catch {}
     res.json({ ok: true, sent: to.length, excluded: excluded.length, noEmail });

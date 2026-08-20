@@ -22,6 +22,12 @@ async function apiReq(method, url, body) {
   if (!res.ok) throw new Error(data.error || "Request failed");
   return data;
 }
+// Fire-and-forget email echo to HR's inbox whenever an employee submits a request.
+// The request itself lives in the portal either way — a failed email never blocks
+// or worries the employee, so errors here are deliberately swallowed.
+function notifyHR(kind, employee, details) {
+  try { apiReq("POST", "/notify/hr-request", { kind, employee, details }).catch(()=>{}); } catch {}
+}
 // Whole-app shared state persisted as one document on the server.
 let _stateCache = { doc: null, brand: null, rev: 0 };
 const DB = {
@@ -98,7 +104,7 @@ function mergeRows(current, before, next) {
 // our change ON TOP of that and retry. This stops one person's save from wiping
 // another person's recent changes (the cause of "my data disappeared on refresh").
 // Visible build tag so we can always verify which version is actually deployed.
-const APP_BUILD = "Build 18 Aug 2026 · announce-email (tested)";
+const APP_BUILD = "Build 19 Aug 2026 · offboarding + previous-employees (tested)";
 // Save-status indicator: "saving" | "saved" | "error" — shown in the top bar.
 let _statusCb = null;
 function onSaveStatus(cb) { _statusCb = cb; }
@@ -1066,6 +1072,20 @@ export default function App() {
   const canViewAsEmp = role !== "employee" && !!meId;
   const isEmp = role === "employee" || (viewAs === "employee" && canViewAsEmp);
   const me = isEmp ? data.employees.find(e=>e.id===meId) : null;
+  // A signed-in session belonging to someone who is no longer an active employee ends
+  // here, on the spot — new logins are already refused by the server, and this catches
+  // anyone who was still signed in (phone app, old tab) when HR deactivated them or
+  // offboarding ran after their last working day.
+  if (isEmp && meId && (!me || me.status !== "Active")) {
+    return (<div className="min-h-screen grid place-items-center bg-slate-50 p-6">
+      <div className="max-w-md w-full bg-white border border-slate-200 rounded-2xl shadow-sm p-8 text-center space-y-3">
+        <div className="w-12 h-12 mx-auto rounded-full bg-slate-100 grid place-items-center"><LogOut size={20} className="text-slate-400"/></div>
+        <div className="text-lg font-bold text-slate-900">Your portal access has ended</div>
+        <p className="text-sm text-slate-500">This account is no longer linked to an active employee{me?"":" record"}. If you believe this is a mistake, please contact HR.</p>
+        <Btn onClick={()=>{ setSession(null); try { setChatToken(null); localStorage.removeItem("svype_session"); } catch {} }}>Sign out</Btn>
+      </div>
+    </div>);
+  }
   const perms = session?.perms || null; // null/undefined = full access
   const canSeeTab = (id) => {
     // HR has the same reach as the founder by default. Per-user permissions still
@@ -1889,6 +1909,8 @@ function CheckInCard({ data, mutateData, me }) {
         // present until HR approves it.
         return { ...cur, attendance: [...list, patchRec({ id:uid(), employee:me.name, date:tf.date, status:"Requested", checkIn:null, checkOut:null, viaRequest:true })] };
       }, `${me.name} requested an attendance time correction for ${tf.date}`);
+      notifyHR(inIso && outIso ? "time-both" : inIso ? "time-in" : "time-out", me.name,
+        [["Date", tf.date], ["Started at", tf.inTime||""], ["Left at", tf.outTime||""], ["Reason", (tf.reason||"").trim()]]);
       setTf(null);
       setTsent("Sent to HR. Your attendance stays as recorded until they approve it.");
       setTimeout(()=>setTsent(""), 8000);
@@ -1907,6 +1929,7 @@ function CheckInCard({ data, mutateData, me }) {
         id: uid(), employee: me.name, date: wf.date, reason: wf.reason.trim(),
         status: "Pending", requestedOn: today(),
       }] }), `${me.name} requested to work from home on ${wf.date}`);
+      notifyHR("wfh", me.name, [["Date", wf.date], ["Reason", wf.reason.trim()]]);
       setWf(null);
       setTsent("Work-from-home request sent to HR. You can check in and out from anywhere on that day — it reaches the attendance sheet once HR approves.");
       setTimeout(()=>setTsent(""), 10000);
@@ -2071,6 +2094,7 @@ function EmpAttendance({ data, update, mutateData, me }) {
     setSubmitting(true);
     try {
       await mutateData((cur)=>({ ...cur, leaves: [...(cur.leaves||[]), { ...l, days, unpaidDays, id:uid(), requestedOn: today() }] }), `${me.name} requested ${l.type} leave (${l.from} → ${l.to})`);
+      notifyHR("leave", me.name, [["Type", l.type], ["From", l.from], ["To", l.to], ["Days", String(days)+(unpaidDays?` (${unpaidDays} unpaid)`:"")], ["Reason", l.reason||""]]);
       setLf(null); setLerr(""); setSentMsg("Leave request sent to HR — you'll be notified once it's approved or declined.");
       setTimeout(()=>setSentMsg(""), 7000);
     } catch { setLerr("Couldn't reach the server — please try again."); }
@@ -2127,6 +2151,7 @@ function EmpPayslips({ data, update, mutateData, brand, me }) {
     setSending(true);
     try {
       await mutateData((cur)=>({ ...cur, requests:[{ id:uid(), employee:me.name, type, status:"Requested", date:today() }, ...(cur.requests||[])] }), `${me.name} requested ${type}`);
+      notifyHR("document", me.name, [["Document", type], ["Requested on", today()]]);
       setSent(`${type} request sent to HR — you'll be notified when it's ready.`);
       setTimeout(()=>setSent(""), 6000);
     } catch { setSent(""); alert("Couldn't reach the server — please try again."); }
@@ -2178,6 +2203,7 @@ function EmpExpenses({ data, update, mutateData, me }) {
         appealCount:(+x.appealCount||0)+1,
         appeals:[...(x.appeals||[]), { reason:ap.reason.trim(), on:today() }],
       }) }), `${me.name} appealed a rejected claim: ${ap.desc}`);
+      notifyHR("appeal", me.name, [["Claim", ap.desc], ["Amount", fmt(+ap.amount)], ["Why reconsider", ap.reason.trim()]]);
       setAp(null);
     } catch { setApErr("Couldn't reach the server — please try again."); }
     setApBusy(false);
@@ -2210,6 +2236,7 @@ function EmpExpenses({ data, update, mutateData, me }) {
     const first = f.receipts[0];
     update("payables", [{ id:uid(), vendor:me.name, desc:"Reimbursement: "+f.desc, amount:+f.amount, due:today(), status:"Pending", kind:"reimbursement", settled:false,
       receipts: f.receipts, receiptFileId:first.fileId, receiptMime:first.mime, receiptName:first.name }, ...data.payables], `${me.name} submitted an expense claim (${f.receipts.length} attachment${f.receipts.length>1?"s":""})`);
+    notifyHR("expense", me.name, [["Claim", f.desc], ["Amount", fmt(+f.amount)], ["Receipts", `${f.receipts.length} attached — view them in the portal`]]);
     setF({ desc:"", amount:"", receipts:[] }); setErr("");
   };
   return (<>
@@ -3175,11 +3202,22 @@ function Employees({ data, update, mutateData }) {
   };
   const filtered = rows.filter(r=>r.name.toLowerCase().includes(q.toLowerCase()));
   const be = useBatch(filtered);
+  const [section, setSection] = useState("active");
+  const activeRows = filtered.filter(e=>e.status==="Active");
+  const prevRows = filtered.filter(e=>e.status!=="Active");
   const noEmail = (data.employees||[]).filter(e=>e.status==="Active" && !e.email).length;
+  const reactivate = (e) => {
+    if (!confirm(`Reactivate ${e.name}? They come back to the active team and their leave balances, payroll and history continue where they left off.\n\nNote: if their portal login was switched off, turn it back on under Users & Access.`)) return;
+    mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).map(x=>x.id===e.id?{ ...x, status:"Active", onNotice:false, lastWorkingDay:null, noticeGivenOn:null, offboardedOn:null }:x) }), `Reactivated ${e.name} — moved back to the active team`);
+  };
   const found = lookup ? rows.find(r=>r.name.toLowerCase().includes(lookup.toLowerCase())) : null;
   if (open) { const emp = rows.find(r=>r.id===open); if (emp) return <EmployeeProfile emp={emp} data={data} onBack={()=>setOpen(null)} onEdit={()=>{ setEdit(emp); setOpen(null); }} />; }
   return (<>
-    <Head title="Employees" sub={`${rows.length} on record · tap a name to open their file`} action={<Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add employee</Btn>}/>
+    <Head title="Employees" sub={`${activeRows.length} active · ${prevRows.length} previous · tap a name to open their file`} action={<Btn onClick={()=>setEdit(blank)}><Plus size={15}/>Add employee</Btn>}/>
+    <div className="flex gap-2 mb-4">
+      <Btn variant={section==="active"?"primary":"ghost"} onClick={()=>setSection("active")}>Active team ({activeRows.length})</Btn>
+      <Btn variant={section==="previous"?"primary":"ghost"} onClick={()=>setSection("previous")}>Previous employees ({prevRows.length})</Btn>
+    </div>
     <Card><div className="p-4">
       <div className="text-xs uppercase tracking-wider text-slate-500 mb-2 font-medium flex items-center gap-1.5"><Landmark size={13}/>Quick account lookup</div>
       <div className="relative max-w-sm"><Search size={15} className="absolute left-3 top-2.5 text-slate-400"/><input list="emp-names" value={lookup} onChange={e=>setLookup(e.target.value)} placeholder="Type an employee name…" className={inputCls+" pl-9"}/><datalist id="emp-names">{rows.map(e=><option key={e.id} value={e.name}/>)}</datalist></div>
@@ -3188,8 +3226,21 @@ function Employees({ data, update, mutateData }) {
     <div className="relative my-4 max-w-xs"><Search size={15} className="absolute left-3 top-2.5 text-slate-400"/><input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search name" className={inputCls+" pl-9"}/></div>
     {noEmail>0 && <div className="mb-3 text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">{noEmail} active employee(s) have no email address — their salary slips can't be emailed until you add one.</div>}
     <BatchBar count={be.count} noun="employee" onClear={be.clear} onDelete={()=>{ const ids=new Set(be.selected); mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(x=>!ids.has(x.id)) }), `Removed ${ids.size} employee(s)`); be.clear(); }}/>
-    <Card><Table cols={[<SelBox key="a" on={be.allOn} onChange={be.toggleAll} title="Select all"/>,"Name","Role","Email","Account / IBAN","Salary","Status",""]}>{filtered.length===0?<tr><td colSpan={8}><Empty msg="No employees"/></td></tr>:filtered.map(e=>(
+    {section==="previous" ? (<>
+      <p className="text-xs text-slate-500 -mt-1 mb-3">People who have left. Their records, payslips and history stay on file, but they receive no emails or reminders and their portal login is blocked. Someone put on a notice period is moved here automatically the day after their last working day.</p>
+      <Card><Table cols={["Name","Role","Joined","Last working day","Status",""]}>{prevRows.length===0?<tr><td colSpan={6}><Empty msg="No previous employees — nobody has left yet"/></td></tr>:prevRows.map(e=>(
+        <Row key={e.id} onClick={()=>setOpen(e.id)}>
+          <Td><div className="flex items-center gap-2.5"><Avatar emp={e} size={30}/><div><div className="font-medium">{e.name}</div>{e.payType==="Freelance"&&<span className="text-xs px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700">Freelance</span>}</div></div></Td>
+          <Td className="text-slate-500">{e.role}</Td>
+          <Td className="text-slate-500">{e.joined||"—"}</Td>
+          <Td className="text-slate-500">{e.lastWorkingDay||e.offboardedOn||"—"}</Td>
+          <Td><Pill s={e.status}/></Td>
+          <Td><RowActions onDelete={()=>mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(r=>r.id!==e.id) }), `Removed former employee ${e.name}`)}><button onClick={(ev)=>{ev.stopPropagation();reactivate(e);}} className="px-2 py-1 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200">Reactivate</button></RowActions></Td>
+        </Row>))}</Table></Card>
+    </>) : (<>
+    <Card><Table cols={[<SelBox key="a" on={be.allOn} onChange={be.toggleAll} title="Select all"/>,"Name","Role","Email","Account / IBAN","Salary","Status",""]}>{activeRows.length===0?<tr><td colSpan={8}><Empty msg="No employees"/></td></tr>:activeRows.map(e=>(
       <Row key={e.id} onClick={()=>setOpen(e.id)}><SelTd on={be.has(e.id)} onChange={()=>be.toggle(e.id)}/><Td><div className="flex items-center gap-2.5"><Avatar emp={e} size={30}/><div><div className="font-medium">{e.name}</div>{e.payType==="Freelance"&&<span className="text-xs px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700 mr-1">Freelance</span>}{e.onNotice&&<span className="text-xs text-amber-600 mt-0.5">On notice{e.lastWorkingDay?` · last day ${e.lastWorkingDay}`:""}</span>}</div></div></Td><Td className="text-slate-500">{e.role}</Td><Td className="text-xs">{e.email?<span className="text-slate-600">{e.email}</span>:<button onClick={(ev)=>{ev.stopPropagation();setEdit(e);}} className="text-amber-600 hover:underline">add email</button>}</Td><Td className="text-slate-500">{e.account||"—"}</Td><Td className="text-slate-500">{fmt(e.salary)}</Td><Td><Pill s={e.status}/></Td><Td><RowActions onEdit={()=>setEdit(e)} onDelete={()=>mutateData((cur)=>({ ...cur, employees:(cur.employees||[]).filter(r=>r.id!==e.id) }), `Removed employee ${e.name}`)}/></Td></Row>))}</Table></Card>
+    </>)}
     {edit && <EmployeeForm edit={edit} setEdit={setEdit} save={save}/>}
   </>);
 }
@@ -5247,7 +5298,7 @@ function Vault({ data, patch }) {
 }
 
 function AttendanceWatchCard({ data, patch }) {
-  const cfg = { enabled:false, startTime:"09:30", graceMin:30, endTime:"18:00", outGraceMin:60, hrEmail:"", remindEmployee:true, ...(data.attendanceWatch||{}) };
+  const cfg = { enabled:false, startTime:"09:30", graceMin:30, endTime:"18:00", outGraceMin:60, hrEmail:"", remindEmployee:true, worklogTime:"21:00", ...(data.attendanceWatch||{}) };
   const [f, setF] = useState(cfg);
   const [st, setSt] = useState(null);
   const [busy, setBusy] = useState(""); const [msg, setMsg] = useState(null);
@@ -5256,7 +5307,7 @@ function AttendanceWatchCard({ data, patch }) {
   const save = (next) => { setF(next); patch({ attendanceWatch:{ ...next, graceMin:+next.graceMin||0, outGraceMin:+next.outGraceMin||0 } }, "Updated attendance reminders"); };
   const test = async (kind) => {
     setBusy(kind); setMsg(null);
-    try { const r = await apiReq("POST","/attendance/watch-test",{ kind }); setMsg({ ok:true, text:`Sent — ${r.pending} person(s) currently ${kind==="in"?"not checked in":"not checked out"}.` }); load(); }
+    try { const r = await apiReq("POST","/attendance/watch-test",{ kind }); setMsg({ ok:true, text:`Sent — ${r.pending} person(s) currently ${kind==="in"?"not checked in":kind==="out"?"not checked out":"missing today's work log"}.` }); load(); }
     catch (e) { setMsg({ ok:false, text:e.message || "Could not send." }); }
     setBusy("");
   };
@@ -5273,7 +5324,12 @@ function AttendanceWatchCard({ data, patch }) {
       <Field label="Office end" type="time" value={f.endTime} onChange={e=>save({...f,endTime:e.target.value})}/>
       <Field label="Tell HR this many minutes later" type="number" value={f.outGraceMin} onChange={e=>setF({...f,outGraceMin:e.target.value})} onBlur={()=>save(f)}/>
     </div>
+    <div className="grid sm:grid-cols-2 gap-3">
+      <Field label="Work-log reminder time (evening)" type="time" value={f.worklogTime} onChange={e=>save({...f,worklogTime:e.target.value})}/>
+      <div className="text-xs text-slate-400 self-end pb-2">Anyone who has not written their Daily Work Log by this time gets a designed reminder email. People on approved leave (or marked absent) are skipped.</div>
+    </div>
     <Field label="Send alerts to (blank = the sending mailbox)" value={f.hrEmail} onChange={e=>setF({...f,hrEmail:e.target.value})} onBlur={()=>save(f)} placeholder="hr@svype.net"/>
+    <p className="text-xs text-slate-400 -mt-1">This address also receives the "you have received a request" emails whenever an employee submits a leave, work-from-home, time-correction, expense or document request. If left blank, those go to info@svype.net.</p>
     <label className="flex items-start gap-2 text-sm text-slate-700 cursor-pointer"><input type="checkbox" checked={f.remindEmployee!==false} onChange={e=>save({...f,remindEmployee:e.target.checked})} className="mt-0.5"/>
       <span>Nudge the employee too<div className="text-xs text-slate-400">They get their own reminder at the same time, pointing them at the correction form.</div></span></label>
     {st && <div className="text-xs text-slate-500">Alerts fire at <b>{st.alertsAt.in}</b> and <b>{st.alertsAt.out}</b> (Pakistan). Right now: {st.missingIn} not checked in, {st.missingOut} not checked out.{st.lastInAlert?` Last morning alert: ${st.lastInAlert}.`:""}</div>}
@@ -5283,6 +5339,7 @@ function AttendanceWatchCard({ data, patch }) {
     <div className="flex flex-wrap gap-2">
       <Btn variant="ghost" onClick={()=>test("in")} disabled={!!busy}>{busy==="in"?<Loader2 size={15} className="animate-spin"/>:<Send size={15}/>}Test morning alert</Btn>
       <Btn variant="ghost" onClick={()=>test("out")} disabled={!!busy}>{busy==="out"?<Loader2 size={15} className="animate-spin"/>:<Send size={15}/>}Test evening alert</Btn>
+      <Btn variant="ghost" onClick={()=>test("worklog")} disabled={!!busy}>{busy==="worklog"?<Loader2 size={15} className="animate-spin"/>:<Send size={15}/>}Test work-log reminder</Btn>
     </div>
     {msg && <div className={`text-xs rounded-lg px-3 py-2 ${msg.ok?"bg-emerald-50 border border-emerald-200 text-emerald-700":"bg-rose-50 border border-rose-200 text-rose-700"}`}>{msg.text}</div>}
     <p className="text-xs text-slate-400">People on approved leave are skipped. Work-from-home days are included but flagged.</p>
